@@ -9,7 +9,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- Shared profile-pseudonym helpers are now exported through UniFFI and C
+  (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
+  `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+
 ### Changed
+
+- Account-reference decoding accepts `nprofile` and `nostr:nprofile` in
+  addition to hex, `npub`, and existing URI forms. nprofile relay hints are
+  discarded. Duplicate type-0 TLV entries keep the first key. After one
+  lowercase `nostr:` prefix, the nprofile fallback rejects encoded tokens
+  longer than 1023 UTF-8 bytes; a valid 1023-byte token still decodes when
+  wrapped. FFI wrapper normalization is unchanged.
 
 - MarmotKit timeline rows and reply previews expose `media` as an ordered list of
   `MediaAttachmentOutcome` values, `Accepted { attachment_index, reference }` or

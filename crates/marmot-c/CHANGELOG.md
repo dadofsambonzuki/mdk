@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_default_profile_pseudonym` and `marmot_random_profile_pseudonym`
+  for the shared cosmetic display-name helpers. Free the owned UTF-8
+  strings with `marmot_string_free`. These functions add no status values or
+  struct layouts.
 - `MarmotMediaAttachmentOutcome` (tagged union: `Accepted { attachment_index, reference }` /
   `Rejected { attachment_index, rejection }`), `MarmotMediaAttachmentRejection`, and
   `MarmotMediaAttachmentRejectionKind` for per-attachment parse outcomes (#1787).
@@ -17,6 +21,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_account_id_hex` now decodes `nprofile` / `nostr:nprofile`
+  references and discards relay hints. Existing hex, `npub`, and
+  `marmot://profile/` forms keep their established OK-plus-NULL contract.
+  Duplicate type-0 TLV entries keep the first key. After wrapper
+  normalization, encoded tokens longer than 1023 UTF-8 bytes are
+  rejected; a valid 1023-byte token still decodes when wrapped.
+- `marmot_normalize_member_ref` documents the same nprofile spellings,
+  first-wins type-0 rule, and 1023-byte encoded-token limit.
 - **In-place ABI break, recompile required.** `MarmotTimelineMessageRecord.media` and
   `MarmotTimelineReplyPreview.media` hold `MarmotMediaAttachmentOutcome` items rather than
   `MarmotMediaAttachmentReference`, so the element type and array stride change; a binary built
