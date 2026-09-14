@@ -81,6 +81,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
+  pending invitations, archived chats, and departed or departing groups do not
+  contribute to account attention. Muted active chats still count; manual unread
+  reminders add conversation attention without inventing message or mention counts.
+  Existing binding layouts are unchanged; invitation badges remain a separate source.
+
 - The runtime's `send_media_attachments` (MarmotKit and `wn media send`) refuses a media reference whose
   `source_epoch` differs from the group's current epoch with the new typed `AppError::MediaReferenceStaleEpoch`
   (`source_epoch`, `current_epoch`), which MarmotKit surfaces as `InvalidMediaReference` and `wn` as
