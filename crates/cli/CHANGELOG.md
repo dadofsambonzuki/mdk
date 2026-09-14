@@ -83,9 +83,22 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Shared profile-pseudonym helpers are now exported through UniFFI and C
   (`default_profile_pseudonym` / `random_profile_pseudonym` and matching
   `marmot_*` functions) so hosts can reuse MDK's cosmetic display names.
+- WN Agent adds the `wn-claude` terminal harness for Claude Code 2.1.0 or newer.
+  Each Marmot group uses an explicit UUID-backed Claude session, resumes only
+  that stored UUID, sends prompts over stdin, and returns completed
+  main-conversation assistant text without reasoning, tool events, or duplicate
+  terminal result text. The shared harness provides workdir selection, `/new`,
+  ordered lanes, durable recovery, permission profiles, and an isolated release
+  installer.
 
 ### Changed
 
+- On Unix, `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` terminate remaining
+  processes in the backend's process group when a turn ends, including successful
+  turns, as well as on timeout or cancellation. Background dev servers started by
+  the backend in that group no longer survive the turn; run long-lived services
+  under a separate supervisor. Output draining after backend exit is limited to
+  two seconds so inherited pipe handles cannot stall a completed turn.
 - MarmotKit `accountUnreadSummary()` now follows the Unread chat-list eligibility:
   pending invitations, archived chats, and departed or departing groups do not
   contribute to account attention. Muted active chats still count; manual unread
