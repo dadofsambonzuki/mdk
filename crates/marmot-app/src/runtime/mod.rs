@@ -65,11 +65,17 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod audit_tracker;
+mod chat_list_window;
 mod commands;
 mod event_routing;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
+pub use chat_list_window::{
+    CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
+    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, RuntimeChatListWindowSubscription,
+};
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
 mod subscriptions;
