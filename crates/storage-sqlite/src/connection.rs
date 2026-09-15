@@ -494,6 +494,14 @@ impl SharedConnection {
         E: From<StorageError>,
         F: FnOnce() -> Result<T, E>,
     {
+        self.with_transaction_mode(false, f)
+    }
+
+    fn with_transaction_mode<T, E, F>(&self, deferred: bool, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
         let current = std::thread::current().id();
         let mut owner = self
             .inner
@@ -524,7 +532,12 @@ impl SharedConnection {
         *owner = Some(current);
         drop(owner);
 
-        if let Err(err) = self.begin_immediate_with_retry() {
+        let begin = if deferred {
+            self.begin_deferred_with_retry()
+        } else {
+            self.begin_immediate_with_retry()
+        };
+        if let Err(err) = begin {
             self.clear_transaction_owner();
             return Err(E::from(err));
         }
@@ -647,6 +660,50 @@ impl SharedConnection {
                 .map(|_| ())
                 .map_err(crate::codec::map_sqlite_error)
         })
+    }
+
+    fn begin_deferred_with_retry(&self) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.inner
+                .connection
+                .lock()?
+                .execute_cached("BEGIN DEFERRED", [])
+                .map(|_| ())
+                .map_err(crate::codec::map_sqlite_error)
+        })
+    }
+
+    /// Called only while this thread owns the transaction, including nested
+    /// reads inside a write transaction. Restore the caller's connection mode
+    /// before returning or unwinding, without committing its transaction.
+    fn with_query_only<T, E>(&self, read: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<StorageError>,
+    {
+        let previous: bool = {
+            let conn = self.lock()?;
+            let previous = conn
+                .pragma_query_value(None, "query_only", |row| row.get(0))
+                .storage()?;
+            conn.pragma_update(None, "query_only", true).storage()?;
+            previous
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read));
+        let restored = self
+            .lock()
+            .and_then(|conn| conn.pragma_update(None, "query_only", previous).storage());
+        // A mode-restore failure must never leave a surviving connection with
+        // an unexpected access mode. Closed handles are already terminal.
+        if restored.is_err() {
+            let _ = self.close();
+        }
+        match result {
+            Ok(result) => {
+                restored?;
+                result
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// The reason this connection can no longer serve work, if any. Closing
@@ -1168,6 +1225,15 @@ impl StorageProvider for SqliteAccountStorage {
         Some(((data_version as u64) << 32) | own)
     }
 
+    fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        self.connection
+            .with_transaction_mode(true, || self.connection.with_query_only(|| f(self)))
+    }
+
     fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {
         Some(self)
     }
@@ -1213,6 +1279,125 @@ mod tests {
     };
     use tracing::{Event, Subscriber, field::Visit};
     use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[test]
+    fn read_snapshot_pins_foreign_writes_and_mls_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-snapshot.db");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        reader
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE capture_test(value INTEGER); INSERT INTO capture_test VALUES(1)",
+            )
+            .unwrap();
+        let value = |s: &SqliteAccountStorage| -> StorageResult<i64> {
+            s.lock()?
+                .query_row("SELECT value FROM capture_test", [], |r| r.get(0))
+                .storage()
+        };
+        let generation = reader.mls_write_generation().unwrap();
+        reader
+            .with_read_snapshot(|s| -> StorageResult<()> {
+                assert_eq!(value(s)?, 1);
+                writer
+                    .lock()?
+                    .execute("UPDATE capture_test SET value=2", [])
+                    .storage()?;
+                s.with_read_snapshot(|nested| -> StorageResult<()> {
+                    assert_eq!(value(nested)?, 1);
+                    assert_eq!(nested.mls_write_generation(), Some(generation));
+                    let error = nested
+                        .lock()?
+                        .execute("UPDATE capture_test SET value=3", [])
+                        .unwrap_err();
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ReadOnly)
+                    );
+                    Ok(())
+                })
+            })
+            .unwrap();
+        assert_eq!(value(&reader).unwrap(), 2);
+        assert_ne!(reader.mls_write_generation(), Some(generation));
+    }
+
+    #[test]
+    fn read_snapshot_restores_mode_and_preserves_outer_transaction_on_all_exits() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE capture_test(value INTEGER)")
+            .unwrap();
+        let assert_readonly = |s: &SqliteAccountStorage| -> StorageResult<()> {
+            // Even nested write transactions must not upgrade the read capture.
+            s.with_transaction(|nested| -> StorageResult<()> {
+                let error = nested
+                    .lock()?
+                    .execute("INSERT INTO capture_test VALUES(99)", [])
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ReadOnly)
+                );
+                Ok(())
+            })
+        };
+        store.with_read_snapshot(assert_readonly).unwrap();
+        let result: StorageResult<()> = store.with_transaction(|outer| {
+            outer
+                .lock()?
+                .execute("INSERT INTO capture_test VALUES(1)", [])
+                .storage()?;
+            outer.with_read_snapshot(assert_readonly)?;
+            let failed: StorageResult<()> = outer.with_read_snapshot(|s| {
+                assert_readonly(s)?;
+                Err(StorageError::Backend("fixture error".into()))
+            });
+            assert!(failed.is_err());
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: StorageResult<()> = outer.with_read_snapshot(|s| {
+                    assert_readonly(s)?;
+                    panic!("fixture panic")
+                });
+            }));
+            assert!(panicked.is_err());
+            outer
+                .lock()?
+                .execute("INSERT INTO capture_test VALUES(2)", [])
+                .storage()?;
+            Err(StorageError::Backend("rollback outer".into()))
+        });
+        assert!(result.is_err());
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM capture_test", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "read capture must not commit the caller's writes");
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        store.with_read_snapshot(assert_readonly).unwrap();
+        let query_only: bool = store
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "query_only", |r| r.get(0))
+            .unwrap();
+        assert!(query_only, "preserve the caller's already-read-only mode");
+        store.close().unwrap();
+        assert!(matches!(
+            store.with_read_snapshot(|_| Ok::<_, StorageError>(())),
+            Err(StorageError::Closed(_))
+        ));
+    }
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TRACED_SQLCIPHER_SETUP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
