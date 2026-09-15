@@ -33,6 +33,7 @@ pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
 /// not amplify: their follows feed search/discovery without scheduling new
 /// contact-list subscriptions for the discovered users.
 pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
+    crate::user_blocks::MUTE_LIST_KIND,
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
     KIND_NIP65_RELAY_LIST,
@@ -323,7 +324,11 @@ async fn run_directory_sync_worker(
                 match event {
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::Record(record)) => {
                         let app = app.clone();
-                        let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        if record.event.kind == crate::user_blocks::MUTE_LIST_KIND {
+                            let _ = app.ingest_block_list_event(record.event).await;
+                        } else {
+                            let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                        }
                     }
                     Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -360,6 +365,11 @@ async fn run_directory_sync_once(
     relay_plane: MarmotRelayPlane,
     force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, AppError> {
+    for account in app.account_home().accounts()? {
+        let lock = app.block_update_lock(&account.label).await;
+        let _guard = lock.lock().await;
+        let _ = app.fetch_block_list(&account.label).await;
+    }
     let plan = blocking_app_task(move || app.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane

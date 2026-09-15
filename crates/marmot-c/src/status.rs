@@ -116,6 +116,9 @@ pub enum MarmotStatus {
     ChatWindowAnchorOutside = 75,
     ChatWindowClosed = 76,
     ChatWindowQuery = 77,
+    UserBlocked = 78,
+    BlockListUnavailable = 79,
+    BlockPublicationUncertain = 80,
 }
 
 thread_local! {
@@ -136,6 +139,9 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
+        MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
+        MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,

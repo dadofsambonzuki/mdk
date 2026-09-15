@@ -81,6 +81,7 @@ use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
 use crate::types::timeline::{MarmotTimelineMessageQuery, MarmotTimelinePage};
+use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
 
 /// Shorthand used by every command wrapper: validate + read an argument,
@@ -933,6 +934,10 @@ c_cmd! {
 
     /// The account ids this account follows (NIP-02). Free with
     /// `marmot_string_list_free`.
+    async fn marmot_block_user(account_ref: str, user_account_id_hex: str) -> unit = block_user;
+    async fn marmot_unblock_user(account_ref: str, user_account_id_hex: str) -> unit = unblock_user;
+    sync fn marmot_get_blocked_users(account_ref: str) -> rec(MarmotBlockedUserList) = get_blocked_users;
+    sync fn marmot_is_user_blocked(account_ref: str, user_account_id_hex: str) -> scalar(bool) = is_user_blocked;
     sync fn marmot_account_follows(account_ref: str) -> rec(MarmotStringList) = account_follows;
 
     /// Whether `user_ref` (`npub` or hex account id) is followed.

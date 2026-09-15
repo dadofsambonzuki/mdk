@@ -34,6 +34,12 @@ impl std::fmt::Display for AccountCatchUpFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("user is blocked")]
+    UserBlocked,
+    #[error("block list synchronization unavailable")]
+    BlockListUnavailable,
+    #[error("block list publication outcome is uncertain; retry to reconcile")]
+    BlockPublicationUncertain,
     #[error(transparent)]
     ProductAnalytics(#[from] crate::ProductAnalyticsError),
     #[error(transparent)]
@@ -349,6 +355,9 @@ impl AppError {
             Self::Publish(_) => "publish",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
+            Self::UserBlocked => "user_blocked",
+            Self::BlockListUnavailable => "block_list_unavailable",
+            Self::BlockPublicationUncertain => "block_publication_uncertain",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",

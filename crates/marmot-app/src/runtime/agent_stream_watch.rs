@@ -82,7 +82,7 @@ impl MarmotAppRuntime {
             .as_deref()
             .map(normalize_hex_app)
             .transpose()?;
-        let (start_message_id_hex, start, _sender_hex) =
+        let (start_message_id_hex, start, sender_hex) =
             latest_agent_stream_start(messages, normalized_stream_id_hex.as_deref())?;
         if start_message_id_hex.is_empty() {
             // The latest start hasn't been echoed back with a message id yet, so
@@ -114,6 +114,12 @@ impl MarmotAppRuntime {
         let invalidation_group_id = group_id.clone();
         let invalidation_start_id = start_message_id_hex.clone();
         let product = self.shared.product_analytics.clone();
+        let mut block_changes = self.accounts.app.block_list_updates.subscribe();
+        let policy_account = self.accounts.resolve(account_ref)?;
+        let policy_storage = self.accounts.app.account_storage(&policy_account.label)?;
+        if policy_storage.is_user_blocked(&sender_hex)? {
+            return Err(AppError::UserBlocked);
+        }
         let handle = tokio::spawn(async move {
             let watch = watch_broker_candidates(
                 BrokerWatch {
@@ -132,6 +138,11 @@ impl MarmotAppRuntime {
             let final_update = tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut stopping) => return,
                 update = &mut watch => update,
+                _ = async {
+                    loop {
+                        if block_changes.changed().await.is_err() || policy_storage.is_user_blocked(&sender_hex).unwrap_or(true) { break; }
+                    }
+                } => RuntimeAgentStreamUpdate::Failed { message:"agent stream preview withdrawn by block policy".into() },
                 reason = wait_for_preview_invalidation(
                     &mut runtime_events,
                     &invalidation_group_id,

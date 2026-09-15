@@ -2453,7 +2453,9 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::GroupRemoved(_) => "group_removed",
         AppError::GroupDisbanding(_) => "group_disbanding",
         AppError::GroupInviteNotPending => "group_invite_not_pending",
-        AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
+        AppError::UserBlocked | AppError::MessageDraftRevisionConflict => {
+            "message_draft_revision_conflict"
+        }
         AppError::MissingKeyPackage(_) => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
@@ -2506,7 +2508,9 @@ fn app_error(error: AppError) -> SubjectError {
         );
     }
     let category = match error {
-        AppError::MessageDraftRevisionConflict => SubjectFailureCategory::ExpectedRefusal,
+        AppError::UserBlocked | AppError::MessageDraftRevisionConflict => {
+            SubjectFailureCategory::ExpectedRefusal
+        }
         AppError::RuntimeBusy
         | AppError::AccountSessionBusy
         | AppError::AccountWorkerBusy
@@ -2588,7 +2592,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::Io(_)
         | AppError::Sqlite(_)
         | AppError::CreatedGroupProjectionUnavailable(_)
-        | AppError::SqlcipherKeyDerivation(_) => SubjectFailureCategory::Environment,
+        | AppError::SqlcipherKeyDerivation(_)
+        | AppError::BlockListUnavailable
+        | AppError::BlockPublicationUncertain => SubjectFailureCategory::Environment,
     };
     SubjectError::classified(
         category,

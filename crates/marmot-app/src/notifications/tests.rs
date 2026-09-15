@@ -1193,6 +1193,7 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
 
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
     let account_id_hex = "aa".repeat(32);
     let sender_id_hex = "bb".repeat(32);
@@ -1895,6 +1896,7 @@ fn group_state_classifier_notifies_only_local_self_affecting_changes() {
 fn group_state_live_classification_respects_settings_and_mute() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
     let local = "aa".repeat(32);
     let actor = "bb".repeat(32);
@@ -1964,6 +1966,7 @@ fn group_state_live_classification_respects_settings_and_mute() {
 fn group_state_live_and_recovery_share_a_deterministic_key() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
     let local = "aa".repeat(32);
     let actor = "bb".repeat(32);

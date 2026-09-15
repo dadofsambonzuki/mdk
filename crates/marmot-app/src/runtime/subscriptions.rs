@@ -38,6 +38,7 @@ use crate::{
 };
 
 pub struct RuntimeMessagesSubscription {
+    pub(crate) policy_storage: storage_sqlite::SqliteAccountStorage,
     pub snapshot: Vec<AppMessageRecord>,
     pub(crate) updates: mpsc::Receiver<RuntimeMessageUpdate>,
     pub(crate) stopping: watch::Receiver<bool>,
@@ -45,9 +46,19 @@ pub struct RuntimeMessagesSubscription {
 
 impl RuntimeMessagesSubscription {
     pub async fn recv(&mut self) -> Option<RuntimeMessageUpdate> {
-        tokio::select! {
-            update = self.updates.recv() => update,
-            _ = wait_for_runtime_shutdown(&mut self.stopping) => None,
+        loop {
+            let update = tokio::select! {
+                update = self.updates.recv() => update?,
+                _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
+            };
+            let message = update.message();
+            if self
+                .policy_storage
+                .is_app_author_visible(&message.sender, &hex::encode(message.group_id.as_slice()))
+                .unwrap_or(false)
+            {
+                return Some(update);
+            }
         }
     }
 }
@@ -99,6 +110,7 @@ pub(crate) enum TimelineSubscriptionSignal {
     // carries none of the public-type cost noted on `RuntimeTimelineMessageUpdate`.
     Projection(Box<RuntimeProjectionUpdate>),
     Refresh,
+    PolicyRefresh,
 }
 
 /// The mutable, materialized window plus everything needed to extend it. Lives
@@ -352,6 +364,8 @@ impl TimelineWindowHandle {
 /// and broadcast-lag refreshes mutate the same window through [`recv`](Self::recv).
 /// The store remains the durable source of truth; this is the view.
 pub struct RuntimeTimelineMessagesSubscription {
+    pub(crate) policy_window_size: usize,
+    pub(crate) policy_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) window: TimelineWindowHandle,
     pub(crate) updates: mpsc::Receiver<TimelineSubscriptionSignal>,
     pub(crate) stopping: watch::Receiver<bool>,
@@ -391,13 +405,35 @@ impl RuntimeTimelineMessagesSubscription {
                 signal = self.updates.recv() => signal?,
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
             };
+            self.policy_window_size = self
+                .policy_window_size
+                .max(self.window.snapshot().messages.len());
+            // A projection may have queued before a policy change. Re-read the
+            // presentation instead of exposing that buffered payload while blocked.
+            let signal = if matches!(signal, TimelineSubscriptionSignal::Projection(_))
+                && !self
+                    .policy_storage
+                    .block_list_snapshot()
+                    .is_ok_and(|s| s.users.is_empty())
+            {
+                TimelineSubscriptionSignal::PolicyRefresh
+            } else {
+                signal
+            };
+            let policy_refresh = matches!(signal, TimelineSubscriptionSignal::PolicyRefresh);
             match signal {
                 TimelineSubscriptionSignal::Projection(update) => {
                     self.window.apply_projection(&update.update);
                     return Some(RuntimeTimelineMessageUpdate::Projection(*update));
                 }
-                TimelineSubscriptionSignal::Refresh => {
-                    let (query_fn, query, head_query, generation) = self.window.refresh_request();
+                TimelineSubscriptionSignal::Refresh | TimelineSubscriptionSignal::PolicyRefresh => {
+                    let (query_fn, mut query, mut head_query, generation) =
+                        self.window.refresh_request();
+                    if policy_refresh {
+                        // Hidden rows must not permanently shrink a loaded page.
+                        query.pagination.limit = Some(self.policy_window_size);
+                        head_query.pagination.limit = Some(self.policy_window_size);
+                    }
                     match query_timeline_page_with_cursor_refresh(query_fn, query, head_query).await
                     {
                         Ok((page, _)) => {
@@ -888,6 +924,7 @@ impl MarmotAppRuntime {
         let kinds = query.kinds.clone();
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
+        let subscription_policy_storage = app.account_storage(&account_label)?;
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         // Lag recovery must NOT inherit the caller's initial-replay `limit`.
@@ -1004,6 +1041,18 @@ impl MarmotAppRuntime {
                     continue;
                 }
                 let message = update.message();
+                if app
+                    .account_storage(&account_label)
+                    .and_then(|s| {
+                        Ok(!s.is_app_author_visible(
+                            &message.sender,
+                            &hex::encode(message.group_id.as_slice()),
+                        )?)
+                    })
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
                 if group_id_hex.as_deref()
                     != Some(hex::encode(message.group_id.as_slice()).as_str())
                     && group_id_hex.is_some()
@@ -1027,6 +1076,7 @@ impl MarmotAppRuntime {
             }
         });
         Ok(RuntimeMessagesSubscription {
+            policy_storage: subscription_policy_storage,
             snapshot,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
@@ -1045,6 +1095,9 @@ impl MarmotAppRuntime {
         let group_id_hex = query.group_id_hex.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
+        let mut block_changes = app.block_list_updates.subscribe();
+        let policy_storage = app.account_storage(&account_label)?;
+        let subscription_policy_storage = policy_storage.clone();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot_query = query.clone();
         let app_for_snapshot = app.clone();
@@ -1073,6 +1126,11 @@ impl MarmotAppRuntime {
         let deltas_applicable = timeline_query_can_apply_projection_delta(&base_query);
         let query_fn: Arc<TimelineQueryFn> =
             Arc::new(move |query| app.timeline_messages_with_query(&account_label, query));
+        let policy_window_size = snapshot
+            .messages
+            .len()
+            .max(query.pagination.limit.unwrap_or(50))
+            .min(TIMELINE_WINDOW_LIMIT);
         let window = TimelineWindowHandle {
             inner: Arc::new(StdMutex::new(TimelineWindow {
                 query: query_fn,
@@ -1088,6 +1146,10 @@ impl MarmotAppRuntime {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     event = events.recv() => event,
+                    changed = block_changes.changed() => {
+                        if changed.is_err() || updates_tx.send(TimelineSubscriptionSignal::PolicyRefresh).await.is_err() { return; }
+                        continue;
+                    }
                 };
                 let event = match event {
                     Ok(event) => event,
@@ -1115,7 +1177,11 @@ impl MarmotAppRuntime {
                 ) {
                     continue;
                 }
-                let signal = if deltas_applicable {
+                let signal = if deltas_applicable
+                    && policy_storage
+                        .block_list_snapshot()
+                        .is_ok_and(|s| s.users.is_empty())
+                {
                     TimelineSubscriptionSignal::Projection(Box::new(update.clone()))
                 } else {
                     TimelineSubscriptionSignal::Refresh
@@ -1126,6 +1192,8 @@ impl MarmotAppRuntime {
             }
         });
         Ok(RuntimeTimelineMessagesSubscription {
+            policy_window_size,
+            policy_storage: subscription_policy_storage,
             window,
             updates: updates_rx,
             stopping: self.shared.lifecycle().subscribe_shutdown(),
@@ -1143,15 +1211,12 @@ impl MarmotAppRuntime {
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
+        let mut block_changes = app.block_list_updates.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let app_for_snapshot = app.clone();
         let account_label_for_snapshot = account_label.clone();
         let snapshot = blocking_app_task(move || {
-            if include_archived {
-                app_for_snapshot.groups(&account_label_for_snapshot)
-            } else {
-                app_for_snapshot.visible_groups(&account_label_for_snapshot)
-            }
+            app_for_snapshot.listed_groups(&account_label_for_snapshot, include_archived)
         })
         .await?;
         let mut group_records = snapshot
@@ -1163,18 +1228,17 @@ impl MarmotAppRuntime {
             loop {
                 let event = tokio::select! {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
-                    event = events.recv() => match event {
+                    event = async { tokio::select! {
+                        event = events.recv() => event,
+                        _ = block_changes.changed() => Err(broadcast::error::RecvError::Lagged(0)),
+                    }} => match event {
                         Ok(event) => event,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             let app_for_lookup = app.clone();
                             let account_label_for_lookup = account_label.clone();
                             let prior_groups = group_records.values().cloned().collect::<Vec<_>>();
                             let recovered = match blocking_app_task(move || {
-                                let groups = if include_archived {
-                                    app_for_lookup.groups(&account_label_for_lookup)?
-                                } else {
-                                    app_for_lookup.visible_groups(&account_label_for_lookup)?
-                                };
+                                let groups = app_for_lookup.listed_groups(&account_label_for_lookup, include_archived)?;
                                 let visible_group_ids = groups
                                     .iter()
                                     .map(|group| group.group_id_hex.clone())
@@ -1227,7 +1291,10 @@ impl MarmotAppRuntime {
                     return;
                 }
                 let group = match blocking_app_task(move || {
-                    app_for_lookup.group(&account_label_for_lookup, &group_id_hex_for_lookup)
+                    Ok(app_for_lookup
+                        .listed_groups(&account_label_for_lookup, include_archived)?
+                        .into_iter()
+                        .find(|g| g.group_id_hex == group_id_hex_for_lookup))
                 })
                 .await
                 {
@@ -1279,6 +1346,7 @@ impl MarmotAppRuntime {
         let account_label = account.label.clone();
         let app = self.accounts.app.clone();
         let mut events = self.events.subscribe();
+        let mut block_changes = app.block_list_updates.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let app_for_snapshot = app.clone();
         let account_label_for_snapshot = account_label.clone();
@@ -1316,6 +1384,7 @@ impl MarmotAppRuntime {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     _ = updates_tx.closed() => return,
                     event = events.recv() => Some(event),
+                    _ = block_changes.changed() => Some(Err(broadcast::error::RecvError::Lagged(0))),
                     _ = expiry_wait => None,
                 };
                 let Some(event) = event else {

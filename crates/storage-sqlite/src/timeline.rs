@@ -1358,7 +1358,7 @@ impl SqliteAccountStorage {
     }
 
     pub fn message_timeline(&self, query: TimelineMessageQuery) -> StorageResult<TimelinePage> {
-        self.message_timeline_ordered(query, true)
+        self.message_timeline_ordered(query, true, true)
     }
 
     /// Query by the legacy wall-clock tuple regardless of group source epochs.
@@ -1368,13 +1368,14 @@ impl SqliteAccountStorage {
         &self,
         query: TimelineMessageQuery,
     ) -> StorageResult<TimelinePage> {
-        self.message_timeline_ordered(query, false)
+        self.message_timeline_ordered(query, false, false)
     }
 
     fn message_timeline_ordered(
         &self,
         query: TimelineMessageQuery,
         canonical_group_order: bool,
+        hide_blocked: bool,
     ) -> StorageResult<TimelinePage> {
         let canonical_group_order = canonical_group_order && query.group_id_hex.is_some();
         let mut pagination = validate_pagination(&query.pagination)?;
@@ -1391,7 +1392,13 @@ impl SqliteAccountStorage {
                 cursor_message_id_hex,
             )?);
         }
-        let rows = select_timeline_rows_tx(&conn, &query, &pagination, canonical_group_order)?;
+        let rows = select_timeline_rows_tx(
+            &conn,
+            &query,
+            &pagination,
+            canonical_group_order,
+            hide_blocked,
+        )?;
         let has_extra = rows.len() > pagination.limit;
         let mut messages = rows.into_iter().take(pagination.limit).collect::<Vec<_>>();
         let (has_more_before, has_more_after) = match pagination.direction {
@@ -1439,7 +1446,7 @@ impl SqliteAccountStorage {
                         timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                         timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                         timeline.deleted_by_message_id_hex, timeline.invalidation_status
-                 FROM message_timeline AS timeline
+                 FROM visible_message_timeline AS timeline
                  LEFT JOIN app_events AS source
                    ON source.group_id_hex = timeline.group_id_hex
                   AND source.message_id_hex = timeline.message_id_hex
@@ -1471,7 +1478,7 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row_cached(
             "SELECT sender, plaintext, kind, deleted, invalidation_status
-             FROM message_timeline
+             FROM visible_message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2
              LIMIT 1",
             params![group_id_hex, message_id_hex],
@@ -2998,8 +3005,15 @@ fn select_timeline_rows_tx(
     query: &TimelineMessageQuery,
     pagination: &ValidatedPagination,
     canonical_group_order: bool,
+    hide_blocked: bool,
 ) -> StorageResult<Vec<TimelineMessageRecord>> {
-    let (sql, params) = timeline_query_sql(query, pagination, canonical_group_order)?;
+    let (mut sql, params) = timeline_query_sql(query, pagination, canonical_group_order)?;
+    if hide_blocked {
+        sql = sql.replace(
+            "FROM message_timeline AS timeline",
+            "FROM visible_message_timeline AS timeline",
+        );
+    }
     let _span = tracing::debug_span!(
         target: "storage_sqlite::timeline",
         "timeline_select",
@@ -3022,7 +3036,7 @@ fn timeline_order_cursor_tx(
         .query_row_cached(
             "SELECT source_message_id_hex, source_epoch, invalidation_status,
                     kind, timeline_at, message_id_hex
-             FROM message_timeline
+             FROM visible_message_timeline
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
             |row| {
@@ -3641,6 +3655,25 @@ fn attach_reply_previews(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
+    let blocked = {
+        let mut stmt = conn
+            .prepare_cached("SELECT public_key FROM user_blocks")
+            .storage()?;
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<HashSet<_>, _>>()
+            .storage()?
+    };
+    for message in messages.iter_mut() {
+        message
+            .reactions
+            .user_reactions
+            .retain(|r| !blocked.contains(&r.sender));
+        message.reactions.by_emoji.retain(|_, senders| {
+            senders.retain(|s| !blocked.contains(s));
+            !senders.is_empty()
+        });
+    }
     let targets = messages
         .iter()
         .filter_map(|message| {
@@ -3690,7 +3723,7 @@ fn load_reply_previews(
             let sql = format!(
                 "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch,
                         invalidation_status
-                 FROM message_timeline
+                 FROM visible_message_timeline
                  WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
             let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
