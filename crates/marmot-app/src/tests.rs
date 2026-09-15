@@ -1306,6 +1306,10 @@ fn explicit_catch_up_arms_and_replays_without_later_traffic() {
         // This command is deferred behind startup catch-up, so its response is
         // also the steady-state barrier this regression needs.
         runtime.pause_maintenance("alice").await.unwrap();
+        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        let sync = app.relay_plane.relay_telemetry().await.sync;
+        assert_eq!(sync.tracked_subscriptions, 2);
+        assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
         let unfloored_before = relay.unfloored_account_subscription_count();
 
         // Hold the ordinary, floored activation inside explicit CatchUp. The

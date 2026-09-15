@@ -835,7 +835,6 @@ impl AppClient {
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
-        self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
         self.runtime.sync_transport_groups(rebuild_since).await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
@@ -1164,6 +1163,7 @@ impl AppClient {
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        self.adapter.require_fresh_activation().await;
         // Reconcile epoch-bounded prior routes before issuing the first relay
         // subscriptions. This makes retirement deterministic even for a quiet
         // group that has no new inbound events after restart.
