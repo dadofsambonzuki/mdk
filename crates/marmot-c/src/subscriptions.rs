@@ -1309,7 +1309,9 @@ pub unsafe extern "C" fn marmot_presented_chat_list_subscription_free(
 mod chat_window;
 pub use chat_window::*;
 
+mod conversation_window;
 use crate::types::user_blocks::MarmotBlockListSnapshot;
+pub use conversation_window::*;
 use marmot_uniffi::BlockListSubscription;
 // Owns its deep allocations, like the other callback snapshot mirrors.
 unsafe impl Send for MarmotBlockListSnapshot {}

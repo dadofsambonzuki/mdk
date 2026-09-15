@@ -33,4 +33,5 @@ pub mod presentation;
 
 pub mod chat_window;
 
+pub mod conversation_window;
 pub mod user_blocks;

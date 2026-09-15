@@ -119,6 +119,18 @@ pub enum MarmotStatus {
     UserBlocked = 78,
     BlockListUnavailable = 79,
     BlockPublicationUncertain = 80,
+    ConversationWindowInvalidLimit = 81,
+    ConversationWindowStale = 82,
+    ConversationWindowWrongGeneration = 83,
+    ConversationWindowAnchorOutside = 84,
+    ConversationWindowClosed = 85,
+    ConversationWindowNotReady = 86,
+    ConversationWindowTimedOut = 87,
+    ConversationWindowInvalidTarget = 88,
+    ConversationWindowQuery = 89,
+    ConversationWindowPresentation = 90,
+    MessageDraftRevisionConflict = 91,
+    ConversationWindowMessageNotRetained = 92,
 }
 
 thread_local! {
@@ -139,6 +151,30 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ConversationWindowMessageNotRetained => {
+            MarmotStatus::ConversationWindowMessageNotRetained
+        }
+        MarmotKitError::MessageDraftRevisionConflict => MarmotStatus::MessageDraftRevisionConflict,
+        MarmotKitError::ConversationWindowInvalidLimit => {
+            MarmotStatus::ConversationWindowInvalidLimit
+        }
+        MarmotKitError::ConversationWindowStale => MarmotStatus::ConversationWindowStale,
+        MarmotKitError::ConversationWindowWrongGeneration => {
+            MarmotStatus::ConversationWindowWrongGeneration
+        }
+        MarmotKitError::ConversationWindowAnchorOutside => {
+            MarmotStatus::ConversationWindowAnchorOutside
+        }
+        MarmotKitError::ConversationWindowClosed => MarmotStatus::ConversationWindowClosed,
+        MarmotKitError::ConversationWindowNotReady => MarmotStatus::ConversationWindowNotReady,
+        MarmotKitError::ConversationWindowTimedOut => MarmotStatus::ConversationWindowTimedOut,
+        MarmotKitError::ConversationWindowInvalidTarget => {
+            MarmotStatus::ConversationWindowInvalidTarget
+        }
+        MarmotKitError::ConversationWindowQuery { .. } => MarmotStatus::ConversationWindowQuery,
+        MarmotKitError::ConversationWindowPresentation { .. } => {
+            MarmotStatus::ConversationWindowPresentation
+        }
         MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
         MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
         MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
@@ -249,6 +285,22 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::ConversationWindowMessageNotRetained,
+            MarmotKitError::ConversationWindowInvalidLimit,
+            MarmotKitError::ConversationWindowStale,
+            MarmotKitError::ConversationWindowWrongGeneration,
+            MarmotKitError::ConversationWindowAnchorOutside,
+            MarmotKitError::ConversationWindowClosed,
+            MarmotKitError::ConversationWindowNotReady,
+            MarmotKitError::ConversationWindowTimedOut,
+            MarmotKitError::ConversationWindowInvalidTarget,
+            MarmotKitError::ConversationWindowQuery {
+                details: "test".into(),
+            },
+            MarmotKitError::ConversationWindowPresentation {
+                details: "test".into(),
+            },
+            MarmotKitError::MessageDraftRevisionConflict,
             MarmotKitError::UserBlocked,
             MarmotKitError::BlockListUnavailable,
             MarmotKitError::BlockPublicationUncertain,
@@ -408,7 +460,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            71,
+            83,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

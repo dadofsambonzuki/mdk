@@ -21,6 +21,13 @@
 
 #include <marmot.h>
 
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC == 0, "automatic ABI value");
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_LATEST == 1, "latest ABI value");
+_Static_assert(MARMOT_CONVERSATION_OPEN_MODE_MESSAGE == 2, "message ABI value");
+_Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER == 0, "older ABI value");
+_Static_assert(MARMOT_CONVERSATION_PAGE_DIRECTION_NEWER == 1, "newer ABI value");
+_Static_assert(MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED == 92, "missing target ABI value");
+
 static int failures = 0;
 
 static void ok(const char *what) {
@@ -119,6 +126,15 @@ int main(int argc, char **argv) {
     check(marmot_is_user_blocked(NULL, "alice", "key", NULL) == MARMOT_STATUS_NULL_POINTER, "block boolean null boundary");
     check(marmot_subscribe_blocked_users(NULL, "alice", NULL) == MARMOT_STATUS_NULL_POINTER, "block subscription null boundary");
     marmot_markdown_document_free(NULL);
+    marmot_conversation_window_snapshot_free(NULL);
+    marmot_selected_message_draft_free(NULL);
+    marmot_conversation_window_subscription_free(NULL);
+    check(marmot_open_conversation_window(NULL, NULL, NULL, MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC, NULL, NULL, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation open preflights outputs");
+    check(marmot_conversation_window_subscription_page(NULL, NULL, MARMOT_CONVERSATION_PAGE_DIRECTION_OLDER, 1, 0, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation page preflights outputs");
+    check(marmot_conversation_window_subscription_cancel(NULL) == MARMOT_STATUS_NULL_POINTER,
+          "conversation cancel rejects NULL handle");
     marmot_chat_list_window_snapshot_free(NULL);
     marmot_account_attention_snapshot_free(NULL);
     marmot_chat_list_window_subscription_free(NULL);

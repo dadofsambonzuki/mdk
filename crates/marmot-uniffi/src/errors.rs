@@ -289,6 +289,31 @@ pub enum MarmotKitError {
     ChatWindowClosed,
     #[error("chat window query failed: {details}")]
     ChatWindowQuery { details: String },
+    #[error("conversation window requests require 1 to 200 rows")]
+    ConversationWindowInvalidLimit,
+    #[error("selected draft changed; refresh before retrying")]
+    MessageDraftRevisionConflict,
+    #[error("conversation changed; refresh the sequence before retrying")]
+    ConversationWindowStale,
+    #[error("revision belongs to another conversation window generation")]
+    ConversationWindowWrongGeneration,
+    #[error("visible anchor must belong to the retained conversation window")]
+    ConversationWindowAnchorOutside,
+    #[error("conversation window closed; reopen it")]
+    ConversationWindowClosed,
+    #[error("conversation capture temporarily unavailable; retry pending")]
+    ConversationWindowNotReady,
+    #[error("conversation operation timed out; accepted commands may still complete")]
+    ConversationWindowTimedOut,
+    #[error("conversation opening mode and message target disagree")]
+    ConversationWindowInvalidTarget,
+    #[error("conversation query failed: {details}")]
+    ConversationWindowQuery { details: String },
+    #[error("conversation presentation failed: {details}")]
+    ConversationWindowPresentation { details: String },
+    /// An explicit target disappeared; an already-open window remains usable.
+    #[error("conversation target message is no longer retained")]
+    ConversationWindowMessageNotRetained,
 }
 
 impl From<AppError> for MarmotKitError {
@@ -386,6 +411,7 @@ impl From<&AppError> for MarmotKitError {
             AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved {
                 group_id_hex: group_id_hex.clone(),
             },
+            AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,
             AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft {
                 details: details.clone(),
             },
@@ -993,6 +1019,61 @@ impl From<marmot_app::ChatListWindowError> for MarmotKitError {
 mod screen_error_tests {
     use super::*;
     #[test]
+    fn conversation_errors_preserve_retry_revision_and_close_classification() {
+        use marmot_app::ConversationWindowError as W;
+        use std::sync::Arc;
+        assert!(matches!(
+            MarmotKitError::from(W::Query(Arc::new(
+                marmot_app::ConversationOpenError::MessageNotFound
+            ))),
+            MarmotKitError::ConversationWindowMessageNotRetained
+        ));
+        for error in [
+            marmot_app::ConversationOpenError::InvalidLimit,
+            marmot_app::ConversationOpenError::InvalidAnchorPosition,
+            marmot_app::ConversationOpenError::AnchorScopeMismatch,
+        ] {
+            assert!(matches!(
+                MarmotKitError::from(W::Query(Arc::new(error))),
+                MarmotKitError::ConversationWindowQuery { .. }
+            ));
+        }
+        assert!(matches!(
+            MarmotKitError::from(W::InvalidLimit),
+            MarmotKitError::ConversationWindowInvalidLimit
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::StaleWindow),
+            MarmotKitError::ConversationWindowStale
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::AnchorOutsideWindow),
+            MarmotKitError::ConversationWindowAnchorOutside
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::NotReady),
+            MarmotKitError::ConversationWindowNotReady
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::Closed),
+            MarmotKitError::ConversationWindowClosed
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::Storage(
+                cgka_traits::storage::StorageError::Busy("busy".into())
+            )))),
+            MarmotKitError::StorageBusy { .. }
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::RuntimeStopping))),
+            MarmotKitError::RuntimeStopping
+        ));
+        assert!(matches!(
+            MarmotKitError::from(W::App(Arc::new(AppError::MessageDraftRevisionConflict))),
+            MarmotKitError::MessageDraftRevisionConflict
+        ));
+    }
+    #[test]
     fn shared_screen_errors_preserve_retry_and_close_classification() {
         use marmot_app::ChatListWindowError as W;
         use std::sync::Arc;
@@ -1032,5 +1113,33 @@ mod screen_error_tests {
             MarmotKitError::from(error.as_ref()),
             MarmotKitError::RuntimeStopping
         ));
+    }
+}
+
+impl From<marmot_app::ConversationWindowError> for MarmotKitError {
+    fn from(v: marmot_app::ConversationWindowError) -> Self {
+        use marmot_app::ConversationWindowError as E;
+        match v {
+            E::InvalidLimit => Self::ConversationWindowInvalidLimit,
+            E::StaleWindow => Self::ConversationWindowStale,
+            E::AnchorOutsideWindow => Self::ConversationWindowAnchorOutside,
+            E::Closed => Self::ConversationWindowClosed,
+            E::NotReady => Self::ConversationWindowNotReady,
+            E::App(e) => Self::from(e.as_ref()),
+            E::Query(e)
+                if matches!(
+                    e.as_ref(),
+                    marmot_app::ConversationOpenError::MessageNotFound
+                ) =>
+            {
+                Self::ConversationWindowMessageNotRetained
+            }
+            E::Query(e) => Self::ConversationWindowQuery {
+                details: e.to_string(),
+            },
+            E::Presentation(e) => Self::ConversationWindowPresentation {
+                details: e.to_string(),
+            },
+        }
     }
 }

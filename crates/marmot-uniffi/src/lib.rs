@@ -40,6 +40,7 @@ pub use publisher::{
 };
 pub mod subscriptions;
 
+pub use conversions::conversation_window::*;
 use conversions::group_id_from_hex;
 pub use errors::MarmotKitError;
 pub use external_signer::ExternalAccountSignerFfi;
@@ -49,6 +50,7 @@ pub use markdown::{
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
 };
 pub use secret_store::SecretStore;
+pub use subscriptions::ConversationWindowSubscription;
 
 uniffi::setup_scaffolding!();
 

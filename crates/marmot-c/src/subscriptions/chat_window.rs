@@ -438,4 +438,291 @@ mod tests {
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), before);
     }
+    #[test]
+    fn c_conversation_window_ownership_timeout_and_revision_operations() {
+        use crate::subscriptions::conversation_window::*;
+        use crate::types::conversation_window::*;
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let relay = rt.block_on(nostr_relay_builder::MockRelay::run()).unwrap();
+        let url = rt.block_on(relay.url()).to_string();
+        let kit = Marmot::new_with_options(
+            dir.path().to_str().unwrap().into(),
+            vec![url.clone()],
+            marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            Some(Arc::new(Store::default())),
+        )
+        .unwrap();
+        let client = MarmotClient {
+            runtime: rt,
+            marmot: kit,
+        };
+        let account = client
+            .block_on(client.marmot.create_identity(vec![url.clone()], vec![url]))
+            .unwrap()
+            .account_id_hex;
+        let group = client
+            .block_on(client.marmot.create_group(
+                account.clone(),
+                "C conversation".into(),
+                vec![],
+                None,
+            ))
+            .unwrap();
+        for i in 0..3 {
+            client
+                .block_on(client.marmot.send_text(
+                    account.clone(),
+                    group.clone(),
+                    format!("message {i}"),
+                ))
+                .unwrap();
+        }
+        let account = CString::new(account).unwrap();
+        let group = CString::new(group).unwrap();
+        unsafe {
+            let mut window = ptr::null_mut();
+            assert_eq!(
+                marmot_open_conversation_window(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    99,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    &mut window
+                ),
+                MarmotStatus::InvalidArgument
+            );
+            assert!(window.is_null());
+            assert_eq!(
+                marmot_open_conversation_window(
+                    &client,
+                    account.as_ptr(),
+                    group.as_ptr(),
+                    1,
+                    ptr::null(),
+                    &2,
+                    0,
+                    &mut window
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_conversation_window_subscription_snapshot(window, ptr::null_mut()),
+                MarmotStatus::NullPointer
+            );
+            let mut initial = ptr::null_mut();
+            assert_eq!(
+                marmot_conversation_window_subscription_snapshot(window, &mut initial),
+                MarmotStatus::Ok
+            );
+            assert_eq!((*initial).messages_len, 2);
+            let mut update = ptr::null_mut();
+            let missing = CString::new("00".repeat(32)).unwrap();
+            assert_eq!(
+                marmot_conversation_window_subscription_jump_to_message(
+                    window,
+                    &(*initial).revision,
+                    missing.as_ptr(),
+                    0,
+                    &mut update,
+                ),
+                MarmotStatus::ConversationWindowMessageNotRetained
+            );
+            assert!(update.is_null());
+            // The failed jump neither closes nor advances this window: same-revision
+            // paging below still succeeds and its stream echo remains available.
+            assert_eq!(
+                marmot_conversation_window_subscription_next(window, 10, &mut update),
+                MarmotStatus::Timeout
+            );
+            assert!(update.is_null());
+            assert_eq!(
+                marmot_conversation_window_subscription_page(
+                    window,
+                    &(*initial).revision,
+                    0,
+                    1,
+                    0,
+                    ptr::null_mut()
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(
+                marmot_conversation_window_subscription_page(
+                    window,
+                    &(*initial).revision,
+                    99,
+                    1,
+                    0,
+                    &mut update
+                ),
+                MarmotStatus::InvalidArgument
+            );
+            let sub = &*window;
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
+                    let mut received = ptr::null_mut();
+                    assert_eq!(
+                        marmot_conversation_window_subscription_next(sub, 5000, &mut received),
+                        MarmotStatus::Ok
+                    );
+                    let sequence = (*received).revision.sequence;
+                    marmot_conversation_window_snapshot_free(received);
+                    sequence
+                });
+                assert_eq!(
+                    marmot_conversation_window_subscription_page(
+                        sub,
+                        &(*initial).revision,
+                        0,
+                        1,
+                        0,
+                        &mut update
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!((*update).messages_len, 3);
+                assert_eq!(waiter.join().unwrap(), (*update).revision.sequence);
+            });
+            marmot_conversation_window_snapshot_free(update);
+            assert_eq!(
+                marmot_conversation_window_subscription_return_to_latest(
+                    window,
+                    &(*initial).revision,
+                    0,
+                    &mut update
+                ),
+                MarmotStatus::ConversationWindowStale
+            );
+            assert!(update.is_null());
+            // Borrow a token from the still-owned snapshot; free returned drafts independently.
+            let attachment_id = c"missing";
+            let mut found = 99;
+            let mut bytes = ptr::dangling_mut();
+            let mut bytes_len = 99;
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    attachment_id.as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!((found, bytes.is_null(), bytes_len), (0, true, 0));
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    attachment_id.as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    ptr::null_mut(),
+                ),
+                MarmotStatus::NullPointer
+            );
+            let attachment = crate::types::draft::MarmotMessageDraftAttachmentInput {
+                id: c"empty".as_ptr(),
+                file_name: c"empty.txt".as_ptr(),
+                media_type: c"text/plain".as_ptr(),
+                plaintext: ptr::null(),
+                plaintext_len: 0,
+                dim: ptr::null(),
+                thumbhash: ptr::null(),
+                has_duration_seconds: 0,
+                duration_seconds: 0.0,
+                waveform_samples: ptr::null(),
+                waveform_samples_len: 0,
+            };
+            let mut edited = ptr::null_mut();
+            assert_eq!(
+                marmot_save_message_draft_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    c"edited".as_ptr(),
+                    ptr::null(),
+                    &attachment,
+                    1,
+                    &mut edited,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*edited).revision,
+                    c"empty".as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!((found, bytes_len), (1, 0));
+            crate::marmot_bytes_free(bytes, bytes_len);
+            found = 99;
+            bytes = ptr::dangling_mut();
+            bytes_len = 99;
+            assert_eq!(
+                marmot_message_draft_attachment_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*initial).draft.revision,
+                    c"empty".as_ptr(),
+                    &mut found,
+                    &mut bytes,
+                    &mut bytes_len,
+                ),
+                MarmotStatus::MessageDraftRevisionConflict
+            );
+            assert_eq!((found, bytes.is_null(), bytes_len), (0, true, 0));
+            let mut selected = ptr::null_mut();
+            assert_eq!(
+                marmot_clear_message_draft_if_revision(
+                    &client,
+                    account.as_ptr(),
+                    (*edited).revision,
+                    &mut selected
+                ),
+                MarmotStatus::Ok
+            );
+            marmot_selected_message_draft_free(selected);
+            marmot_selected_message_draft_free(edited);
+            marmot_conversation_window_snapshot_free(initial);
+            assert_eq!(
+                marmot_conversation_window_subscription_cancel(window),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_conversation_window_subscription_next(window, 100, &mut update),
+                MarmotStatus::Closed
+            );
+            marmot_conversation_window_subscription_free(window);
+            marmot_conversation_window_subscription_free(ptr::null_mut());
+            marmot_conversation_window_snapshot_free(ptr::null_mut());
+            marmot_selected_message_draft_free(ptr::null_mut());
+        }
+        client.block_on(client.marmot.shutdown_and_close()).unwrap();
+        drop(relay);
+        drop(client);
+        let _ = crate::status::take_last_error();
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
 }
