@@ -35,8 +35,9 @@ See [shared conversation presentation](../further-context/conversation-presentat
 The additive Rust chat-list window API owns bounded live Chats, Unread, Archived and Left windows.
 It coordinates the initial subscription/read, serializes paging and stable-anchor recovery, prepares only
 required selected presentation, and closes handles on account-store eviction. Invitation acceptance preserves
-archive; successful rejoin restores departed conversations. Independent live account attention reuses the Unread
-eligibility keys, reports unavailable accounts explicitly, and refreshes affected accounts without opening lists.
+archive; successful rejoin restores departed conversations. Independent live account attention combines accepted
+Unread-list counts with one attention item per active unarchived pending invitation. Archived and departed/departing
+groups contribute nothing. It reports unavailable accounts explicitly and refreshes affected accounts without opening lists.
 C4 M4 adds UniFFI/C handles, typed window errors and native ownership/parity checks;
 release and client adoption remain separate. See the [native handoff](../further-context/chat-projections-native.md),
 [bounded live chat-list windows](../further-context/chat-list-windows.md) and
