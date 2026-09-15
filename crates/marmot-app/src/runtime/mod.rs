@@ -73,6 +73,13 @@ pub use account_attention::{
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
 };
 mod chat_list_window;
+mod conversation_window;
+pub use conversation_window::{
+    CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
+    ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
+    ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
+    ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
+};
 mod commands;
 mod event_routing;
 mod onboarding;
