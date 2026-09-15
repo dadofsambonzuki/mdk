@@ -36,3 +36,5 @@ mod product_analytics;
 mod presentation;
 
 mod chat_window;
+
+pub mod user_blocks;

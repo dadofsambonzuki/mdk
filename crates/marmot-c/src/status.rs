@@ -116,6 +116,9 @@ pub enum MarmotStatus {
     ChatWindowAnchorOutside = 75,
     ChatWindowClosed = 76,
     ChatWindowQuery = 77,
+    UserBlocked = 78,
+    BlockListUnavailable = 79,
+    BlockPublicationUncertain = 80,
 }
 
 thread_local! {
@@ -136,6 +139,9 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
+        MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
+        MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -243,6 +249,9 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::UserBlocked,
+            MarmotKitError::BlockListUnavailable,
+            MarmotKitError::BlockPublicationUncertain,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -399,8 +408,17 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            68,
+            71,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
+        );
+        assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
+            79
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
+            80
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {

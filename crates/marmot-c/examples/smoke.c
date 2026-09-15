@@ -112,6 +112,12 @@ int main(int argc, char **argv) {
     marmot_client_free(NULL);
     marmot_string_free(NULL);
     marmot_account_summary_list_free(NULL);
+    marmot_blocked_user_list_free(NULL);
+    marmot_block_list_snapshot_free(NULL);
+    marmot_block_list_subscription_free(NULL);
+    check(marmot_get_blocked_users(NULL, "alice", NULL) == MARMOT_STATUS_NULL_POINTER, "block list null boundary");
+    check(marmot_is_user_blocked(NULL, "alice", "key", NULL) == MARMOT_STATUS_NULL_POINTER, "block boolean null boundary");
+    check(marmot_subscribe_blocked_users(NULL, "alice", NULL) == MARMOT_STATUS_NULL_POINTER, "block subscription null boundary");
     marmot_markdown_document_free(NULL);
     marmot_chat_list_window_snapshot_free(NULL);
     marmot_account_attention_snapshot_free(NULL);
