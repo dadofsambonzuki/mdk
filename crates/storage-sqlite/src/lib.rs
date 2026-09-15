@@ -76,10 +76,11 @@ pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use storage::messages::StorageFormatBenchSizes;
 pub use timeline::{
-    BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence, ConversationAnchor,
-    ConversationOpenAnchorOutcome, ConversationOpenError, ConversationOpenQuery,
-    ConversationOpenReadState, ConversationOpenSnapshot, ConversationOpenTarget,
-    ConversationPresentationPage, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
+    BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
+    ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
+    ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
+    ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
+    ConversationWindowQuery, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
     SecurePruneAppEventsResult, StoredAppEvent, TimelineMessageChange, TimelineMessageQuery,
     TimelineMessageRecord, TimelineMessageTarget, TimelinePage, TimelinePagination,
     TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
