@@ -460,3 +460,5 @@ See [APP_PATH_COVERAGE.md](APP_PATH_COVERAGE.md#unified-public-app-campaign) for
 ignored-test selection, WIP provenance, outcome interpretation and the fresh-stack versus sustained-runtime boundary.
 
 The [public app inventory](APP_SCENARIO_INVENTORY.md) describes the default participant-process layout, matching node-helper build, and explicit shared-runtime stress control.
+
+See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.

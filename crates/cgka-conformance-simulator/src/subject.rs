@@ -62,6 +62,7 @@ pub enum SubjectCapability {
     MultiGroup,
     RetainedRelayHistory,
     RetainedRelayControl,
+    RetainedRelayConfiguration,
 }
 
 impl SubjectCapability {
@@ -93,6 +94,7 @@ impl SubjectCapability {
             Self::MultiGroup => "multi_group",
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
+            Self::RetainedRelayConfiguration => "retained_relay_configuration",
         }
     }
 
@@ -478,7 +480,7 @@ pub trait ConvergenceSubject: Send {
         _duplicate_copies: usize,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
-            SubjectCapability::RetainedRelayControl,
+            SubjectCapability::RetainedRelayConfiguration,
         ))
     }
 
@@ -528,6 +530,19 @@ pub trait ConvergenceSubject: Send {
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(
             SubjectCapability::RelayInterruption,
+        ))
+    }
+
+    async fn race_invite_profile(
+        &mut self,
+        _action_id: &str,
+        _actors: &[String],
+        _invitee: &str,
+        _name: &str,
+        _restart_at_offer: bool,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(
+            SubjectCapability::ConcurrentGroupMutation,
         ))
     }
 
@@ -675,6 +690,17 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         }
         return capabilities;
     }
+    if matches!(step, ScenarioStep::RaceInviteProfile { .. }) {
+        return vec![
+            SubjectCapability::ConcurrentGroupMutation,
+            SubjectCapability::GroupMutation,
+            SubjectCapability::OutboundPublication,
+            SubjectCapability::EventObservation,
+            SubjectCapability::CrashReopen,
+            SubjectCapability::TransportDelivery,
+            SubjectCapability::PublicGroupStateObservation,
+        ];
+    }
     if let ScenarioStep::AwaitQuiescence { policy } = step {
         let mut capabilities = vec![
             SubjectCapability::StructuralProgress,
@@ -722,8 +748,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
                 SubjectCapability::ParticipantConnectivity
             }
             ScenarioStep::SyncRelayHistory { .. } => SubjectCapability::RetainedRelayHistory,
-            ScenarioStep::ConfigureRelay { .. }
-            | ScenarioStep::SetRelayEventVisibility { .. }
+            ScenarioStep::ConfigureRelay { .. } => SubjectCapability::RetainedRelayConfiguration,
+            ScenarioStep::SetRelayEventVisibility { .. }
             | ScenarioStep::ReconcileRelayHistories { .. } => {
                 SubjectCapability::RetainedRelayControl
             }
@@ -741,6 +767,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             | ScenarioStep::WithholdMessage { .. }
             | ScenarioStep::ReleaseWithheld { .. }
             | ScenarioStep::ReorderMessages { .. } => SubjectCapability::SemanticTransportFaults,
+            ScenarioStep::RaceInviteProfile { .. } => unreachable!("handled above"),
             ScenarioStep::Barrier { .. } => unreachable!("handled above"),
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),

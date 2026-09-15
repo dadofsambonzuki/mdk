@@ -382,3 +382,7 @@ checks do not expand once per participant/message pair. The whole-history assert
 The ignored `large_group_app_canary` selects one case using `MDK_LARGE_APP_CASE=0..5`, preserves its
 input/report, and mutates every participant's message/roster/profile observations to prove oracle
 sensitivity. See `SCENARIOS.md` for the production-policy command and evidence boundaries.
+
+See [app recovery expansion](APP_RECOVERY_EXPANSION.md) for generated contracts and weekly/manual campaign selection.
+The expansion contracts cover indices 0–3, publication/event/reopen capability preflight, and strict recovery evidence;
+`app_runtime::tests::unknown_group_tolerance_preserves_refusal_boundary` pins the transient error wrapper boundary.

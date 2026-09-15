@@ -43,6 +43,19 @@ use crate::{
 
 pub const APP_RUNTIME_OBSERVATION_SCHEMA_VERSION: &str = "1";
 
+// Matches the fixed strict invite/rename journey's automatic re-invitation allowance.
+const INVITEE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(150);
+
+fn owns_relay(relay: &str) -> bool {
+    ["relay:shared", "relay:default"].contains(&relay)
+}
+
+fn tolerates_unknown_group(error: &SubjectError) -> bool {
+    error.code == "unknown_group"
+        || (error.category == SubjectFailureCategory::ExpectedRefusal
+            && error.message.ends_with("unknown_group"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRuntimeProtocolProjectionV1 {
     pub epoch: u64,
@@ -411,11 +424,11 @@ impl AppRuntimeHarness {
         clients: &[String],
         visible: bool,
     ) -> Result<(), SubjectError> {
-        if relay != "relay:shared" {
+        if !owns_relay(relay) {
             return Err(SubjectError::classified(
                 SubjectFailureCategory::ExpectedRefusal,
                 "unknown_relay",
-                "the app-runtime adapter owns only relay:shared",
+                "the app-runtime adapter owns relay:shared and its relay:default alias",
             ));
         }
         if clients
@@ -1834,8 +1847,7 @@ impl ConvergenceSubject for AppRuntimeHarness {
         relay: &str,
         outage_ms: u64,
     ) -> Result<(), SubjectError> {
-        if !["relay:shared", "relay:default"].contains(&relay) || !(1..=30_000).contains(&outage_ms)
-        {
+        if !owns_relay(relay) || !(1..=30_000).contains(&outage_ms) {
             return Err(SubjectError::new(
                 "invalid_relay_interruption",
                 "unknown local relay or invalid outage duration",
@@ -1867,6 +1879,141 @@ impl ConvergenceSubject for AppRuntimeHarness {
             ));
         }
         Ok(())
+    }
+
+    async fn race_invite_profile(
+        &mut self,
+        action_id: &str,
+        actors: &[String],
+        invitee: &str,
+        name: &str,
+        restart_at_offer: bool,
+    ) -> Result<(), SubjectError> {
+        // With equal-depth same-epoch branches, convergence's final tip_committer
+        // tie-break favors the smaller identity. The higher-identity invite then
+        // loses. Earlier selector criteria may break the tie (including after a
+        // restart); only an actual rejoin offer below proves this race occurred.
+        let (inviter, renamer) =
+            if self.account_identity(&actors[0])? < self.account_identity(&actors[1])? {
+                (&actors[1], &actors[0])
+            } else {
+                (&actors[0], &actors[1])
+            };
+        let invitees = vec![invitee.to_owned()];
+        let report = self
+            .race_mutations(
+                action_id,
+                &[
+                    ConcurrentMutation::InviteMembers {
+                        inviter,
+                        invitees: &invitees,
+                    },
+                    ConcurrentMutation::UpdateGroupProfile {
+                        client: renamer,
+                        name: Some(name),
+                        description: None,
+                    },
+                ],
+            )
+            .await?;
+        let all_accepted = report.outcomes.iter().all(|o| o.accepted);
+        let evidence_index = self.stimulus_observations.len();
+        self.stimulus_observations.push(
+            crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                action_id: action_id.into(),
+                inviter: inviter.clone(),
+                renamer: renamer.clone(),
+                outcomes: report.outcomes,
+                admitted_publications: report.admitted_publications,
+                explicit_rejoin: false,
+                offer_survived_restart: false,
+                confirmation_survived_restart: false,
+            },
+        );
+        if !all_accepted {
+            return Err(SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "invite_profile_race_not_exercised",
+                "a competing command was refused; retained outcomes do not establish race recovery",
+            ));
+        }
+        // A barrier alone proves simultaneous calls, not a losing branch. Only
+        // a validated rejoin offer and explicit recovery satisfy this action.
+        let deadline = tokio::time::Instant::now() + INVITEE_RECOVERY_TIMEOUT;
+        loop {
+            self.tick(actors).await?;
+            match self.tick(&invitees).await {
+                Ok(()) => (),
+                Err(error) if tolerates_unknown_group(&error) => {}
+                Err(error) => return Err(error),
+            }
+            let status = self.group_recovery_status(invitee).await;
+            match status {
+                Ok(status) => {
+                    if let Some(offer) = status.rejoin_invitations.first() {
+                        let offer = offer.clone();
+                        if restart_at_offer {
+                            self.reopen(invitee).await?;
+                            if !self
+                                .group_recovery_status(invitee)
+                                .await?
+                                .rejoin_invitations
+                                .contains(&offer)
+                            {
+                                return Err(SubjectError::new(
+                                    "rejoin_offer_lost",
+                                    "validated offer did not survive reopen",
+                                ));
+                            }
+                            if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                                offer_survived_restart,
+                                ..
+                            } = &mut self.stimulus_observations[evidence_index]
+                            {
+                                *offer_survived_restart = true;
+                            }
+                        }
+                        self.confirm_group_rejoin(invitee, &offer).await?;
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            explicit_rejoin,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *explicit_rejoin = true;
+                        }
+                        self.reopen(invitee).await?;
+                        let view = self.observations(&invitees).await?;
+                        if view[0].application.pending_confirmation {
+                            return Err(SubjectError::new(
+                                "rejoin_confirmation_lost",
+                                "confirmed rejoin did not survive reopen",
+                            ));
+                        }
+                        if let crate::ScenarioStimulusObservation::InviteProfileRecovery {
+                            confirmation_survived_restart,
+                            ..
+                        } = &mut self.stimulus_observations[evidence_index]
+                        {
+                            *confirmation_survived_restart = true;
+                        }
+                        return Ok(());
+                    }
+                }
+                Err(error) if tolerates_unknown_group(&error) => {}
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Accepted mutations without an offer cannot distinguish an
+                // unexercised selector tie from broken recovery. Keep this an
+                // unresolved failure, not an expected refusal inferred from time.
+                return Err(SubjectError::new(
+                    "explicit_invitee_recovery_not_exercised",
+                    "accepted concurrent calls did not produce a validated recipient recovery offer",
+                ));
+            }
+            self.run_due_maintenance(actors).await?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     async fn race_group_profiles(
@@ -2571,6 +2718,34 @@ async fn make_participant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_group_tolerance_preserves_refusal_boundary() {
+        assert!(tolerates_unknown_group(&SubjectError::new(
+            "unknown_group",
+            "group unavailable"
+        )));
+        assert!(tolerates_unknown_group(&SubjectError::classified(
+            SubjectFailureCategory::ExpectedRefusal,
+            "wrapped_refusal",
+            "public observation: unknown_group"
+        )));
+        for error in [
+            SubjectError::new("wrapped_refusal", "public observation: unknown_group"),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "public observation: permission_denied",
+            ),
+            SubjectError::classified(
+                SubjectFailureCategory::ExpectedRefusal,
+                "wrapped_refusal",
+                "unknown_group: unexpected trailing detail",
+            ),
+        ] {
+            assert!(!tolerates_unknown_group(&error), "{error}");
+        }
+    }
 
     /// Even a pre-publication validation error must release maintenance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
