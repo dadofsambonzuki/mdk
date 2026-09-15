@@ -3007,13 +3007,7 @@ fn select_timeline_rows_tx(
     canonical_group_order: bool,
     hide_blocked: bool,
 ) -> StorageResult<Vec<TimelineMessageRecord>> {
-    let (mut sql, params) = timeline_query_sql(query, pagination, canonical_group_order)?;
-    if hide_blocked {
-        sql = sql.replace(
-            "FROM message_timeline AS timeline",
-            "FROM visible_message_timeline AS timeline",
-        );
-    }
+    let (sql, params) = timeline_query_sql(query, pagination, canonical_group_order, hide_blocked)?;
     let _span = tracing::debug_span!(
         target: "storage_sqlite::timeline",
         "timeline_select",
@@ -3139,7 +3133,13 @@ fn timeline_query_sql(
     query: &TimelineMessageQuery,
     pagination: &ValidatedPagination,
     canonical_group_order: bool,
+    hide_blocked: bool,
 ) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
+    let source = if hide_blocked {
+        "visible_message_timeline"
+    } else {
+        "message_timeline"
+    };
     let mut clauses = Vec::new();
     let mut params = Vec::new();
     if let Some(group_id_hex) = &query.group_id_hex {
@@ -3235,7 +3235,7 @@ fn timeline_query_sql(
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
                     timeline.deleted_by_message_id_hex, timeline.invalidation_status
-             FROM message_timeline AS timeline
+             FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex
               AND source.message_id_hex = timeline.message_id_hex

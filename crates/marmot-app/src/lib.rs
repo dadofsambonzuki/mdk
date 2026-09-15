@@ -2417,7 +2417,7 @@ impl MarmotApp {
             .collect())
     }
 
-    /// Resolve one durable raw app event by group/message id.
+    /// Resolve one app-visible event by group/message id, applying block policy.
     pub fn message_by_id(
         &self,
         label: &str,
@@ -2426,24 +2426,13 @@ impl MarmotApp {
     ) -> Result<Option<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
-        if let Some(record) = storage.app_message(group_id_hex, message_id_hex)? {
-            if storage.is_user_blocked(&record.sender)? {
-                return Ok(None);
-            }
-            if let Some(group) = self.group(label, group_id_hex)?
-                && group.pending_confirmation
-                && group
-                    .welcomer_account_id_hex
-                    .as_deref()
-                    .is_some_and(|key| storage.is_user_blocked(key).unwrap_or(true))
-            {
-                return Ok(None);
-            }
+        let Some(record) = storage.app_message(group_id_hex, message_id_hex)? else {
+            return Ok(None);
+        };
+        if !storage.is_app_author_visible(&record.sender, group_id_hex)? {
+            return Ok(None);
         }
-        Ok(self
-            .account_storage(label)?
-            .app_message(group_id_hex, message_id_hex)?
-            .map(app_message_record_from_stored))
+        Ok(Some(app_message_record_from_stored(record)))
     }
 
     /// Resolve the reacted-to target for a reaction notification from the

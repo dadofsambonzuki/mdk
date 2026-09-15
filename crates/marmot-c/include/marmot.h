@@ -6113,8 +6113,7 @@ MarmotStatus marmot_refresh_user_relay_lists(const struct MarmotClient *client,
                                              struct MarmotAccountRelayLists **out);
 
 /**
- * The account ids this account follows (NIP-02). Free with
- * `marmot_string_list_free`.
+ * Block a user privately and publish the updated list. Requires relay synchronization.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6127,6 +6126,7 @@ MarmotStatus marmot_block_user(const struct MarmotClient *client,
                                const char *user_account_id_hex);
 
 /**
+ * Unblock a user and publish the updated list. Requires relay synchronization.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6139,6 +6139,7 @@ MarmotStatus marmot_unblock_user(const struct MarmotClient *client,
                                  const char *user_account_id_hex);
 
 /**
+ * Read the local blocked-user list, newest first. Free with `marmot_blocked_user_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6151,6 +6152,7 @@ MarmotStatus marmot_get_blocked_users(const struct MarmotClient *client,
                                       struct MarmotBlockedUserList **out);
 
 /**
+ * Whether the local account currently blocks this public key.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -6164,6 +6166,8 @@ MarmotStatus marmot_is_user_blocked(const struct MarmotClient *client,
                                     bool *out);
 
 /**
+ * The account ids this account follows (NIP-02). Free with
+ * `marmot_string_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

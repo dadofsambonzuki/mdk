@@ -33,6 +33,23 @@ pub struct PendingBlockPublication {
 }
 
 impl SqliteAccountStorage {
+    /// Cheap policy probes for live subscriptions; never materialize the list.
+    pub fn has_blocked_users(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row("SELECT EXISTS(SELECT 1 FROM user_blocks)", [], |row| {
+                row.get(0)
+            })
+            .storage()
+    }
+
+    pub fn block_list_revision(&self) -> StorageResult<u64> {
+        let revision: i64 = self
+            .lock()?
+            .query_row("SELECT revision FROM user_block_list", [], |row| row.get(0))
+            .storage()?;
+        crate::i64_to_u64(revision)
+    }
+
     pub fn block_list_snapshot(&self) -> StorageResult<BlockListSnapshot> {
         let conn = self.lock()?;
         let revision: i64 = conn

@@ -199,7 +199,8 @@ cross-device edits to compete.
 `BlockListUnavailable` means synchronization or definite publication failed;
 changes learned during the preceding fetch are retained. `BlockPublicationUncertain`
 means delivery or local completion is unresolved. The exact signed event remains in
-the account database. Retrying the same operation reuses it after fetching again;
+the account database. While it is unresolved, other edits return the same uncertainty
+error. Retrying the original operation reuses it after fetching again;
 a newer remote replacement supersedes the old intent. Startup reconciles retained
 intents against relays. Success requires relay acceptance and committed local state.
 An unreadable authenticated replacement prevents edits until a readable replacement
@@ -214,6 +215,10 @@ inviters remain stored but hidden; new Welcomes are checked against their authen
 sender before admission and durably dismissed. Unblocking refreshes retained content
 and invitations without replaying suppressed notifications. Raw storage and the
 runtime diagnostic event stream remain separate from these presentation APIs.
+Notification suppression records are removed when their source event or group is
+physically deleted. Dismissed Welcome IDs remain for the account's lifetime: they
+have no admitted group or event to attach retention to, and forgetting them would
+allow an old relay delivery to create an invitation after unblocking.
 
 Native screens and imports of old White Noise local databases are outside this
 feature. Existing published lists migrate through relay synchronization.

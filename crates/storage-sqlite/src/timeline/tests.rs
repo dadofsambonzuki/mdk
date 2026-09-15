@@ -3512,3 +3512,43 @@ fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
         6
     );
 }
+
+#[test]
+fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fence_retained() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .adopt_block_list(
+            &crate::StoredBlockList {
+                event_id: "block".into(),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[("bob".into(), true)],
+            1,
+            "local",
+            &no_mentions,
+        )
+        .unwrap();
+    let event = chat("hidden", "bob", 2, "retained until prune");
+    store.record_app_event(&event).unwrap();
+    store.dismiss_blocked_welcome("old-welcome").unwrap();
+    assert!(
+        store
+            .blocked_notification_suppressed(&event.group_id_hex, "hidden")
+            .unwrap()
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2",
+            rusqlite::params![event.group_id_hex, "hidden"],
+        )
+        .unwrap();
+    assert!(
+        !store
+            .blocked_notification_suppressed(&event.group_id_hex, "hidden")
+            .unwrap()
+    );
+    assert!(store.is_blocked_welcome_dismissed("old-welcome").unwrap());
+}

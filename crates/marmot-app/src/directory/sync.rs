@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use cgka_traits::TransportEndpoint;
@@ -365,17 +366,33 @@ async fn run_directory_sync_once(
     relay_plane: MarmotRelayPlane,
     force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, AppError> {
-    for account in app.account_home().accounts()? {
-        let lock = app.block_update_lock(&account.label).await;
-        let _guard = lock.lock().await;
-        let _ = app.fetch_block_list(&account.label).await;
-    }
-    let plan = blocking_app_task(move || app.directory_sync_plan()).await?;
+    let app_for_plan = app.clone();
+    let plan = blocking_app_task(move || app_for_plan.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
         .sync_directory_user_subscriptions(plan, force_rebuild)
         .await
         .map_err(AppError::RelayDirectory)?;
+    // Install live subscriptions first. Reconcile accounts concurrently with a
+    // fixed bound so one slow account does not serialize every other account's
+    // startup/reconnect, and report failures without exposing identities.
+    let accounts = app.account_home().accounts()?;
+    let failures = stream::iter(accounts.into_iter().map(|account| {
+        let app = app.clone();
+        async move {
+            let lock = app.block_update_lock(&account.label).await;
+            let _guard = lock.lock().await;
+            app.fetch_block_list(&account.label).await.is_err()
+        }
+    }))
+    .buffer_unordered(4)
+    .fold(0usize, |count, failed| async move {
+        count + usize::from(failed)
+    })
+    .await;
+    if failures != 0 {
+        tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_once", failed_account_count = failures, "block list reconciliation incomplete");
+    }
     Ok(DirectorySyncRunSummary {
         watched_user_count,
         active_subscriptions: subscriptions.active_subscriptions,

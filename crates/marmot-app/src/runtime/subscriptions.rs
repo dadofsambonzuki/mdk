@@ -51,13 +51,22 @@ impl RuntimeMessagesSubscription {
                 update = self.updates.recv() => update?,
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
             };
+            // Recheck queued payloads: the producer may have enqueued this
+            // before a block committed. Storage errors terminate the stream so
+            // callers can resubscribe; they must not silently lose one update.
             let message = update.message();
-            if self
-                .policy_storage
-                .is_app_author_visible(&message.sender, &hex::encode(message.group_id.as_slice()))
-                .unwrap_or(false)
+            let sender = message.sender.clone();
+            let group = hex::encode(message.group_id.as_slice());
+            let storage = self.policy_storage.clone();
+            match blocking_app_task(move || Ok(storage.is_app_author_visible(&sender, &group)?))
+                .await
             {
-                return Some(update);
+                Ok(true) => return Some(update),
+                Ok(false) => continue,
+                Err(_) => {
+                    tracing::warn!(target: "marmot_app::runtime", method = "message_subscription_recv", "message policy read failed; closing subscription");
+                    return None;
+                }
             }
         }
     }
@@ -71,6 +80,61 @@ impl RuntimeMessagesSubscription {
 pub enum RuntimeTimelineMessageUpdate {
     Page { page: TimelinePage },
     Projection(RuntimeProjectionUpdate),
+}
+
+/// Rehydrate a queued delta by id, retaining incremental window updates even
+/// when another conversation has a blocked participant.
+fn filter_projection_for_block_policy(
+    storage: &storage_sqlite::SqliteAccountStorage,
+    mut update: RuntimeProjectionUpdate,
+) -> Result<RuntimeProjectionUpdate, AppError> {
+    if !storage.has_blocked_users()? {
+        return Ok(update);
+    }
+    let mut records = HashMap::new();
+    let ids = update
+        .update
+        .timeline_messages
+        .iter()
+        .map(|m| m.message_id_hex.clone())
+        .chain(
+            update
+                .update
+                .timeline_changes
+                .iter()
+                .filter_map(|change| match change {
+                    TimelineMessageChange::Upsert { message, .. } => {
+                        Some(message.message_id_hex.clone())
+                    }
+                    TimelineMessageChange::Remove { .. } => None,
+                }),
+        )
+        .collect::<HashSet<_>>();
+    for id in ids {
+        if let Some(message) = storage.timeline_message(&update.update.group_id_hex, &id)? {
+            records.insert(id, message);
+        }
+    }
+    update.update.timeline_messages = update
+        .update
+        .timeline_messages
+        .iter()
+        .filter_map(|m| records.get(&m.message_id_hex).cloned())
+        .collect();
+    for change in &mut update.update.timeline_changes {
+        if let TimelineMessageChange::Upsert { message, .. } = change {
+            if let Some(current) = records.get(&message.message_id_hex) {
+                **message = current.clone();
+            } else {
+                *change = TimelineMessageChange::Remove {
+                    message_id_hex: message.message_id_hex.clone(),
+                    reason: storage_sqlite::TimelineRemoveReason::NoLongerMatchesQuery,
+                };
+            }
+        }
+    }
+    update.update.chat_list_row = storage.chat_list_row(&update.update.group_id_hex)?;
+    Ok(update)
 }
 
 /// Maximum number of messages a timeline subscription keeps materialized at
@@ -408,15 +472,22 @@ impl RuntimeTimelineMessagesSubscription {
             self.policy_window_size = self
                 .policy_window_size
                 .max(self.window.snapshot().messages.len());
-            // A projection may have queued before a policy change. Re-read the
-            // presentation instead of exposing that buffered payload while blocked.
-            let signal = if matches!(signal, TimelineSubscriptionSignal::Projection(_))
-                && !self
-                    .policy_storage
-                    .block_list_snapshot()
-                    .is_ok_and(|s| s.users.is_empty())
-            {
-                TimelineSubscriptionSignal::PolicyRefresh
+            // Refresh only the affected records under current policy, including
+            // quotes and reactions in payloads queued before a block committed.
+            // An unrelated block must not turn every delta into a full page read.
+            let signal = if let TimelineSubscriptionSignal::Projection(update) = signal {
+                let storage = self.policy_storage.clone();
+                match blocking_app_task(move || {
+                    filter_projection_for_block_policy(&storage, *update)
+                })
+                .await
+                {
+                    Ok(update) => TimelineSubscriptionSignal::Projection(Box::new(update)),
+                    Err(_) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "timeline_subscription_recv", "timeline policy read failed; closing subscription");
+                        return None;
+                    }
+                }
             } else {
                 signal
             };
@@ -1041,18 +1112,8 @@ impl MarmotAppRuntime {
                     continue;
                 }
                 let message = update.message();
-                if app
-                    .account_storage(&account_label)
-                    .and_then(|s| {
-                        Ok(!s.is_app_author_visible(
-                            &message.sender,
-                            &hex::encode(message.group_id.as_slice()),
-                        )?)
-                    })
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
+                // The consumer owns the current-policy check, including buffered
+                // payloads. Do not discard updates here on storage errors.
                 if group_id_hex.as_deref()
                     != Some(hex::encode(message.group_id.as_slice()).as_str())
                     && group_id_hex.is_some()
@@ -1098,6 +1159,7 @@ impl MarmotAppRuntime {
         let mut block_changes = app.block_list_updates.subscribe();
         let policy_storage = app.account_storage(&account_label)?;
         let subscription_policy_storage = policy_storage.clone();
+        let mut policy_revision = policy_storage.block_list_revision()?;
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot_query = query.clone();
         let app_for_snapshot = app.clone();
@@ -1147,7 +1209,19 @@ impl MarmotAppRuntime {
                     _ = wait_for_runtime_shutdown(&mut stopping) => return,
                     event = events.recv() => event,
                     changed = block_changes.changed() => {
-                        if changed.is_err() || updates_tx.send(TimelineSubscriptionSignal::PolicyRefresh).await.is_err() { return; }
+                        if changed.is_err() {
+                            return;
+                        }
+                        let storage = policy_storage.clone();
+                        let Ok(revision) = blocking_app_task(move || Ok(storage.block_list_revision()?)).await else {
+                            return;
+                        };
+                        if revision != policy_revision {
+                            policy_revision = revision;
+                            if updates_tx.send(TimelineSubscriptionSignal::PolicyRefresh).await.is_err() {
+                                return;
+                            }
+                        }
                         continue;
                     }
                 };
@@ -1177,11 +1251,7 @@ impl MarmotAppRuntime {
                 ) {
                     continue;
                 }
-                let signal = if deltas_applicable
-                    && policy_storage
-                        .block_list_snapshot()
-                        .is_ok_and(|s| s.users.is_empty())
-                {
+                let signal = if deltas_applicable {
                     TimelineSubscriptionSignal::Projection(Box::new(update.clone()))
                 } else {
                     TimelineSubscriptionSignal::Refresh
@@ -1291,10 +1361,18 @@ impl MarmotAppRuntime {
                     return;
                 }
                 let group = match blocking_app_task(move || {
-                    Ok(app_for_lookup
-                        .listed_groups(&account_label_for_lookup, include_archived)?
-                        .into_iter()
-                        .find(|g| g.group_id_hex == group_id_hex_for_lookup))
+                    let group = app_for_lookup
+                        .group(&account_label_for_lookup, &group_id_hex_for_lookup)?;
+                    if let Some(group) = &group
+                        && group.pending_confirmation
+                        && let Some(inviter) = &group.welcomer_account_id_hex
+                        && app_for_lookup
+                            .account_storage(&account_label_for_lookup)?
+                            .is_user_blocked(inviter)?
+                    {
+                        return Ok(None);
+                    }
+                    Ok(group)
                 })
                 .await
                 {

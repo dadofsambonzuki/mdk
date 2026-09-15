@@ -138,11 +138,23 @@ impl MarmotAppRuntime {
             let final_update = tokio::select! {
                 _ = wait_for_runtime_shutdown(&mut stopping) => return,
                 update = &mut watch => update,
-                _ = async {
+                reason = async {
                     loop {
-                        if block_changes.changed().await.is_err() || policy_storage.is_user_blocked(&sender_hex).unwrap_or(true) { break; }
+                        if block_changes.changed().await.is_err() {
+                            return None;
+                        }
+                        let storage = policy_storage.clone();
+                        let sender = sender_hex.clone();
+                        match blocking_app_task(move || Ok(storage.is_user_blocked(&sender)?)).await {
+                            Ok(false) => continue,
+                            Ok(true) => return Some("agent stream preview withdrawn by block policy"),
+                            Err(_) => return Some("agent stream preview policy check unavailable"),
+                        }
                     }
-                } => RuntimeAgentStreamUpdate::Failed { message:"agent stream preview withdrawn by block policy".into() },
+                } => match reason {
+                    Some(message) => RuntimeAgentStreamUpdate::Failed { message: message.into() },
+                    None => return,
+                },
                 reason = wait_for_preview_invalidation(
                     &mut runtime_events,
                     &invalidation_group_id,

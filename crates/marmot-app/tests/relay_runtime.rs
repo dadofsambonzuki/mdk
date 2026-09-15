@@ -14052,6 +14052,26 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
 /// Published policy is account-scoped and follows the identity across independent databases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
+    // Real relay publication can lose an acknowledgement. Exercise the public
+    // explicit-retry contract; success and cross-device observation are still
+    // required, and unavailable synchronization is not treated as success.
+    async fn edit(runtime: &MarmotAppRuntime, target: &str, blocked: bool) {
+        for attempt in 0..3 {
+            let result = if blocked {
+                runtime.block_user("alice", target).await
+            } else {
+                runtime.unblock_user("alice", target).await
+            };
+            match result {
+                Ok(()) => return,
+                Err(AppError::BlockPublicationUncertain) if attempt < 2 => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("block-list operation failed: {error}"),
+            }
+        }
+        unreachable!("last attempt must succeed or fail");
+    }
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
     let (_relay, first_app, url) = mock_app(&first_dir).await;
@@ -14078,10 +14098,7 @@ async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
     let second = second_app.runtime();
     first.start().await.unwrap();
     second.start().await.unwrap();
-    first
-        .block_user("alice", &bob.account_id_hex)
-        .await
-        .unwrap();
+    edit(&first, &bob.account_id_hex, true).await;
     timeout(Duration::from_secs(15), async {
         while !second
             .is_user_blocked("alice", &bob.account_id_hex)
@@ -14093,10 +14110,7 @@ async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
     .await
     .expect("second device learns private block");
     assert!(first.get_blocked_users("bob").unwrap().is_empty());
-    second
-        .unblock_user("alice", &bob.account_id_hex)
-        .await
-        .unwrap();
+    edit(&second, &bob.account_id_hex, false).await;
     timeout(Duration::from_secs(15), async {
         while first.is_user_blocked("alice", &bob.account_id_hex).unwrap() {
             sleep(Duration::from_millis(25)).await;
@@ -14104,10 +14118,7 @@ async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
     })
     .await
     .expect("first device learns empty replacement");
-    first
-        .block_user("alice", &bob.account_id_hex)
-        .await
-        .unwrap();
+    edit(&first, &bob.account_id_hex, true).await;
     second.shutdown().await;
     first.shutdown().await;
     drop(second);
@@ -14228,7 +14239,7 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
             .is_none()
     );
     assert!(matches!(
-        runtime.accept_group_invite(&alice, &pending).await,
+        accept_group_invite_retrying_busy(&runtime, &alice, &pending).await,
         Err(AppError::UserBlocked)
     ));
     let mut events = runtime.subscribe();
@@ -14366,6 +14377,16 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
         .await
         .unwrap();
     runtime.block_user(alice, bob).await.unwrap();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            alice,
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let mut events = runtime.subscribe();
     let hidden = runtime
         .send_message(bob, &group, b"hidden author".to_vec())
@@ -14377,6 +14398,29 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
         .await
         .unwrap();
     wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::MessageReceived(m) if &m.account_id_hex==alice && m.message.message_id_hex==visible.message_ids[0])).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let update = timeline.recv().await.unwrap();
+            assert!(
+                !timeline
+                    .take_snapshot()
+                    .messages
+                    .iter()
+                    .any(|m| m.message_id_hex == hidden.message_ids[0])
+            );
+            if let marmot_app::RuntimeTimelineMessageUpdate::Projection(update) = update
+                && update
+                    .update
+                    .timeline_messages
+                    .iter()
+                    .any(|m| m.message_id_hex == visible.message_ids[0])
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("blocking preserves incremental visible-author updates");
     let group_hex = hex::encode(group.as_slice());
     assert!(
         runtime

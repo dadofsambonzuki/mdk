@@ -31,6 +31,16 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         WHEN NEW.sender IN (SELECT public_key FROM user_blocks) BEGIN
             INSERT OR IGNORE INTO blocked_notification_suppressions VALUES (NEW.group_id_hex,NEW.message_id_hex);
         END;
+        -- Notification identities have no replay target after physical event or
+        -- group deletion. Welcome dismissals have no admitted group/event row:
+        -- retain their ids for the account lifetime to reject relay replay.
+        CREATE TRIGGER prune_blocked_notification AFTER DELETE ON app_events BEGIN
+            DELETE FROM blocked_notification_suppressions
+            WHERE group_id=OLD.group_id_hex AND message_id=OLD.message_id_hex;
+        END;
+        CREATE TRIGGER prune_group_blocked_notifications AFTER DELETE ON account_groups BEGIN
+            DELETE FROM blocked_notification_suppressions WHERE group_id=OLD.group_id_hex;
+        END;
         CREATE TABLE blocked_welcome_dismissals (message_id TEXT PRIMARY KEY);
         CREATE INDEX idx_account_groups_pending_inviter ON account_groups(welcomer_account_id_hex,group_id_hex) WHERE pending_confirmation != 0;
         -- Keep the exclusion set indexed. Navigation and badges must never scan
