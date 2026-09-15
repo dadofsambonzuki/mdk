@@ -213,6 +213,9 @@ catches up, including after restart. Private plaintext never enters the shared d
 Blocking retains history and existing DMs, disables their user-authored sends, and
 rejects new DMs with `UserBlocked`. It hides blocked authors from app message reads,
 search, timelines, media lists, reactions, quotes, previews, and attention counts.
+Chat-list activity ordering deliberately still advances on blocked traffic; when
+the latest message's author is blocked, its preview is blank and no older visible
+message is substituted.
 Manual-unread reminders remain independent. Shared groups continue to process MLS
 state and permit communication with other members. Pending invitations from blocked
 inviters remain stored but hidden; new Welcomes are checked against their authenticated

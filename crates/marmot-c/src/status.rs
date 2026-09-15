@@ -249,6 +249,9 @@ mod tests {
         // exhaustive match forces a new arm for a new variant; add the variant
         // here too so a duplicated or renumbered stable status cannot pass.
         let variants: Vec<MarmotKitError> = vec![
+            MarmotKitError::UserBlocked,
+            MarmotKitError::BlockListUnavailable,
+            MarmotKitError::BlockPublicationUncertain,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -405,8 +408,17 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            68,
+            71,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
+        );
+        assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
+            79
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
+            80
         );
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
