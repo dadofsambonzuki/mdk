@@ -285,6 +285,10 @@ impl TimelineWindowHandle {
         self.lock().page.clone()
     }
 
+    fn message_count(&self) -> usize {
+        self.lock().page.messages.len()
+    }
+
     /// Extend the window toward older history by up to `count` messages and
     /// return the updated window. A no-op (returns the current window) when no
     /// older messages exist. The store read runs off the caller thread.
@@ -469,9 +473,7 @@ impl RuntimeTimelineMessagesSubscription {
                 signal = self.updates.recv() => signal?,
                 _ = wait_for_runtime_shutdown(&mut self.stopping) => return None,
             };
-            self.policy_window_size = self
-                .policy_window_size
-                .max(self.window.snapshot().messages.len());
+            self.policy_window_size = self.policy_window_size.max(self.window.message_count());
             // Refresh only the affected records under current policy, including
             // quotes and reactions in payloads queued before a block committed.
             // An unrelated block must not turn every delta into a full page read.

@@ -34,12 +34,6 @@ impl std::fmt::Display for AccountCatchUpFailure {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("user is blocked")]
-    UserBlocked,
-    #[error("block list synchronization unavailable")]
-    BlockListUnavailable,
-    #[error("block list publication outcome is uncertain; retry to reconcile")]
-    BlockPublicationUncertain,
     #[error(transparent)]
     ProductAnalytics(#[from] crate::ProductAnalyticsError),
     #[error(transparent)]
@@ -140,6 +134,12 @@ pub enum AppError {
     /// an empty list could silently erase follows published elsewhere.
     #[error("current account follow list is unavailable")]
     FollowListUnavailable,
+    #[error("user is blocked")]
+    UserBlocked,
+    #[error("block list synchronization unavailable")]
+    BlockListUnavailable,
+    #[error("block list publication outcome is uncertain; retry to reconcile")]
+    BlockPublicationUncertain,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).

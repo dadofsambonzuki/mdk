@@ -323,7 +323,7 @@ pub(super) fn opening_tx(
             ConversationOpenAnchorOutcome::Empty => unreachable!(),
         }
     }
-    attach_reply_previews(conn, &mut messages)?;
+    hydrate_timeline_presentation(conn, &mut messages)?;
     let anchors = messages
         .iter()
         .map(|message| {

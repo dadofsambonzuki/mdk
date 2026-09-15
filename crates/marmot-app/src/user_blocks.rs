@@ -103,24 +103,35 @@ impl MarmotApp {
             private_tags,
         };
         let entries = block_entries(&list, &account.account_id_hex);
-        if storage.adopt_block_list(
-            &list,
-            &entries,
-            crate::notifications::unix_now_ms(),
-            &account.account_id_hex,
-            &Self::chat_list_mention_classifier(&account.account_id_hex),
-        )? {
-            if let Ok(version) = storage.chat_presentation_version() {
-                let _ = self.presentation_signals.updates.send(
-                    crate::chat_presentation::signals::PresentationInvalidation {
-                        account_label: label.to_owned(),
-                        version,
-                    },
-                );
+        // The atomic replacement rebuilds every chat projection. Keep that
+        // potentially large synchronous transaction off the Tokio executor.
+        let local_account_id = account.account_id_hex.clone();
+        let app = self.clone();
+        let label = label.to_owned();
+        crate::blocking_app_task(move || {
+            if storage.adopt_block_list(
+                &list,
+                &entries,
+                crate::notifications::unix_now_ms(),
+                &local_account_id,
+                &Self::chat_list_mention_classifier(&local_account_id),
+            )? {
+                // Commit and invalidation stay in the same blocking task even
+                // if its async caller is cancelled while the transaction runs.
+                if let Ok(version) = storage.chat_presentation_version() {
+                    let _ = app.presentation_signals.updates.send(
+                        crate::chat_presentation::signals::PresentationInvalidation {
+                            account_label: label,
+                            version,
+                        },
+                    );
+                }
+                app.block_list_updates
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
             }
-            self.block_list_updates
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-        }
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 

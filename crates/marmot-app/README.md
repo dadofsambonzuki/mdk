@@ -202,7 +202,11 @@ means delivery or local completion is unresolved. The exact signed event remains
 the account database. While it is unresolved, other edits return the same uncertainty
 error. Retrying the original operation reuses it after fetching again;
 a newer remote replacement supersedes the old intent. Startup reconciles retained
-intents against relays. Success requires relay acceptance and committed local state.
+intents against relays. A definite rejection on a later retry cannot disprove delivery
+of the original attempt: the intent still fences other edits until that original
+operation succeeds or a current relay replacement resolves it. Restoring relay write
+access may be necessary; retrying alone does not guarantee recovery.
+Success requires relay acceptance and committed local state.
 An unreadable authenticated replacement prevents edits until a readable replacement
 catches up, including after restart. Private plaintext never enters the shared directory.
 

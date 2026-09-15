@@ -995,7 +995,8 @@ fn group_invite_notification_is_not_a_mention() {
         &account.account_id_hex,
         &group_id,
     )
-    .unwrap();
+    .unwrap()
+    .expect("unblocked invitation produces a notification");
 
     assert!(matches!(update.trigger, NotificationTrigger::GroupInvite));
     assert_eq!(update.traffic_class, NotificationTrafficClass::Standard);

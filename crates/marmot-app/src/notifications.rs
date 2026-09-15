@@ -1592,15 +1592,7 @@ pub(crate) fn notification_update_from_event_cached(
             account_label,
             account_id_hex,
             group_id,
-        )
-        .map(Some)
-        .or_else(|error| {
-            if matches!(error, AppError::UserBlocked) {
-                Ok(None)
-            } else {
-                Err(error)
-            }
-        }),
+        ),
         MarmotAppEvent::GroupEvent(group_event) => {
             notification_update_from_runtime_group_event(app, resolver, group_event)
         }
@@ -1970,7 +1962,7 @@ fn notification_update_from_group_join(
     account_label: &str,
     account_id_hex: &str,
     group_id: &cgka_traits::GroupId,
-) -> Result<NotificationUpdate, AppError> {
+) -> Result<Option<NotificationUpdate>, AppError> {
     let settings = resolver.settings(app, account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
@@ -1996,14 +1988,14 @@ fn notification_update_from_group_join(
             ),
         )?
     {
-        return Err(AppError::UserBlocked);
+        return Ok(None);
     }
     let sender = resolver.user(app, &sender_id)?;
     let invite_ref = group
         .as_ref()
         .and_then(|group| group.via_welcome_message_id_hex.clone())
         .unwrap_or_else(|| group_id_hex.clone());
-    Ok(NotificationUpdate {
+    Ok(Some(NotificationUpdate {
         notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
         conversation_key: conversation_key(account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::GroupInvite,
@@ -2022,7 +2014,7 @@ fn notification_update_from_group_join(
         reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
         is_from_self: sender_id == account_id_hex,
-    })
+    }))
 }
 
 fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {

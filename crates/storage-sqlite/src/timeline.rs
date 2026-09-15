@@ -1419,7 +1419,7 @@ impl SqliteAccountStorage {
                 method = "message_timeline"
             )
             .entered();
-            attach_reply_previews(&conn, &mut messages)?;
+            hydrate_timeline_presentation(&conn, &mut messages)?;
         }
         Ok(TimelinePage {
             messages,
@@ -1459,7 +1459,7 @@ impl SqliteAccountStorage {
             .optional()
             .storage()?;
         if let Some(message) = message.as_mut() {
-            attach_reply_previews(&conn, std::slice::from_mut(message))?;
+            hydrate_timeline_presentation(&conn, std::slice::from_mut(message))?;
         }
         Ok(message)
     }
@@ -2994,7 +2994,7 @@ fn timeline_records_by_ids_tx(
         messages.extend(chunk_messages);
     }
     messages.sort_by(|left, right| left.canonical_order_key().cmp(&right.canonical_order_key()));
-    attach_reply_previews(tx, &mut messages)?;
+    hydrate_timeline_presentation(tx, &mut messages)?;
     Ok(messages)
 }
 
@@ -3651,29 +3651,11 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
     })
 }
 
-fn attach_reply_previews(
+fn hydrate_timeline_presentation(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
-    let blocked = {
-        let mut stmt = conn
-            .prepare_cached("SELECT public_key FROM user_blocks")
-            .storage()?;
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .storage()?
-            .collect::<Result<HashSet<_>, _>>()
-            .storage()?
-    };
-    for message in messages.iter_mut() {
-        message
-            .reactions
-            .user_reactions
-            .retain(|r| !blocked.contains(&r.sender));
-        message.reactions.by_emoji.retain(|_, senders| {
-            senders.retain(|s| !blocked.contains(s));
-            !senders.is_empty()
-        });
-    }
+    filter_blocked_reactions(conn, messages)?;
     let targets = messages
         .iter()
         .filter_map(|message| {
@@ -3696,6 +3678,40 @@ fn attach_reply_previews(
         message.reply_preview = previews
             .get(&(message.group_id_hex.clone(), target.clone()))
             .cloned();
+    }
+    Ok(())
+}
+
+fn filter_blocked_reactions(
+    conn: &Connection,
+    messages: &mut [TimelineMessageRecord],
+) -> StorageResult<()> {
+    if messages.iter().all(|message| {
+        message.reactions.user_reactions.is_empty() && message.reactions.by_emoji.is_empty()
+    }) {
+        return Ok(());
+    }
+    let blocked = {
+        let mut stmt = conn
+            .prepare_cached("SELECT public_key FROM user_blocks")
+            .storage()?;
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<HashSet<_>, _>>()
+            .storage()?
+    };
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    for message in messages.iter_mut() {
+        message
+            .reactions
+            .user_reactions
+            .retain(|r| !blocked.contains(&r.sender));
+        message.reactions.by_emoji.retain(|_, senders| {
+            senders.retain(|s| !blocked.contains(s));
+            !senders.is_empty()
+        });
     }
     Ok(())
 }
