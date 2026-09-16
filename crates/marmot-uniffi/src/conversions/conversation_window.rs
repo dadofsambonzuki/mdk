@@ -84,10 +84,12 @@ pub struct ConversationHeaderFfi {
     pub disbanding: bool,
     pub unrecoverable: bool,
     pub capabilities: ConversationCapabilitiesFfi,
+    pub avatar_asset: Option<AvatarAssetFfi>,
 }
 impl From<app::conversation_presentation::ConversationHeader> for ConversationHeaderFfi {
     fn from(v: app::conversation_presentation::ConversationHeader) -> Self {
         Self {
+            avatar_asset: v.avatar_asset.map(Into::into),
             selected: v.selected.into(),
             member_count: v.member_count,
             archived: v.archived,
@@ -105,10 +107,12 @@ pub struct ConversationIdentityFfi {
     pub display_name: String,
     pub avatar: SelectedAvatarFfi,
     pub has_cached_profile: bool,
+    pub avatar_asset: Option<AvatarAssetFfi>,
 }
 impl From<app::conversation_presentation::ConversationIdentity> for ConversationIdentityFfi {
     fn from(v: app::conversation_presentation::ConversationIdentity) -> Self {
         Self {
+            avatar_asset: v.avatar_asset.map(Into::into),
             account_id_hex: v.account_id_hex,
             display_name: v.display_name,
             avatar: v.avatar.into(),

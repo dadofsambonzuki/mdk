@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
 
@@ -515,6 +516,15 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Register up to 16 visible avatar targets without awaiting HTTP.
+    /// Free the returned list with `marmot_avatar_asset_list_free`.
+    async fn marmot_request_avatar_assets(account_ref: str, targets/targets_len: str_arr) -> rec(MarmotAvatarAssetList) = request_avatar_assets;
+    /// Read up to 16 local avatar references with a 1-byte..16-MiB aggregate byte budget.
+    /// Budget-deferred entries are explicit. Free with `marmot_avatar_bytes_list_free`.
+    async fn marmot_read_avatar_assets(account_ref: str, references/references_len: str_arr, max_bytes: val u64) -> rec(MarmotAvatarBytesList) = read_avatar_assets;
+    /// Remove this account's local avatar bytes and demand. Later visible requests may reacquire them.
+    async fn marmot_clear_avatar_cache(account_ref: str) -> unit = clear_avatar_cache;
+
     /// List every account known to this device. Free the result with
     /// `marmot_account_summary_list_free`.
     sync fn marmot_list_accounts() -> rec(MarmotAccountSummaryList) = list_accounts;
