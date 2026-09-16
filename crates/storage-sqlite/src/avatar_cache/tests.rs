@@ -362,6 +362,8 @@ fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     let result = store.read_avatar(&reference, 0).unwrap();
     assert_eq!(result.status.availability, AvatarAvailability::Missing);
     assert_eq!(result.status.content_revision, 2);
+    assert!(result.repaired);
+    assert!(!store.read_avatar(&reference, 0).unwrap().repaired);
     assert!(result.image.is_none());
     assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
     assert_eq!(
@@ -1227,6 +1229,16 @@ fn avatar_identity_demand_survives_directory_generation_catchup() {
             .unwrap()
             .is_none()
     );
+    let pending = store
+        .avatar_target_presentation("group", Some("member"), &selected_url("a"), 0)
+        .unwrap()
+        .unwrap();
+    let requested = store
+        .request_avatar_target(&pending.target, &selected_url("a"), Some(&version), 0)
+        .unwrap();
+    assert_eq!(requested.target, pending.target);
+    assert_eq!(requested.status.availability, AvatarAvailability::Missing);
+    assert!(requested.reference.is_none());
     let registered = store.requested_avatar_identities_after("").unwrap();
     assert_eq!(registered.len(), 1);
     let checkpoint = store.chat_presentation_checkpoint().unwrap();
@@ -1243,4 +1255,130 @@ fn avatar_identity_demand_survives_directory_generation_catchup() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn avatar_native_reference_and_byte_budget_preserve_source_fencing() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let reference = bind(&store, "owner");
+    publish(&store, &reference, &image(7, 16));
+    let decoded = AvatarAssetRef::from_opaque(&reference.to_opaque()).unwrap();
+    let short = store.read_avatar_bounded(&decoded, 0, 15).unwrap();
+    assert!(short.image.is_none());
+    assert_eq!(short.status.availability, AvatarAvailability::Ready);
+    assert_eq!(
+        store.read_avatar_bounded(&decoded, 0, 16).unwrap().image,
+        Some(image(7, 16))
+    );
+    store.bind_avatar_source("owner", "replacement").unwrap();
+    assert_eq!(
+        store
+            .read_avatar_bounded(&decoded, 0, 16)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    assert!(AvatarAssetRef::from_opaque("bad reference").is_err());
+}
+
+#[test]
+fn avatar_screen_targets_reject_another_account_or_recreated_conversation() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&store);
+    let asset = store
+        .avatar_target_presentation("group", None, &selected_url("a"), 0)
+        .unwrap()
+        .unwrap();
+    let target = AvatarAssetTarget::from_opaque(&asset.target.to_opaque()).unwrap();
+    assert_eq!(
+        store.resolve_avatar_target(&target).unwrap().as_deref(),
+        Some("group")
+    );
+    let other = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&other);
+    assert!(other.resolve_avatar_target(&target).unwrap().is_none());
+    assert_eq!(
+        other
+            .request_avatar_target(&target, &selected_url("a"), None, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM account_groups WHERE group_id_hex = 'group'",
+            [],
+        )
+        .unwrap();
+    seed_avatar_group(&store);
+    assert!(store.resolve_avatar_target(&target).unwrap().is_none());
+    assert_eq!(
+        store
+            .request_avatar_target(&target, &selected_url("a"), None, 0)
+            .unwrap()
+            .status
+            .availability,
+        AvatarAvailability::Invalidated
+    );
+    assert!(AvatarAssetTarget::from_opaque(&"x".repeat(1201)).is_err());
+}
+
+#[test]
+fn avatar_target_lookup_uses_the_conversation_incarnation_index() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let conn = store.lock().unwrap();
+    let mut query = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            access::AVATAR_TARGET_LOOKUP_SQL
+        ))
+        .unwrap();
+    let plan = query
+        .query_map(params![vec![0_u8; 16], vec![0_u8; 16]], |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("chat_avatar_target_lookup"))
+    );
+    assert!(!plan.iter().any(|line| line.contains("SCAN chat_list_rows")));
+}
+
+#[test]
+fn avatar_screen_and_byte_read_availability_agree_at_freshness_boundary() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed_avatar_group(&store);
+    let selected = selected_url("a");
+    let version = crate::ChatPresentationVersion {
+        store_epoch: vec![9; 16],
+        revision: 1,
+    };
+    let reference = store
+        .request_identity_avatar_acquisition("group", "member", &selected, &version)
+        .unwrap()
+        .unwrap();
+    let screen = |now| {
+        store
+            .avatar_target_presentation("group", Some("member"), &selected, now)
+            .unwrap()
+            .unwrap()
+            .status
+    };
+    assert_eq!(screen(0), store.read_avatar(&reference, 0).unwrap().status);
+    store
+        .publish_avatar(&reference, 0, &image(1, 16), Some(10))
+        .unwrap();
+    for now in [9, 10, 11] {
+        assert_eq!(
+            screen(now),
+            store.read_avatar(&reference, now).unwrap().status
+        );
+    }
 }

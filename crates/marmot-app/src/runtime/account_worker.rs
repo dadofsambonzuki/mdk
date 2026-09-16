@@ -1672,6 +1672,13 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                if client.backfill_content_reports().is_err() {
+                    tracing::warn!(
+                        target: "marmot_app::account_worker",
+                        method = "maintenance_tick",
+                        "report backfill deferred"
+                    );
+                }
                 run_legacy_message_promotion_batch(
                     &client,
                     &mut legacy_message_promotion,
@@ -2525,16 +2532,32 @@ fn schedule_avatar_acquisition(
 ) -> Result<bool, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let transport = client.blossom_http_transport.clone();
-    dispatch_avatar_acquisition(&storage, media_http, resumed, move |descriptor| {
-        let transport = transport.clone();
-        async move { crate::media::avatar::fetch(&descriptor, &transport).await }
-    })
+    let mut dispatched = false;
+    let result = dispatch_avatar_acquisition(
+        &storage,
+        media_http,
+        resumed,
+        &mut dispatched,
+        move |descriptor| {
+            let transport = transport.clone();
+            async move { crate::media::avatar::fetch(&descriptor, &transport).await }
+        },
+    );
+    if dispatched {
+        let _ = client
+            .app
+            .presentation_signals
+            .avatars
+            .send(client.state.label.clone());
+    }
+    result
 }
 
 fn dispatch_avatar_acquisition<F, Fut>(
     storage: &storage_sqlite::SqliteAccountStorage,
     media_http: &MediaHttpContext,
     resumed: &mut bool,
+    dispatched: &mut bool,
     fetch: F,
 ) -> Result<bool, AppError>
 where
@@ -2561,6 +2584,7 @@ where
         let Some(job) = storage.claim_avatar_acquisition(crate::unix_now_seconds())? else {
             break;
         };
+        *dispatched = true;
         let descriptor = job.descriptor.clone();
         spawn_media_http(media_http, permit, fetch(descriptor), move |result| {
             MediaHttpCompletion::Avatar { job, result }
@@ -2691,6 +2715,11 @@ async fn complete_media_http(
                         "avatar completion could not be committed");
                 }
             }
+            let _ = client
+                .app
+                .presentation_signals
+                .avatars
+                .send(client.state.label.clone());
         }
         MediaHttpCompletion::Upload {
             finish,
@@ -5978,7 +6007,7 @@ mod tests {
         let (media_http, mut completions) = media_http_context(4);
         let foreground = reserve_media_http(&media_http);
         let mut resumed = false;
-        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, &mut false, |_| async {
             Ok(storage_sqlite::AvatarImage::new(
                 vec![1; 8],
                 storage_sqlite::AvatarImageFormat::Png,
@@ -5988,7 +6017,7 @@ mod tests {
             .unwrap())
         })
         .unwrap();
-        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, |_| async {
+        dispatch_avatar_acquisition(&store, &media_http, &mut resumed, &mut false, |_| async {
             panic!("another background pass must preserve the foreground slot")
         })
         .unwrap();
@@ -6044,7 +6073,7 @@ mod tests {
                 let _ = self.0.send(());
             }
         }
-        dispatch_avatar_acquisition(&store, &media_http, &mut false, |_| {
+        dispatch_avatar_acquisition(&store, &media_http, &mut false, &mut false, |_| {
             let started = started_tx.clone();
             let dropped = dropped_tx.clone();
             async move {

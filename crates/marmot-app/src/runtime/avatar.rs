@@ -20,14 +20,18 @@ impl MarmotApp {
         })?;
         let (selected, version) =
             selected_identity(self, &input, &account.account_id_hex, &member)?;
+        let before = storage.avatar_identity_reference(group, &member)?;
         let reference =
             storage.request_identity_avatar_acquisition(group, &member, &selected, &version)?;
         self.presentation_signals.wake();
+        if before != storage.avatar_identity_reference(group, &member)? {
+            let _ = self.presentation_signals.avatars.send(label.to_owned());
+        }
         Ok(reference)
     }
 }
 
-fn selected_identity(
+pub(super) fn selected_identity(
     app: &MarmotApp,
     input: &ChatPresentationInput,
     account: &str,
@@ -99,18 +103,28 @@ impl IdentityAvatarMaintenance {
             String::new()
         };
         let mut failure = None;
+        let mut changed = false;
         for identity in &identities {
             let result = (|| -> Result<(), AppError> {
                 if let Some(input) = storage.chat_presentation_input(&identity.group)? {
                     let (selected, version) =
                         selected_identity(&client.app, &input, account, &identity.member)?;
+                    let before = storage.avatar_reference(&identity.owner)?;
                     storage.maintain_identity_avatar_acquisition(identity, &selected, &version)?;
+                    changed |= before != storage.avatar_reference(&identity.owner)?;
                 }
                 Ok(())
             })();
             if let Err(error) = result {
                 failure = Some(error);
             }
+        }
+        if changed {
+            let _ = client
+                .app
+                .presentation_signals
+                .avatars
+                .send(client.state.label.clone());
         }
         if let Some(error) = failure {
             self.directory_version = None;
@@ -208,6 +222,18 @@ mod tests {
                 .reference,
             reference
         );
+        let mut changes = app.presentation_signals.avatars.subscribe();
+        for _ in 0..3 {
+            assert_eq!(
+                app.request_identity_avatar("alice", &group, &member)
+                    .unwrap(),
+                Some(reference.clone())
+            );
+        }
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         // Removal during the shared-profile preparation gap must not recreate demand.
         storage.remove_avatar_source(&reference).unwrap();
         IdentityAvatarMaintenance::default()

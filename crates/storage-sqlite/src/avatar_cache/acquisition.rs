@@ -9,7 +9,7 @@ struct DescriptorEnvelope {
 }
 
 /// Acquisition state is independent of whether stale bytes are still usable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AvatarAcquisitionState {
     Idle,
     Queued,
@@ -276,6 +276,18 @@ impl SqliteAccountStorage {
                 _ => Err(invalid("invalid avatar acquisition state")),
             })
             .transpose()
+    }
+
+    /// Current binding for a conversation identity, including its previous source.
+    pub fn avatar_identity_reference(
+        &self,
+        group: &str,
+        member: &str,
+    ) -> StorageResult<Option<AvatarAssetRef>> {
+        let Some(chat) = self.avatar_chat_owner(group)? else {
+            return Ok(None);
+        };
+        self.avatar_reference(&format!("identity:{chat}:{member}"))
     }
 
     /// Register only an explicitly requested conversation identity. Placeholder
