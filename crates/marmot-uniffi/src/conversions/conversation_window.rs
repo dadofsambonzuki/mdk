@@ -371,6 +371,7 @@ fn presented_timeline_with_tokens(
     content_tokens: crate::markdown::MarkdownDocumentFfi,
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
+        has_reports: row.has_reports,
         edit: row.edit.clone().map(Into::into),
         message_id_hex: row.message_id_hex.clone(),
         source_message_id_hex: row.source_message_id_hex.clone(),
@@ -539,6 +540,7 @@ impl ConversationConversionCache {
             },
             reactions: Default::default(),
             edit: row.edit.clone(),
+            has_reports: row.has_reports,
             deleted: row.deleted,
             deleted_by_message_id_hex: row.deleted_by_message_id_hex.clone(),
             invalidation_status: row.invalidation_status.clone(),
@@ -596,6 +598,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
         group_system,
         reactions: _,
         edit,
+        has_reports,
         deleted,
         deleted_by_message_id_hex,
         invalidation_status,
@@ -621,6 +624,7 @@ fn visible_row_key(row: &app::TimelineMessageRecord, trusted: bool) -> impl Part
             media,
             agent_text_stream,
             edit,
+            has_reports,
             deleted,
             deleted_by_message_id_hex,
             invalidation_status,
@@ -756,6 +760,7 @@ mod tests {
         .to_content()
         .unwrap();
         let mut record = app::TimelineMessageRecord {
+            has_reports: false,
             group_system: Some({
                 let mut event =
                     marmot_app::group_system_event_from_message(1210, &content).unwrap();
@@ -808,6 +813,7 @@ mod edit_contract_tests {
     fn prepared_and_legacy_rows_share_effective_content_and_edit_metadata() {
         let row: marmot_app::TimelineMessageRecord = serde_json::from_value(serde_json::json!({
             "message_id_hex":"target","direction":"received","group_id_hex":"11","sender":"alice",
+            "has_reports":true,
             "plaintext":"**replacement**","kind":9,"tags":[],"timeline_at":1,"received_at":1,
             "reactions":{"by_emoji":{},"user_reactions":[]},"deleted":false,
             "edit":{"edit_count":2,"latest_edit_message_id_hex":"edit","edited_at":5}
@@ -817,6 +823,8 @@ mod edit_contract_tests {
         let prepared = super::presented_timeline(&row, false);
         assert_eq!(legacy.plaintext, prepared.plaintext);
         assert_eq!(legacy.content_tokens, prepared.content_tokens);
+        assert_eq!(legacy.has_reports, prepared.has_reports);
+        assert!(prepared.has_reports);
         assert_eq!(prepared.edit.unwrap().latest_edit_message_id_hex, "edit");
         assert_eq!(legacy.edit.unwrap().edit_count, 2);
     }

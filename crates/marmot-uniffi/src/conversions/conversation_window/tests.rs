@@ -291,3 +291,16 @@ fn bench_prepared_conversation_conversion() {
         }
     }
 }
+
+#[test]
+fn prepared_conversion_refreshes_report_indicator_without_reparsing_text() {
+    let mut row = record(0);
+    let mut cache = ConversationConversionCache::default();
+    for (index, reported) in [false, true, false].into_iter().enumerate() {
+        row.has_reports = reported;
+        let converted = cache.row(&row, false);
+        assert_eq!(converted.has_reports, reported);
+        assert_eq!(wire(converted), wire(presented_timeline(&row, false)));
+        assert_eq!((cache.conversions, cache.parses), (index + 1, 1));
+    }
+}

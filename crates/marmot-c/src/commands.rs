@@ -80,7 +80,9 @@ use crate::types::relay::{
 use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
-use crate::types::timeline::{MarmotTimelineMessageQuery, MarmotTimelinePage};
+use crate::types::timeline::{
+    MarmotTimelineMessageQuery, MarmotTimelineMessageRecord, MarmotTimelinePage,
+};
 use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
 
@@ -2908,4 +2910,49 @@ mod identity_pointer_tests {
         #[cfg(feature = "alloc-audit")]
         assert_eq!(crate::memory::audit::live_allocations(), start);
     }
+}
+
+use crate::types::moderation::{
+    MarmotContentReportPage, MarmotReportDismissalPage, MarmotReportReason,
+};
+c_cmd! {
+    async fn marmot_dismiss_reports(account_ref: str, group_id_hex: str, report_ids/report_ids_len: str_arr, explanation: str) -> rec(MarmotSendSummary) = dismiss_reports;
+    sync fn marmot_reported_message(account_ref: str, group_id_hex: str, message_id: str) -> opt_rec(MarmotTimelineMessageRecord) = reported_message;
+    sync fn marmot_content_reports(account_ref: str, group_id_hex: str, message_id: opt_str, after: opt_str, limit: val u32) -> rec(MarmotContentReportPage) = content_reports;
+    sync fn marmot_report_dismissals(account_ref: str, group_id_hex: str, report_id: str, after: opt_str, limit: val u32) -> rec(MarmotReportDismissalPage) = report_dismissals;
+}
+/// Report one group message. Reason is a MarmotReportReason discriminant.
+/// # Safety
+/// Client, strings and output pointer must be valid. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_report_message(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    message_id: *const c_char,
+    reason: u32,
+    explanation: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        let message = try_arg!(unsafe { required_str(message_id) });
+        let reason = try_arg!(MarmotReportReason::from_c(reason));
+        let explanation = try_arg!(unsafe { required_str(explanation) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.report_message(
+                    account,
+                    group,
+                    message,
+                    reason.to_ffi(),
+                    explanation,
+                )),
+                out,
+            )
+        }
+    })
 }

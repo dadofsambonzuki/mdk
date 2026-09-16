@@ -30,6 +30,29 @@ Tracking issue: marmot-protocol/mdk#381.
 | --- | --- | --- |
 | `Engine::canonical_replays`, `Engine::peel_replays` | At most one continuation of each kind per pending group. Each owns one input graph; frontier and completed paths are bounded by the existing cumulative replay-probe budget, with path depth limited by the retained graph. Peel output remains capped at eight contexts. This is an input-relative bound, not a fixed account-wide byte cap. | Removed on completion/error, relevant state or policy invalidation, hydration/repair/removal, or engine drop. Exact source identity and replay-state content fingerprint (or strict MLS mutation generation on other tracking backends) are checked before reuse; a new canonical pass discards the old cursor. No transaction, snapshot guard, or durable scratch row survives a slice. |
 
+### `cgka-engine` moderation authority recovery (`src/app_payload.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `Engine::authority_recovery_attempts`, `Engine::authority_recovery_seen` | At most one entry per durable unresolved moderation control encountered in the current or previous cursor pass; input-relative to retained source records, never ordinary chat history. Each maintenance call visits at most 32 requests. Fingerprints identify one named snapshot rather than the whole live group. | Resolved entries are removed immediately; each completed cursor pass removes entries whose requests disappeared. Source-byte pruning and group deletion remove durable requests atomically. Engine drop clears both caches; restart may retry once against unchanged evidence. No secret-derived fingerprint is logged or persisted. |
+
+### `storage-sqlite` durable moderation (`src/timeline/reports.rs`, `src/timeline.rs`)
+
+These are input-relative durable bounds, not fixed account-wide row or byte caps. Moderation evidence must remain
+stable under delayed delivery and convergence; ordinary chat expiry must not create a moderation history ledger.
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| `content_reports` | One metadata row per retained valid report event; no target summaries or logical-report grouping. | Recomputed for affected targets; event expiry/invalidation and group deletion remove rows. Target expiry does not erase reports. |
+| `content_pruned_controls` and retained control `app_events` | One marker and minimal structural record per retained kind-5 or kind-4891 deletion. | Expiry removes unrelated tags while preserving references, verdicts and source provenance. Group deletion reclaims evidence. Reports and labels use ordinary retention. |
+| `content_expired_targets` | At most one marker per erased target with retained deletion evidence. Ordinary expired chats and reports create no marker. | Retained until group deletion so late target/edit delivery cannot restore deleted content. Repeated delivery reuses the marker. |
+| `content_report_backfill` | One cursor row per account database. | Advances through the captured pre-migration prefix in batches of at most 100 events; completion retains only that progress row. |
+
+Explicit secure erasure intentionally retains these minimal moderation identifiers and branch-provenance records;
+it does not promise to erase every trace of a moderation decision. Message bodies, report/review explanations and media remain subject to
+secure erasure. The moderation replay fence applies only to targets with this retained evidence. Ordinary message
+re-delivery and expiry continue through the existing ingress deduplication and retention lifecycle.
+
 ### `transport-quic-broker` (`src/state.rs`, `src/server.rs`)
 
 | Structure | Bound | Reclamation |

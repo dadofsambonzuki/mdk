@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
@@ -4424,6 +4424,7 @@ impl AppClient {
             epoch,
             payload,
             retention,
+            ..
         } = event
         else {
             return Ok(false);
@@ -4529,9 +4530,9 @@ impl AppClient {
                 "projecting message without directory enrichment",
             );
         }
-        let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
-            && self.delete_moderation_grant(&message.group_id, &message.sender);
+        let moderation_grant = message.authority.is_some_and(|a| a.moderation_grant);
         let message_projection = AppMessageProjection {
+            authority: message.authority,
             message_id_hex: message.message_id_hex.clone(),
             source_message_id_hex: Some(message.source_message_id_hex.clone()),
             direction: "received".to_owned(),
@@ -5667,6 +5668,7 @@ mod tests {
             effects
                 .events
                 .push(cgka_traits::engine::GroupEvent::MessageReceived {
+                    authority: None,
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),

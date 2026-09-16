@@ -1351,15 +1351,53 @@ impl<S: StorageProvider> Engine<S> {
                             });
                         }
                     };
+                let needs_authority =
+                    cgka_traits::reporting::requires_source_authority(app_event.kind);
+                let historical_source = if needs_authority && msg_epoch != current_epoch {
+                    if let Some(snapshot) = crate::app_payload::retained_source_snapshot(
+                        &self.storage,
+                        &group_id,
+                        msg_epoch,
+                    )? {
+                        use sha2::{Digest, Sha256};
+                        let request = cgka_traits::app_event::PendingAppMessageAuthority {
+                            group_id: group_id.clone(),
+                            message_id: msg.id.clone(),
+                            epoch: msg_epoch,
+                            sender: sender.clone(),
+                            payload_digest: Sha256::digest(&payload).into(),
+                            retention: None,
+                        };
+                        crate::app_payload::historical_source(
+                            &self.storage,
+                            &self.crypto,
+                            &request,
+                            &snapshot,
+                            &openmls_msg.payload,
+                        )?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let retention_seconds = if msg_epoch == current_epoch {
                     Some(
                         crate::app_components::message_retention_seconds_of_group(&mls_group)?
                             .unwrap_or(0),
                     )
                 } else {
-                    let recovered =
-                        recovered_source_retention.and_then(|(snapshot_epoch, seconds)| {
-                            (snapshot_epoch == msg_epoch).then_some(seconds.unwrap_or(0))
+                    // Successful authentication supplies both policies in one
+                    // visit. If it remains unresolved, retain the ordinary
+                    // source-epoch retention fallback; missing moderation proof
+                    // must not exempt report explanations from expiry.
+                    let recovered = historical_source
+                        .as_ref()
+                        .map(|source| source.retention_seconds)
+                        .or_else(|| {
+                            recovered_source_retention.and_then(|(epoch, seconds)| {
+                                (epoch == msg_epoch).then_some(seconds.unwrap_or(0))
+                            })
                         });
                     match recovered {
                         Some(seconds) => Some(seconds),
@@ -1372,12 +1410,18 @@ impl<S: StorageProvider> Engine<S> {
                             .map(|seconds| seconds.unwrap_or(0)),
                     }
                 };
+                let authority = if needs_authority && msg_epoch == current_epoch {
+                    Some(crate::app_payload::source_authority(&mls_group, &sender)?)
+                } else {
+                    historical_source.map(|source| source.authority)
+                };
                 let event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),
                     sender,
                     epoch: msg_epoch,
                     payload,
+                    authority,
                     retention: retention_seconds.map(|seconds| {
                         AppMessageRetentionDecision::new(app_event.created_at, seconds)
                     }),

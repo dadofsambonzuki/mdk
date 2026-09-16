@@ -1672,6 +1672,13 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                if client.backfill_content_reports().is_err() {
+                    tracing::warn!(
+                        target: "marmot_app::account_worker",
+                        method = "maintenance_tick",
+                        "report backfill deferred"
+                    );
+                }
                 run_legacy_message_promotion_batch(
                     &client,
                     &mut legacy_message_promotion,

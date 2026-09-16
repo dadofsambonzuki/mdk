@@ -457,3 +457,18 @@ for opening, paging, cancellation, timeout, ownership and draft migration.
 Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target. See the
 [privacy audit and adoption guide](apple-privacy/README.md) for declarations,
 archive validation, host integration changes, and unresolved release questions.
+
+## Group reporting
+
+Swift/Kotlin expose `report_message`, `dismiss_reports`, `content_reports`,
+`report_dismissals`, and `reported_message`; the C ABI mirrors these operations.
+`ReportReasonFfi` supplies the NIP-56 categories. Timeline records carry
+`has_reports`. Individual report records carry reporter, target author, category,
+explanation and `dismissed`; each admin label carries its own event ID, admin,
+explanation and timestamp. No aggregate queue, count, status, revision argument,
+or winning review decision is imposed on hosts.
+
+Pages are capped at 100 and cursors are exclusive. C callers deep-free returned
+pages with `marmot_content_report_page_free` or `marmot_report_dismissal_page_free`.
+`reported_message` uses the ordinary timeline record and its free function.
+Use existing projection subscriptions to refresh client review views.
