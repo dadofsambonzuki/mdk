@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- MarmotKit standard release builds now use thin LTO and one codegen unit, kept in lockstep between the
+  workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
+  symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON
+  `false` or `"thin"`.
+
 ### Added
 
 - MDK-owned accepted message edits: timeline, reply and selected chat-list previews share effective text and

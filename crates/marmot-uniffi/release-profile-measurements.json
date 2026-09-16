@@ -1,0 +1,438 @@
+{
+  "android_reduction_gate": {
+    "deferred_to": "bindings-profile.yml linux lane --require-android-reduction",
+    "primary_arm_failures": [
+      "aarch64-linux-android was not measured (Android NDK or Rust target unavailable)",
+      "armv7-linux-androideabi was not measured (Android NDK or Rust target unavailable)"
+    ],
+    "required_locally": false
+  },
+  "artifacts": [
+    {
+      "availability": "measured",
+      "baseline_bytes": 89237400,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": "52d16996b58bf0e9fa0d9ac769bbbfef894dcf0df6b09e600d304622652a16bf",
+      "candidate_bytes": 66959200,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": "35785a19268f1dc9aad49aa806a284b89535ccd256503c3b18f3871c0096ce56",
+      "delta_bytes": -22278200,
+      "delta_percent": -24.965093111184324,
+      "kind": "host_generation_library",
+      "reason": null,
+      "target": "host"
+    },
+    {
+      "availability": "measured",
+      "baseline_bytes": null,
+      "baseline_profile": null,
+      "baseline_sha256": null,
+      "candidate_bytes": 66524864,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": "2559b1963499264e297aa74fac4b2ae176c9b6c8f70c239b4cab0f326641a693",
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "host_generation_library_default_features",
+      "reason": "candidate-only default-feature smoke",
+      "target": "host"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "android_jni_so",
+      "reason": "Android NDK or Rust target unavailable",
+      "target": "aarch64-linux-android"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "android_jni_so",
+      "reason": "Android NDK or Rust target unavailable",
+      "target": "armv7-linux-androideabi"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "android_jni_so",
+      "reason": "Android NDK or Rust target unavailable",
+      "target": "i686-linux-android"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "symbols"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "symbols"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "android_jni_so",
+      "reason": "Android NDK or Rust target unavailable",
+      "target": "x86_64-linux-android"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "apple_static_archive",
+      "reason": "Apple Rust target unavailable",
+      "target": "aarch64-apple-ios"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "apple_static_archive",
+      "reason": "Apple Rust target unavailable",
+      "target": "aarch64-apple-ios-sim"
+    },
+    {
+      "availability": "unavailable",
+      "baseline_bytes": null,
+      "baseline_profile": {
+        "codegen_units": 16,
+        "lto": false,
+        "strip": "none"
+      },
+      "baseline_sha256": null,
+      "candidate_bytes": null,
+      "candidate_profile": {
+        "codegen_units": 1,
+        "lto": "thin",
+        "strip": "none"
+      },
+      "candidate_sha256": null,
+      "delta_bytes": null,
+      "delta_percent": null,
+      "kind": "apple_static_archive",
+      "reason": "Apple Rust target unavailable",
+      "target": "aarch64-apple-darwin"
+    }
+  ],
+  "builder_sha": "c41404a02acd9c3e020e26de4cd13895477288ec",
+  "commands": [
+    {
+      "compile_seconds": null,
+      "name": "host-baseline",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-baseline"
+    },
+    {
+      "compile_seconds": null,
+      "name": "host-candidate",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-candidate"
+    },
+    {
+      "compile_seconds": null,
+      "features": [],
+      "name": "host-default-features-candidate",
+      "reason": "original compile duration overwritten by a later incremental cargo invocation",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-default-features"
+    },
+    {
+      "availability": "partial",
+      "compile_seconds": null,
+      "name": "cpu-baseline",
+      "reason": "create_group estimates collected; later group_lifecycle fixture panicked",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-baseline"
+    },
+    {
+      "availability": "partial",
+      "compile_seconds": null,
+      "name": "cpu-candidate",
+      "reason": "create_group estimates collected; later group_lifecycle fixture panicked",
+      "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-candidate"
+    }
+  ],
+  "cpu_runs": [
+    {
+      "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 23733535.411368057,
+        "upper": 24669633.113055557
+      },
+      "point_estimate": 24198427.77305556,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/32_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 3025545.6256250003,
+        "upper": 3316300.667201079
+      },
+      "point_estimate": 3177839.042388393,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/1_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 7528337.767970238,
+        "upper": 7842387.454592686
+      },
+      "point_estimate": 7685392.663707483,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/8_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 3020246.115104167,
+        "upper": 3331711.18842913
+      },
+      "point_estimate": 3183918.250498512,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/1_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 23905439.632749334,
+        "upper": 24700656.24119643
+      },
+      "point_estimate": 24299295.60534391,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/32_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 7583623.16937624,
+        "upper": 7986119.270548983
+      },
+      "point_estimate": 7783527.669885914,
+      "profile": {
+        "codegen_units": 16,
+        "lto": false
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/8_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "baseline"
+    },
+    {
+      "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 23155046.377148144,
+        "upper": 24002992.731111113
+      },
+      "point_estimate": 23580560.939074073,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/32_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 2951671.0049019614,
+        "upper": 3275703.244110645
+      },
+      "point_estimate": 3119294.876659664,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/1_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 7274413.305059028,
+        "upper": 7682707.341889383
+      },
+      "point_estimate": 7479110.598373015,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/8_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 2977909.367057948,
+        "upper": 3286292.2259389
+      },
+      "point_estimate": 3138801.175665266,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/1_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 23165606.40079365,
+        "upper": 24114894.119944446
+      },
+      "point_estimate": 23643618.725238092,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/32_invitees,_retention_enabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    },
+    {
+      "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
+      "confidence_interval": {
+        "lower": 7246435.0753125,
+        "upper": 7589875.68611111
+      },
+      "point_estimate": 7414871.138715277,
+      "profile": {
+        "codegen_units": 1,
+        "lto": "thin"
+      },
+      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/8_invitees,_retention_disabled/estimates.json",
+      "units": "ns",
+      "variant": "candidate"
+    }
+  ],
+  "features": [
+    "otlp-export",
+    "product-analytics-export"
+  ],
+  "lock_sha256": "10de3ae2006a2283c43c6efb598db78b53da7b620af9057338b16fd8dfa6110e",
+  "schema_version": 1,
+  "source_sha": "c41404a02acd9c3e020e26de4cd13895477288ec",
+  "toolchains": {
+    "android_api": "26",
+    "android_ndk_home": "unavailable",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "xcodebuild": "unavailable"
+  }
+}

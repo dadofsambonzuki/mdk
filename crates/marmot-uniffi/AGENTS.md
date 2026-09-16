@@ -12,6 +12,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - Own `apple-privacy.py`, `apple-privacy/`, `validate-apple-privacy.py`, `validate-apple-archive.py`,
   and `test-apple-privacy.py` for SDK declarations and resource delivery into Apple app archives.
 - Own `marmotkit-release-profile.env`, the canonical Rust release profile for distributable MarmotKit artifacts.
+- Own `release-profile-json.py`, `release-profile-archive.py`, `test-release-profile.py`, and
+  `measure-release-profile.py` for provenance JSON, native-archive bitcode checks, and controlled
+  baseline/candidate measurements.
 - Own `chat-projections-smoke.sh`, the host Swift/Kotlin chat-screen DTO round-trip check.
 - Own `marmotkit-endpoints.env` build-time defaults for audit-log tracker and relay-telemetry OTLP route URLs.
 - Keep generated bindings out of git; host apps vendor artifacts from `output/` after running the scripts.
