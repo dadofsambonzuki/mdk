@@ -81,6 +81,7 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod avatar;
 mod commands;
 mod event_routing;
 mod onboarding;
