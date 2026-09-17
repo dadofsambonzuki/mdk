@@ -4818,15 +4818,6 @@ impl MarmotApp {
         self.display_names_for_account_ids(&account_ids)
     }
 
-    pub(crate) fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
-        Ok(self
-            .account_home()
-            .accounts()?
-            .into_iter()
-            .map(|account| (account.account_id_hex, account.label))
-            .collect())
-    }
-
     fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
@@ -4843,7 +4834,7 @@ impl MarmotApp {
 
         let caches = self.directory_caches()?;
         let shared_storage = self.shared_storage()?;
-        let local_names = self.local_account_labels_by_id()?;
+        let local_accounts = self.local_accounts_by_id()?;
         let mut names = HashMap::new();
 
         for account_id in account_ids {
@@ -4851,13 +4842,14 @@ impl MarmotApp {
                 &account_id,
                 &caches,
                 &shared_storage,
+                &local_accounts,
             )? && let Some(name) = display_name_for_profile(entry.profile.as_ref())
             {
                 names.insert(account_id, name);
                 continue;
             }
-            if let Some(name) = local_names.get(&account_id) {
-                names.insert(account_id, name.clone());
+            if let Some(name) = local_accounts.get(&account_id) {
+                names.insert(account_id, name.label.clone());
             }
         }
 
@@ -4876,6 +4868,7 @@ impl MarmotApp {
     /// back to a local account's label. Split out so callers that already hold
     /// the entry (e.g. notification building, #639) don't re-query
     /// `directory_entry_for_account_id`.
+    /// Preserve its first-alias fallback; batched name reads historically use the last alias.
     pub(crate) fn display_name_from_directory_entry(
         &self,
         account_id_hex: &str,
@@ -4923,16 +4916,23 @@ impl MarmotApp {
         }
         let caches = self.directory_caches()?;
         let shared = self.shared_storage()?;
-        let local = self.local_account_labels_by_id()?;
+        let local_accounts = self.local_accounts_by_id()?;
         let mut names = HashMap::new();
         for id in ids {
             let profile = self
-                .directory_entry_for_account_id_with_handles(&id, &caches, &shared)?
+                .directory_entry_for_account_id_with_handles(
+                    &id,
+                    &caches,
+                    &shared,
+                    &local_accounts,
+                )?
                 .and_then(|entry| entry.profile);
             let name = conversation_presentation::identity_display_name(
                 &id,
                 profile.as_ref(),
-                local.get(&id).map(String::as_str),
+                local_accounts
+                    .get(&id)
+                    .map(|account| account.label.as_str()),
             );
             names.insert(id, name);
         }
