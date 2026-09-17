@@ -189,7 +189,8 @@ python3 crates/marmot-uniffi/test-release-profile.py
 
 # Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
 # unavailable, never as zero. Isolated target directories keep the two variants
-# from overwriting each other:
+# from overwriting each other. `--cpu` fails if a benchmark invocation fails or
+# only stale Criterion estimates remain:
 python3 crates/marmot-uniffi/measure-release-profile.py \
   --source-sha "$(git rev-parse HEAD)" \
   --builder-sha "$(git rev-parse HEAD)" \

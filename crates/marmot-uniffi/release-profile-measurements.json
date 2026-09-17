@@ -203,7 +203,7 @@
       "target": "aarch64-apple-darwin"
     }
   ],
-  "builder_sha": "c41404a02acd9c3e020e26de4cd13895477288ec",
+  "builder_sha": "b9c305c0a67f59527f7291d2f69e4d23707c6cb2",
   "commands": [
     {
       "compile_seconds": null,
@@ -225,209 +225,279 @@
       "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/host-default-features"
     },
     {
-      "availability": "partial",
-      "compile_seconds": null,
+      "argv": [
+        "cargo",
+        "bench",
+        "--locked",
+        "--profile",
+        "release",
+        "-p",
+        "cgka-engine",
+        "--bench",
+        "group_lifecycle",
+        "--",
+        "create_group/",
+        "--sample-size",
+        "10",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "3",
+        "--noplot"
+      ],
+      "availability": "measured",
+      "compile_seconds": 178.15128054795787,
       "name": "cpu-baseline",
-      "reason": "create_group estimates collected; later group_lifecycle fixture panicked",
       "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-baseline"
     },
     {
-      "availability": "partial",
-      "compile_seconds": null,
+      "argv": [
+        "cargo",
+        "bench",
+        "--locked",
+        "--profile",
+        "release",
+        "-p",
+        "cgka-engine",
+        "--bench",
+        "group_lifecycle",
+        "--",
+        "create_group/",
+        "--sample-size",
+        "10",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "3",
+        "--noplot"
+      ],
+      "availability": "measured",
+      "compile_seconds": 222.71375241596252,
       "name": "cpu-candidate",
-      "reason": "create_group estimates collected; later group_lifecycle fixture panicked",
       "target_dir": "/var/lib/pip/worktrees/mdk/repo-1055628515-issue-1304-workflow-3/target/release-profile-measure/cpu-candidate"
     }
   ],
+  "cpu_collection_error": null,
   "cpu_runs": [
     {
+      "availability": "measured",
       "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 23733535.411368057,
-        "upper": 24669633.113055557
+        "lower": 24069325.087857146,
+        "upper": 24981811.573737103
       },
-      "point_estimate": 24198427.77305556,
+      "point_estimate": 24518834.329298943,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/32_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/32 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 3025545.6256250003,
-        "upper": 3316300.667201079
+        "lower": 3079153.726597222,
+        "upper": 3392356.982327877
       },
-      "point_estimate": 3177839.042388393,
+      "point_estimate": 3241633.7394295633,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/1_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/1 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 7528337.767970238,
-        "upper": 7842387.454592686
+        "lower": 7514062.01914966,
+        "upper": 7831699.082245465
       },
-      "point_estimate": 7685392.663707483,
+      "point_estimate": 7669328.426712018,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/8_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/8 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 3020246.115104167,
-        "upper": 3331711.18842913
+        "lower": 3066486.1003645835,
+        "upper": 3368414.2727812496
       },
-      "point_estimate": 3183918.250498512,
+      "point_estimate": 3222687.1003645835,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/1_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/1 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 23905439.632749334,
-        "upper": 24700656.24119643
+        "lower": 24123952.5901412,
+        "upper": 25059787.771806546
       },
-      "point_estimate": 24299295.60534391,
+      "point_estimate": 24609446.296335977,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/32_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/32 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 7583623.16937624,
-        "upper": 7986119.270548983
+        "lower": 7536497.316011904,
+        "upper": 7886686.337041666
       },
-      "point_estimate": 7783527.669885914,
+      "point_estimate": 7711899.520059524,
       "profile": {
         "codegen_units": 16,
         "lto": false
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/baseline/8_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-baseline/criterion/create_group/8 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "baseline"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/32 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 23155046.377148144,
-        "upper": 24002992.731111113
+        "lower": 23492950.74966667,
+        "upper": 24336139.098730158
       },
-      "point_estimate": 23580560.939074073,
+      "point_estimate": 23911779.110119052,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/32_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/32 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/1 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 2951671.0049019614,
-        "upper": 3275703.244110645
+        "lower": 2956790.588700397,
+        "upper": 3271523.9855667166
       },
-      "point_estimate": 3119294.876659664,
+      "point_estimate": 3118766.15625248,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/1_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/1 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/8 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 7274413.305059028,
-        "upper": 7682707.341889383
+        "lower": 7371353.618304315,
+        "upper": 7697115.0681341775
       },
-      "point_estimate": 7479110.598373015,
+      "point_estimate": 7531235.517400794,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/8_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/8 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/1 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 2977909.367057948,
-        "upper": 3286292.2259389
+        "lower": 2964670.0648203124,
+        "upper": 3265280.1125
       },
-      "point_estimate": 3138801.175665266,
+      "point_estimate": 3121101.7451041667,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/1_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/1 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/32 invitees, retention enabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 23165606.40079365,
-        "upper": 24114894.119944446
+        "lower": 23598318.32522785,
+        "upper": 24721925.615438495
       },
-      "point_estimate": 23643618.725238092,
+      "point_estimate": 24148019.529669315,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/32_invitees,_retention_enabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/32 invitees, retention enabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     },
     {
+      "availability": "measured",
       "benchmark": "create_group/8 invitees, retention disabled/new/estimates.json",
       "confidence_interval": {
-        "lower": 7246435.0753125,
-        "upper": 7589875.68611111
+        "lower": 7343251.181457589,
+        "upper": 7680215.549464285
       },
-      "point_estimate": 7414871.138715277,
+      "point_estimate": 7513005.044384921,
       "profile": {
         "codegen_units": 1,
         "lto": "thin"
       },
-      "raw_result": "/var/lib/pip/artifacts/mdk/1a05c6550ed6f7d96483bc1af160083ee6c91e2f32ee277a38772c4e2860f915/attempt-00171/criterion-raw/candidate/8_invitees,_retention_disabled/estimates.json",
+      "raw_result": "diagnostics/cpu-candidate/criterion/create_group/8 invitees, retention disabled/new/estimates.json",
+      "reason": null,
       "units": "ns",
       "variant": "candidate"
     }
   ],
+  "cpu_slowdown_warnings": [],
   "features": [
     "otlp-export",
     "product-analytics-export"
   ],
   "lock_sha256": "10de3ae2006a2283c43c6efb598db78b53da7b620af9057338b16fd8dfa6110e",
+  "native_acceptance": {
+    "android_apple_local": "unavailable on this Linux builder (no NDK, no Apple targets)",
+    "cpu_local": "successful scoped create_group baseline/candidate runs with fresh Criterion estimates; no >5% candidate slowdown",
+    "linux_ci_on_b9c305c0a67f59527f7291d2f69e4d23707c6cb2": "Linux Android and host profile measurements succeeded with --require-android-reduction",
+    "macos_ci_on_b9c305c0a67f59527f7291d2f69e4d23707c6cb2": "macOS Apple slice and package verification failed; this head uploads diagnostics on failure"
+  },
   "schema_version": 1,
-  "source_sha": "c41404a02acd9c3e020e26de4cd13895477288ec",
+  "source_sha": "b9c305c0a67f59527f7291d2f69e4d23707c6cb2",
   "toolchains": {
     "android_api": "26",
     "android_ndk_home": "unavailable",

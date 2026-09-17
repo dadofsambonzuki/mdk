@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- MarmotKit release-profile measurements now fail closed when `create_group` benchmarks error or
+  omit fresh Criterion estimates, including when stale results are already on disk. The Apple
+  archive helper classifies little-endian Mach-O magic correctly so embedded `__LLVM` / `__bitcode`
+  members are rejected without otool, and the non-publishing profile workflow uploads logs, raw
+  Criterion data, and toolchain versions even when a later step fails.
 - OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
   managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
   no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed

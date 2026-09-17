@@ -29,6 +29,13 @@ MACHO_MAGICS = {
     0xCAFEBABE,
     0xBEBAFECA,
 }
+# Values produced by decoding the first word with "<I". Native little-endian
+# 32/64-bit Mach-O and the usual FAT_MAGIC on a little-endian read.
+LITTLE_ENDIAN_ON_LE_DECODE = {
+    0xFEEDFACE,
+    0xFEEDFACF,
+    0xCAFEBABE,
+}
 LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 
@@ -85,7 +92,7 @@ def macho_has_llvm_bitcode(content: bytes) -> bool:
     magic = struct.unpack_from("<I", content, 0)[0]
     if magic not in MACHO_MAGICS and struct.unpack_from(">I", content, 0)[0] not in MACHO_MAGICS:
         return False
-    little = magic in {0xCEFAEDFE, 0xCFFAEDFE, 0xBEBAFECA}
+    little = magic in LITTLE_ENDIAN_ON_LE_DECODE
     magic = _u32(content, 0, little)
     if magic in {0xCAFEBABE, 0xBEBAFECA}:
         return b"__LLVM" in content or b"__bitcode" in content

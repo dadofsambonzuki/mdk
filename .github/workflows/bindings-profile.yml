@@ -136,6 +136,7 @@ jobs:
             --host --android --cpu \
             --require-android-reduction \
             --work-dir target/release-profile-measure \
+            --diagnostics-dir "$RUNNER_TEMP/marmotkit-profile/diagnostics" \
             --output "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.json" \
             --markdown "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md"
 
@@ -158,17 +159,48 @@ jobs:
             echo "kotlin_sha256=$(sha256sum "$kotlin" | awk '{print $1}')"
           } > "$RUNNER_TEMP/marmotkit-profile/kotlin-generation.txt"
 
+      - name: Stage Linux diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics"
+          if [[ -d target/release-profile-measure/logs ]]; then
+            rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+            cp -a target/release-profile-measure/logs "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+          fi
+          for variant in baseline candidate; do
+            if [[ -d "target/release-profile-measure/cpu-${variant}/criterion" ]]; then
+              mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}"
+              rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}/criterion"
+              cp -a "target/release-profile-measure/cpu-${variant}/criterion" \
+                "$RUNNER_TEMP/marmotkit-profile/diagnostics/cpu-${variant}/criterion"
+            fi
+          done
+          {
+            echo "head_sha=${{ steps.identity.outputs.head_sha }}"
+            echo "job=${{ github.job }}"
+            rustc --version
+            cargo --version
+          } > "$RUNNER_TEMP/marmotkit-profile/diagnostics/toolchain.txt"
+
       - name: Publish Linux measurement artifacts
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: marmotkit-profile-linux-${{ steps.identity.outputs.head_sha }}
-          path: ${{ runner.temp }}/marmotkit-profile/*
+          path: ${{ runner.temp }}/marmotkit-profile
           if-no-files-found: error
 
       - name: Write Linux job summary
+        if: always()
         run: |
           set -euo pipefail
-          cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Measurement markdown was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   macos-profile:
     name: macOS Apple slice and package verification
@@ -205,6 +237,7 @@ jobs:
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
           rustc --version
           cargo --version
+          xcodebuild -version
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -222,6 +255,7 @@ jobs:
             --builder-sha "$HEAD_SHA" \
             --apple \
             --work-dir target/release-profile-measure \
+            --diagnostics-dir "$RUNNER_TEMP/marmotkit-profile/diagnostics" \
             --output "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.json" \
             --markdown "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md"
 
@@ -304,18 +338,47 @@ jobs:
           printf 'ios_swift_sha256=%s\nmacos_swift_sha256=%s\n' "$ios_swift" "$macos_swift" \
             > "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt"
 
+      - name: Stage macOS diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/marmotkit-profile/diagnostics"
+          if [[ -d target/release-profile-measure/logs ]]; then
+            rm -rf "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+            cp -a target/release-profile-measure/logs "$RUNNER_TEMP/marmotkit-profile/diagnostics/logs"
+          fi
+          {
+            echo "head_sha=${{ steps.identity.outputs.head_sha }}"
+            echo "job=${{ github.job }}"
+            rustc --version
+            cargo --version
+            xcodebuild -version
+          } > "$RUNNER_TEMP/marmotkit-profile/diagnostics/toolchain.txt"
+          shopt -s nullglob
+          for manifest in \
+            "$RUNNER_TEMP"/marmotkit-ios-dist/*.manifest.json \
+            "$RUNNER_TEMP"/marmotkit-macos-dist/*.manifest.json; do
+            cp "$manifest" "$RUNNER_TEMP/marmotkit-profile/diagnostics/$(basename "$manifest")"
+          done
+
       - name: Publish macOS measurement artifacts
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: marmotkit-profile-macos-${{ steps.identity.outputs.head_sha }}
-          path: |
-            ${{ runner.temp }}/marmotkit-profile/*
-            ${{ runner.temp }}/marmotkit-ios-dist/*.manifest.json
-            ${{ runner.temp }}/marmotkit-macos-dist/*.manifest.json
+          path: ${{ runner.temp }}/marmotkit-profile
           if-no-files-found: error
 
       - name: Write macOS job summary
+        if: always()
         run: |
           set -euo pipefail
-          cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
-          cat "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/release-profile-measurements.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Measurement markdown was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt" ]]; then
+            cat "$RUNNER_TEMP/marmotkit-profile/swift-agreement.txt" >> "$GITHUB_STEP_SUMMARY"
+          fi

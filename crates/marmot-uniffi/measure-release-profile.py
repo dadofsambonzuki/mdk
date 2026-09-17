@@ -167,8 +167,8 @@ def artifact_row(target, kind, strip, baseline, candidate, reason=None):
         "delta_percent": None,
         "baseline_profile": {**BASELINE_PROFILE, "strip": strip},
         "candidate_profile": {**CANDIDATE_PROFILE, "strip": strip},
-        "availability": "unavailable" if reason else "measured",
-        "reason": reason,
+        "availability": "unavailable",
+        "reason": reason or "artifact files missing",
     }
     if baseline and candidate and baseline.exists() and candidate.exists():
         row["baseline_bytes"] = baseline.stat().st_size
@@ -213,7 +213,7 @@ def measure_library(workspace, env, log_dir, extra_args, name, features=None):
     if selected:
         command.extend(["--features", ",".join(selected)])
     duration, _ = run(command, env, workspace, log_dir, name)
-    return duration
+    return duration, command
 
 
 def collect_cpu(target_dir: Path):
@@ -239,6 +239,128 @@ def collect_cpu(target_dir: Path):
             }
         )
     return rows
+
+
+def isolate_criterion_dir(target_dir: Path) -> None:
+    root = target_dir / "criterion"
+    if root.exists():
+        shutil.rmtree(root)
+
+
+def cpu_rows_from_successful_run(variant: str, profile: dict, rows: list[dict]) -> list[dict]:
+    """Publish only fresh create_group estimates from a successful cargo bench."""
+    published = []
+    for row in rows:
+        if "create_group" not in row.get("benchmark", ""):
+            continue
+        if row.get("point_estimate") is None:
+            continue
+        published.append(
+            {
+                **row,
+                "variant": variant,
+                "profile": dict(profile),
+                "availability": "measured",
+                "reason": None,
+            }
+        )
+    return published
+
+
+def unavailable_cpu_row(variant: str, profile: dict, reason: str) -> dict:
+    return {
+        "benchmark": "group_lifecycle/create_group",
+        "variant": variant,
+        "profile": dict(profile),
+        "units": "ns",
+        "point_estimate": None,
+        "confidence_interval": None,
+        "raw_result": None,
+        "availability": "unavailable",
+        "reason": reason,
+    }
+
+
+def cpu_slowdown_warnings(cpu_runs: list[dict]) -> list[str]:
+    warnings = []
+    baseline = {
+        row["benchmark"]: row
+        for row in cpu_runs
+        if row.get("variant") == "baseline" and row.get("availability") == "measured"
+    }
+    for row in cpu_runs:
+        if row.get("variant") != "candidate" or row.get("availability") != "measured":
+            continue
+        prior = baseline.get(row["benchmark"])
+        if not prior or not prior.get("point_estimate") or not row.get("point_estimate"):
+            continue
+        delta = ((row["point_estimate"] - prior["point_estimate"]) / prior["point_estimate"]) * 100
+        if delta > 5:
+            warnings.append(
+                f"{row['benchmark']} candidate is {delta:.2f}% slower than baseline"
+            )
+    return warnings
+
+
+def relocate_cpu_raw_results(cpu_runs: list[dict], work: Path, diagnostics: Path) -> None:
+    for row in cpu_runs:
+        raw = row.get("raw_result")
+        if not raw:
+            continue
+        raw_path = Path(raw)
+        try:
+            relative = raw_path.relative_to(work)
+        except ValueError:
+            continue
+        destination = diagnostics / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if raw_path.is_file():
+            shutil.copy2(raw_path, destination)
+            row["raw_result"] = str(Path("diagnostics") / relative)
+
+
+def stage_diagnostics(work: Path, diagnostics: Path) -> None:
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    logs = work / "logs"
+    if logs.is_dir():
+        destination = diagnostics / "logs"
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(logs, destination)
+    for variant in ("baseline", "candidate"):
+        criterion = work / f"cpu-{variant}" / "criterion"
+        if not criterion.is_dir():
+            continue
+        destination = diagnostics / f"cpu-{variant}" / "criterion"
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(criterion, destination)
+
+
+def xcodebuild_version() -> str:
+    path = shutil.which("xcodebuild")
+    if not path:
+        return "unavailable"
+    completed = subprocess.run(
+        [path, "-version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    text = (completed.stdout or completed.stderr or "").strip()
+    if completed.returncode != 0 or not text:
+        return f"{path} (version unavailable)"
+    return " ".join(text.split())
+
+
+def command_record(name: str, command: list[str], duration, **extra) -> dict:
+    record = {
+        "name": name,
+        "argv": list(command),
+        "compile_seconds": duration,
+    }
+    record.update(extra)
+    return record
 
 
 def render_markdown(report: dict) -> str:
@@ -269,14 +391,27 @@ def render_markdown(report: dict) -> str:
             )
         )
     lines.extend(["", "## CPU", ""])
+    if report.get("cpu_collection_error"):
+        lines.append(f"CPU collection failed: {report['cpu_collection_error']}")
+        lines.append("")
     if not report["cpu_runs"]:
         lines.append("No CPU measurements were collected.")
     for row in report["cpu_runs"]:
+        reason = row.get("reason") or row.get("collection_error")
+        availability = row.get("availability")
         estimate = row.get("point_estimate")
+        if availability == "unavailable" or reason or estimate is None:
+            detail = reason or "missing estimate"
+            lines.append(
+                f"- `{row['benchmark']}` ({row.get('variant', 'unknown')}): "
+                f"unavailable ({detail})"
+            )
+            continue
         lines.append(
-            f"- `{row['benchmark']}` ({row['variant']}): "
-            f"{estimate if estimate is not None else 'unavailable'} {row['units']}"
+            f"- `{row['benchmark']}` ({row['variant']}): {estimate} {row['units']}"
         )
+    for warning in report.get("cpu_slowdown_warnings") or []:
+        lines.append(f"- investigation required: {warning}")
     lines.append("")
     return "\n".join(lines)
 
@@ -293,6 +428,11 @@ def main(argv=None) -> int:
     parser.add_argument("--android", action="store_true")
     parser.add_argument("--apple", action="store_true")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        help="Copy logs and Criterion raw results here using artifact-relative paths",
+    )
     parser.add_argument(
         "--require-android-reduction",
         action="store_true",
@@ -312,6 +452,7 @@ def main(argv=None) -> int:
     commands = []
     artifacts = []
     cpu_runs = []
+    cpu_failures = []
     base_env = os.environ.copy()
     base_env["CARGO_INCREMENTAL"] = "0"
 
@@ -320,15 +461,16 @@ def main(argv=None) -> int:
             target_dir = work / f"host-{variant}"
             env = profile_env(base_env, variant, "none")
             env["CARGO_TARGET_DIR"] = str(target_dir)
-            duration = measure_library(
+            duration, command = measure_library(
                 workspace, env, log_dir, [], f"host-{variant}"
             )
             commands.append(
-                {
-                    "name": f"host-{variant}",
-                    "compile_seconds": duration,
-                    "target_dir": str(target_dir),
-                }
+                command_record(
+                    f"host-{variant}",
+                    command,
+                    duration,
+                    target_dir=str(target_dir),
+                )
             )
         artifacts.append(
             artifact_row(
@@ -342,16 +484,17 @@ def main(argv=None) -> int:
         default_dir = work / "host-default-features"
         env = profile_env(base_env, "candidate", "none")
         env["CARGO_TARGET_DIR"] = str(default_dir)
-        duration = measure_library(
+        duration, command = measure_library(
             workspace, env, log_dir, [], "host-default-features-candidate", features=[]
         )
         commands.append(
-            {
-                "name": "host-default-features-candidate",
-                "compile_seconds": duration,
-                "target_dir": str(default_dir),
-                "features": [],
-            }
+            command_record(
+                "host-default-features-candidate",
+                command,
+                duration,
+                target_dir=str(default_dir),
+                features=[],
+            )
         )
         default_lib = host_library(default_dir)
         artifacts.append(
@@ -401,7 +544,7 @@ def main(argv=None) -> int:
             env = profile_env(base_env, variant, strip)
             env["CARGO_TARGET_DIR"] = str(target_dir)
             configure_android_toolchain(env, ndk, triple)
-            duration = measure_library(
+            duration, command = measure_library(
                 workspace,
                 env,
                 log_dir,
@@ -409,11 +552,12 @@ def main(argv=None) -> int:
                 f"android-{abi}-{variant}",
             )
             commands.append(
-                {
-                    "name": f"android-{abi}-{variant}",
-                    "compile_seconds": duration,
-                    "target_dir": str(target_dir),
-                }
+                command_record(
+                    f"android-{abi}-{variant}",
+                    command,
+                    duration,
+                    target_dir=str(target_dir),
+                )
             )
             paths[variant] = target_dir / triple / "release" / "libmarmot_uniffi.so"
         artifacts.append(
@@ -436,7 +580,7 @@ def main(argv=None) -> int:
             target_dir = work / f"apple-{variant}"
             env = profile_env(base_env, variant, "none")
             env["CARGO_TARGET_DIR"] = str(target_dir)
-            duration = measure_library(
+            duration, command = measure_library(
                 workspace,
                 env,
                 log_dir,
@@ -444,11 +588,12 @@ def main(argv=None) -> int:
                 f"apple-{triple}-{variant}",
             )
             commands.append(
-                {
-                    "name": f"apple-{triple}-{variant}",
-                    "compile_seconds": duration,
-                    "target_dir": str(target_dir),
-                }
+                command_record(
+                    f"apple-{triple}-{variant}",
+                    command,
+                    duration,
+                    target_dir=str(target_dir),
+                )
             )
             paths[variant] = target_dir / triple / "release" / "libmarmot_uniffi.a"
         artifacts.append(
@@ -458,8 +603,10 @@ def main(argv=None) -> int:
     if args.cpu:
         for variant in ("baseline", "candidate"):
             target_dir = work / f"cpu-{variant}"
+            isolate_criterion_dir(target_dir)
             env = profile_env(base_env, variant, "none")
             env["CARGO_TARGET_DIR"] = str(target_dir)
+            env["MDK_RELEASE_PROFILE_CPU_ONLY"] = "1"
             command = [
                 "cargo",
                 "bench",
@@ -480,46 +627,55 @@ def main(argv=None) -> int:
                 "3",
                 "--noplot",
             ]
-            # Later groups in this file construct fixtures during registration.
-            # A substring filter still executes those functions, so collect
-            # create_group estimates even when a later fixture asserts.
+            profile = BASELINE_PROFILE if variant == "baseline" else CANDIDATE_PROFILE
             try:
                 duration, _ = run(command, env, workspace, log_dir, f"cpu-{variant}")
-                cpu_error = None
             except RuntimeError as error:
-                duration = None
-                cpu_error = str(error)
-            commands.append(
-                {
-                    "name": f"cpu-{variant}",
-                    "compile_seconds": duration,
-                    "target_dir": str(target_dir),
-                    "availability": "measured" if cpu_error is None else "partial",
-                    "reason": cpu_error,
-                }
-            )
-            rows = collect_cpu(target_dir)
-            if rows:
-                for row in rows:
-                    row["variant"] = variant
-                    row["profile"] = (
-                        BASELINE_PROFILE if variant == "baseline" else CANDIDATE_PROFILE
+                reason = str(error)
+                cpu_failures.append(reason)
+                commands.append(
+                    command_record(
+                        f"cpu-{variant}",
+                        command,
+                        None,
+                        target_dir=str(target_dir),
+                        availability="unavailable",
+                        reason=reason,
                     )
-                    if cpu_error:
-                        row["collection_error"] = cpu_error
-                    cpu_runs.append(row)
-            else:
-                cpu_runs.append(
-                    {
-                        "benchmark": "group_lifecycle/create_group",
-                        "variant": variant,
-                        "units": "ns",
-                        "point_estimate": None,
-                        "confidence_interval": None,
-                        "raw_result": None,
-                        "reason": cpu_error or "no criterion estimates",
-                    }
                 )
+                cpu_runs.append(unavailable_cpu_row(variant, profile, reason))
+                continue
+            published = cpu_rows_from_successful_run(
+                variant, profile, collect_cpu(target_dir)
+            )
+            if not published:
+                reason = (
+                    "no fresh create_group Criterion estimates after a successful "
+                    "benchmark invocation"
+                )
+                cpu_failures.append(reason)
+                commands.append(
+                    command_record(
+                        f"cpu-{variant}",
+                        command,
+                        duration,
+                        target_dir=str(target_dir),
+                        availability="unavailable",
+                        reason=reason,
+                    )
+                )
+                cpu_runs.append(unavailable_cpu_row(variant, profile, reason))
+                continue
+            commands.append(
+                command_record(
+                    f"cpu-{variant}",
+                    command,
+                    duration,
+                    target_dir=str(target_dir),
+                    availability="measured",
+                )
+            )
+            cpu_runs.extend(published)
     else:
         cpu_runs.append(
             {
@@ -529,10 +685,16 @@ def main(argv=None) -> int:
                 "point_estimate": None,
                 "confidence_interval": None,
                 "raw_result": None,
+                "availability": "unavailable",
                 "reason": "not requested",
             }
         )
 
+    diagnostics = args.diagnostics_dir.resolve() if args.diagnostics_dir else None
+    if diagnostics is not None:
+        stage_diagnostics(work, diagnostics)
+        relocate_cpu_raw_results(cpu_runs, work, diagnostics)
+    slowdowns = cpu_slowdown_warnings(cpu_runs)
     report = {
         "schema_version": 1,
         "source_sha": args.source_sha,
@@ -543,12 +705,14 @@ def main(argv=None) -> int:
             "cargo": cargo,
             "android_ndk_home": str(find_android_ndk() or "unavailable"),
             "android_api": ANDROID_API,
-            "xcodebuild": shutil.which("xcodebuild") or "unavailable",
+            "xcodebuild": xcodebuild_version(),
         },
         "features": FEATURES,
         "commands": commands,
         "artifacts": artifacts,
         "cpu_runs": cpu_runs,
+        "cpu_collection_error": "; ".join(cpu_failures) if cpu_failures else None,
+        "cpu_slowdown_warnings": slowdowns,
     }
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     markdown = render_markdown(report)
@@ -556,13 +720,16 @@ def main(argv=None) -> int:
         args.markdown.write_text(markdown)
     else:
         sys.stdout.write(markdown)
+    failures = []
     if args.require_android_reduction:
-        failures = android_reduction_failures(artifacts)
-        if failures:
-            sys.stderr.write("Android reduction gate failed:\n")
-            for failure in failures:
-                sys.stderr.write(f"  {failure}\n")
-            return 1
+        failures.extend(android_reduction_failures(artifacts))
+    if args.cpu and cpu_failures:
+        failures.extend(cpu_failures)
+    if failures:
+        sys.stderr.write("Release-profile measurement gate failed:\n")
+        for failure in failures:
+            sys.stderr.write(f"  {failure}\n")
+        return 1
     return 0
 
 

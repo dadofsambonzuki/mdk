@@ -9,7 +9,9 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -73,6 +75,108 @@ def write_ar(path: Path, members: list[tuple[str, bytes]]) -> None:
         if len(content) % 2 == 1:
             blob.append(0)
     path.write_bytes(blob)
+
+
+def _pack(fmt: str, *values, little: bool) -> bytes:
+    endian = "<" if little else ">"
+    return struct.pack(endian + fmt, *values)
+
+
+def macho64(little: bool, segname: bytes, sectname: bytes | None = None) -> bytes:
+    """Structurally valid 64-bit Mach-O object with one LC_SEGMENT_64."""
+    nsects = 1 if sectname is not None else 0
+    cmdsize = 72 + (80 * nsects)
+    header = (
+        _pack("I", 0xFEEDFACF, little=little)
+        + _pack("i", 0x0100000C, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", cmdsize, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    command = (
+        _pack("I", 0x19, little=little)
+        + _pack("I", cmdsize, little=little)
+        + segname.ljust(16, b"\0")
+        + _pack("Q", 0, little=little)
+        + _pack("Q", 0, little=little)
+        + _pack("Q", 0, little=little)
+        + _pack("Q", 0, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", nsects, little=little)
+        + _pack("I", 0, little=little)
+    )
+    if sectname is not None:
+        command += (
+            sectname.ljust(16, b"\0")
+            + segname.ljust(16, b"\0")
+            + _pack("Q", 0, little=little)
+            + _pack("Q", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+        )
+    return header + command
+
+
+def macho32(little: bool, segname: bytes) -> bytes:
+    header = (
+        _pack("I", 0xFEEDFACE, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", 56, little=little)
+        + _pack("I", 0, little=little)
+    )
+    command = (
+        _pack("I", 0x01, little=little)
+        + _pack("I", 56, little=little)
+        + segname.ljust(16, b"\0")
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    return header + command
+
+
+def write_criterion_estimates(root: Path, point_estimate: float) -> Path:
+    estimates = (
+        root
+        / "criterion"
+        / "create_group"
+        / "1 invitees, retention disabled"
+        / "new"
+        / "estimates.json"
+    )
+    estimates.parent.mkdir(parents=True, exist_ok=True)
+    estimates.write_text(
+        json.dumps(
+            {
+                "mean": {
+                    "point_estimate": point_estimate,
+                    "confidence_interval": {
+                        "lower_bound": point_estimate - 1,
+                        "upper_bound": point_estimate + 1,
+                    },
+                }
+            }
+        )
+    )
+    return estimates
 
 
 def write_executable(path: Path, text: str) -> None:
@@ -181,6 +285,48 @@ class ReleaseProfileTests(unittest.TestCase):
         otool = "Archive : mixed.a(dup.o)\n  sectname __bitcode\n  segname __LLVM\n"
         with self.assertRaises(archive.ArchiveError):
             archive.check_archive(native, otool)
+
+    def test_macho_byte_level_detects_llvm_for_both_endians(self):
+        short_native = b"\xcf\xfa\xed\xfe" + b"native-object"
+        self.assertFalse(archive.member_has_bitcode(short_native))
+        for little in (True, False):
+            with self.subTest(little=little):
+                native = macho64(little, b"__TEXT")
+                llvm = macho64(little, b"__LLVM")
+                bitcode_section = macho64(little, b"__TEXT", sectname=b"__bitcode")
+                native32 = macho32(little, b"__TEXT")
+                llvm32 = macho32(little, b"__LLVM")
+                self.assertFalse(archive.member_has_bitcode(native))
+                self.assertFalse(archive.member_has_bitcode(native32))
+                self.assertTrue(archive.member_has_bitcode(llvm))
+                self.assertTrue(archive.member_has_bitcode(bitcode_section))
+                self.assertTrue(archive.member_has_bitcode(llvm32))
+                accepted = self.root / f"native-{'le' if little else 'be'}.a"
+                rejected = self.root / f"llvm-{'le' if little else 'be'}.a"
+                write_ar(accepted, [("obj.o", native)])
+                write_ar(rejected, [("obj.o", llvm)])
+                self.assertGreater(archive.check_archive(accepted), 0)
+                with self.assertRaises(archive.ArchiveError):
+                    archive.check_archive(rejected)
+
+    def test_clang_llvm_bitcode_archive_rejected_without_otool(self):
+        clang = shutil.which("clang")
+        if not clang:
+            self.skipTest("clang unavailable")
+        src = self.root / "probe.c"
+        src.write_text("int marmotkit_bitcode_probe(void) { return 1; }\n")
+        obj = self.root / "probe.o"
+        completed = subprocess.run(
+            [clang, "-c", "-emit-llvm", "-o", str(obj), str(src)],
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 or not obj.exists():
+            self.skipTest(completed.stderr or "clang -emit-llvm unavailable")
+        archive_path = self.root / "clang-bitcode.a"
+        write_ar(archive_path, [("probe.o", obj.read_bytes())])
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(archive_path)
 
     def test_builders_keep_android_strip_isolated(self):
         log = self.root / "cargo.jsonl"
@@ -438,6 +584,11 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertNotIn("softprops/action-gh-release", text)
         self.assertNotIn("upload-to-github-release", text)
         self.assertIn("github.event.pull_request.head.sha", text)
+        self.assertGreaterEqual(text.count("if: always()"), 4)
+        self.assertIn("--diagnostics-dir", text)
+        self.assertIn("target/release-profile-measure/logs", text)
+        self.assertIn("cpu-${variant}/criterion", text)
+        self.assertIn("xcodebuild -version", text)
 
     def test_unavailable_measurements_are_not_zero(self):
         row = measure.artifact_row(
@@ -454,6 +605,20 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertEqual(row["availability"], "unavailable")
         self.assertNotEqual(row["baseline_bytes"], 0)
         self.assertNotEqual(row["candidate_bytes"], 0)
+
+    def test_missing_artifact_paths_are_unavailable(self):
+        missing = self.root / "missing.so"
+        row = measure.artifact_row(
+            "host",
+            "host_generation_library",
+            "none",
+            missing,
+            missing,
+        )
+        self.assertEqual(row["availability"], "unavailable")
+        self.assertEqual(row["reason"], "artifact files missing")
+        self.assertIsNone(row["baseline_bytes"])
+        self.assertIsNone(row["candidate_bytes"])
 
     def test_android_reduction_gate_requires_measured_shrink(self):
         missing = [
@@ -544,12 +709,106 @@ class ReleaseProfileTests(unittest.TestCase):
                 self.assertIsNone(row["delta_bytes"])
                 self.assertTrue(row["reason"])
         self.assertGreaterEqual(len(report["cpu_runs"]), 2)
-        estimates = [
-            row["point_estimate"]
-            for row in report["cpu_runs"]
-            if row.get("point_estimate") is not None
-        ]
-        self.assertTrue(estimates)
+        for row in report["cpu_runs"]:
+            if row.get("availability") == "unavailable":
+                self.assertIsNone(row.get("point_estimate"))
+                self.assertTrue(row.get("reason"))
+            else:
+                self.assertIsNotNone(row.get("point_estimate"))
+
+    def test_failed_cpu_does_not_publish_stale_or_missing_estimates(self):
+        stale = write_criterion_estimates(self.root / "cpu-baseline", 12345.0)
+        self.assertTrue(stale.is_file())
+        isolate = self.root / "empty-target"
+        isolate.mkdir()
+        measure.isolate_criterion_dir(isolate)
+        leftover = write_criterion_estimates(isolate, 999.0)
+        measure.isolate_criterion_dir(isolate)
+        self.assertFalse(leftover.exists())
+
+        published = measure.cpu_rows_from_successful_run(
+            "baseline",
+            measure.BASELINE_PROFILE,
+            measure.collect_cpu(self.root / "cpu-baseline"),
+        )
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0]["point_estimate"], 12345.0)
+
+        failed = measure.unavailable_cpu_row(
+            "baseline",
+            measure.BASELINE_PROFILE,
+            "cpu-baseline failed with 2; see logs/cpu-baseline.stderr",
+        )
+        self.assertIsNone(failed["point_estimate"])
+        self.assertEqual(failed["availability"], "unavailable")
+        markdown = measure.render_markdown(
+            {
+                "schema_version": 1,
+                "source_sha": "a" * 40,
+                "builder_sha": "b" * 40,
+                "artifacts": [],
+                "cpu_runs": [failed],
+                "cpu_collection_error": failed["reason"],
+            }
+        )
+        self.assertIn("unavailable", markdown)
+        self.assertNotIn("12345", markdown)
+        self.assertIn("CPU collection failed", markdown)
+
+    def test_cpu_measurement_gate_fails_with_and_without_stale_estimates(self):
+        for label, seed_stale in (("without-stale", False), ("with-stale", True)):
+            with self.subTest(label=label):
+                work = self.root / label
+                work.mkdir()
+                measure_dir = work / "measure"
+                if seed_stale:
+                    write_criterion_estimates(measure_dir / "cpu-baseline", 4242.0)
+                    write_criterion_estimates(measure_dir / "cpu-candidate", 4343.0)
+                bin_dir = work / "bin"
+                write_executable(
+                    bin_dir / "cargo",
+                    "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "if sys.argv[1:2] == ['--version']:\n"
+                    "    print('cargo 1.97.1')\n"
+                    "    raise SystemExit(0)\n"
+                    "raise SystemExit(2)\n",
+                )
+                env = os.environ.copy()
+                env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                output = work / "report.json"
+                markdown = work / "report.md"
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(HERE / "measure-release-profile.py"),
+                        "--source-sha",
+                        "a" * 40,
+                        "--builder-sha",
+                        "b" * 40,
+                        "--cpu",
+                        "--work-dir",
+                        str(measure_dir),
+                        "--output",
+                        str(output),
+                        "--markdown",
+                        str(markdown),
+                    ],
+                    env=env,
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                report = json.loads(output.read_text())
+                for row in report["cpu_runs"]:
+                    self.assertIsNone(row.get("point_estimate"))
+                    self.assertEqual(row.get("availability"), "unavailable")
+                    self.assertTrue(row.get("reason"))
+                rendered = markdown.read_text()
+                self.assertNotIn("4242", rendered)
+                self.assertNotIn("4343", rendered)
+                self.assertIn("unavailable", rendered)
 
 
 if __name__ == "__main__":
