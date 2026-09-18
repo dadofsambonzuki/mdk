@@ -552,6 +552,86 @@ Use the asynchronous attachment history page/version methods for canonical media
 discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
 removal and cursor ownership. `list_media` remains a compatibility API.
 
+## KeyPackage client preference and publication label
+
+Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
+then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
+substring). These are advisory labels, never proof of a particular application.
+Only valid packages compatible with the proposed/existing group qualify. Within a
+tier, the existing recency order applies. Amethyst remains selectable when no
+higher-priority compatible package is available. A replacement in a publication
+slot supersedes the old package before ranking; one package per account is selected.
+This temporary selection policy applies to all hosts of this runtime; only the
+publication label is host-configurable. Compatibility alone cannot identify a
+client that publishes usable packages but does not process Welcomes.
+
+Client ranking and slot supersession also apply to directory lookup (including
+`wn-cli key-package`) and composition prewarm, without target-group requirements. A
+malformed current publication never revives an older package in the same slot.
+If no usable slot remains, prewarm reports failure while retaining successfully
+discovered routes for other members. Its success must not imply readiness based
+on superseded material. Bounded batch results are not exhaustive, so rejected
+candidates still permit a per-account fallback fetch. A lower-priority batch
+winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
+batch limit, even if it returned fewer records than requested: relays may impose
+lower caps. Already observed replacements remain authoritative during the refetch.
+This adds a per-author request for each lower-priority batch winner. A White Noise
+winner already has the highest tier in a newest-first prefix, so it skips that
+request. Both paths remain bounded discovery: neither guarantees completeness
+when a relay omits newer events instead of returning a newest-first prefix.
+If that supplementary fetch fails, a still-valid, compatible package from the
+current batch remains usable; previously cached packages are never substituted.
+Prewarm skips preference-only refetches because it only checks existence.
+Prewarm checks discovery readiness only; it has no proposed group configuration
+and does not guarantee capability compatibility. Final creation/invitation checks
+the actual group's requirements. Device-aware delivery in
+[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
+replacement for this temporary client ranking.
+
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, and
+`secretStore` in `Marmot.newWithConfiguration`. Each field is optional in generated
+Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
+an omitted label stays untagged and omitted storage uses the platform keychain.
+Existing constructors keep their signatures and delegate to this same configuration
+path. Use the options constructor when combining a label with a custom relay policy.
+C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
+struct; zero initialization selects the same defaults. Use the matching header
+and library for that struct's layout.
+
+```swift
+let options = MarmotOptions(clientName: "whitenoise")
+let marmot = try Marmot.newWithConfiguration(
+    rootPath: rootPath, relayUrls: relayUrls, options: options
+)
+```
+
+Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
+and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
+./crates/marmot-uniffi/options-smoke.sh kotlin`.
+
+Host applications opt into public tagging at construction. Existing constructors
+remain untagged. Swift hosts can use:
+
+```swift
+let marmot = try Marmot.newWithClientName(
+    rootPath: rootPath,
+    relayUrls: relayUrls,
+    clientName: "whitenoise",
+    cursorPersistence: .advance,
+    secretStore: nil
+)
+```
+
+Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
+`marmot_client_new_with_client_name`. Rust hosts set
+`MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
+Supply the name on every host runtime construction, including background and
+notification-extension entry points (which retain their frozen cursor policy).
+Absent or whitespace-only names omit the tag. New initial publications and normal
+rotations carry the configured label. Existing events are not republished, and
+already-signed pending publications retry with their original tags even if the
+configuration changes. No workspace/binding version bump is part of this change.
+
 ## Local attachment access
 
 Use `attachmentLocalAssets` to locate verified retained bytes for visible source
