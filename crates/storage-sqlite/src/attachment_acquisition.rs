@@ -147,7 +147,93 @@ pub(crate) fn reconcile_attachment_acquisition_tx(
     Ok(())
 }
 
+/// A bounded parser work item. Its generation fences acknowledgement against
+/// a source update or rebuild that arrives while the caller is parsing it.
+pub struct AttachmentWorkerDemand {
+    pub group_id_hex: String,
+    pub entry: crate::AttachmentHistoryEntry,
+    generation: Vec<u8>,
+}
+
+/// Source material for local preparation. This is not a lease or permission to
+/// fetch; claim must still succeed for this exact asset before network work.
+pub struct AttachmentAcquisitionSource {
+    pub group_id_hex: String,
+    pub source_epoch: u64,
+    pub slot: serde_json::Value,
+}
+
+impl AttachmentAcquisition {
+    /// Deterministic publication validation, distinct from transient DB errors.
+    pub fn verify_plaintext(&self, plaintext: &[u8]) -> StorageResult<()> {
+        if plaintext.len() > MAX_RETAINED_ATTACHMENT_BYTES {
+            return Err(invalid("retained attachment exceeds storage bound"));
+        }
+        if Sha256::digest(plaintext).as_slice() != self.digest {
+            return Err(invalid("attachment plaintext digest mismatch"));
+        }
+        Ok(())
+    }
+}
+
 impl SqliteAccountStorage {
+    /// Read source changes without a history scan. Oversized descriptors are
+    /// represented as null so the shared parser rejects them without allocation.
+    pub fn attachment_worker_demands(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<AttachmentWorkerDemand>> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment demand limit"));
+        }
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT d.group_id_hex,d.generation,h.message_id_hex,
+            h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,
+            CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE 'null' END
+            FROM attachment_worker_demand d JOIN attachment_history h
+            USING(group_id_hex,message_id_hex,attachment_index)
+            ORDER BY d.group_id_hex,d.message_id_hex,d.attachment_index LIMIT ?1").storage()?;
+        stmt.query_map([limit as i64], |r| {
+            let slot: String = r.get(9)?;
+            Ok(AttachmentWorkerDemand {
+                group_id_hex: r.get(0)?,
+                generation: r.get(1)?,
+                entry: crate::AttachmentHistoryEntry {
+                    message_id_hex: r.get(2)?,
+                    attachment_index: r.get::<_, u32>(3)? as usize,
+                    source_message_id_hex: r.get(4)?,
+                    source_epoch: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    sender: r.get(6)?,
+                    timeline_at: nonnegative(r, 7)?,
+                    received_at: nonnegative(r, 8)?,
+                    slot: serde_json::from_str(&slot).unwrap_or(serde_json::Value::Null),
+                },
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+    }
+
+    pub fn acknowledge_attachment_worker_demand(
+        &self,
+        demand: &AttachmentWorkerDemand,
+    ) -> StorageResult<()> {
+        self.lock()?
+            .execute(
+                "DELETE FROM attachment_worker_demand
+            WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3 AND generation=?4",
+                params![
+                    demand.group_id_hex,
+                    demand.entry.message_id_hex,
+                    demand.entry.attachment_index as i64,
+                    demand.generation
+                ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
     /// Persist source-bound demand after the app has validated this exact slot
     /// and its plaintext digest with the shared parser. Pending invitations,
     /// hidden/expired/missing sources and legacy unknown epochs are not admitted.
@@ -296,6 +382,72 @@ impl SqliteAccountStorage {
             .collect())
     }
 
+    /// Reclaim abandoned attempts once, under the new account worker's exclusive
+    /// ownership, before it starts any transfers. Bounded and attempt-fenced;
+    /// scheduled retries, terminal failures and ready bytes are unchanged.
+    pub fn resume_attachment_acquisitions(&self, now: u64, limit: usize) -> StorageResult<usize> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment resume limit"));
+        }
+        self.lock()?.execute("UPDATE attachment_acquisition SET state=0,due=?1,attempt=NULL
+            WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)",
+            params![u64_to_i64(now)?,limit as i64]).storage()
+    }
+
+    /// Select a due source without incrementing attempts. Ineligible sources are
+    /// parked just as at claim time, so stale rows cannot obstruct the due page.
+    pub fn prepare_attachment_acquisition(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<Option<AttachmentAcquisitionSource>> {
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? { return Ok(None); }
+            let row = conn.query_row(&format!("SELECT group_id_hex,source_epoch,slot_json
+                FROM attachment_acquisition q WHERE token=?1 AND due<=?2 AND {SOURCE_MATCH} AND {ACCEPTED}
+                AND (expires_at IS NULL OR expires_at>?2)"), params![reference.token,now], |r|
+                Ok((r.get::<_,String>(0)?,nonnegative(r,1)?,r.get::<_,String>(2)?))).optional().storage()?;
+            let Some((group_id_hex,source_epoch,slot)) = row else {
+                conn.execute("UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
+                    WHERE token=?1 AND due<=?2",params![reference.token,now]).storage()?;
+                return Ok(None);
+            };
+            Ok(Some(AttachmentAcquisitionSource { group_id_hex,source_epoch,
+                slot: serde_json::from_str(&slot).map_err(|_| invalid("invalid stored attachment slot"))? }))
+        })
+    }
+
+    /// Defer readiness checks without recording a transfer attempt, or block a
+    /// structurally invalid source. Never replace an active lease or newer job.
+    pub fn finish_attachment_preparation(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        retry_at: Option<u64>,
+    ) -> StorageResult<()> {
+        let due = retry_at.map(u64_to_i64).transpose()?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4
+                WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                params![
+                    reference.token,
+                    u64_to_i64(now)?,
+                    if due.is_some() { 2 } else { 4 },
+                    due
+                ],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
     /// Lease deadlines are chosen by the runtime transfer policy. Expired leases
     /// can be reclaimed after process death; the new attempt fences late results.
     pub fn claim_attachment_acquisition(
@@ -391,12 +543,7 @@ impl SqliteAccountStorage {
         now: u64,
         byte_budget: u64,
     ) -> StorageResult<AttachmentPublishResult> {
-        if plaintext.len() > MAX_RETAINED_ATTACHMENT_BYTES {
-            return Err(invalid("retained attachment exceeds storage bound"));
-        }
-        if Sha256::digest(plaintext).as_slice() != job.digest {
-            return Err(invalid("attachment plaintext digest mismatch"));
-        }
+        job.verify_plaintext(plaintext)?;
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
