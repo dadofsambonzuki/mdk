@@ -172,6 +172,8 @@ mod migration_0079_content_reports;
 mod migration_0080_avatar_target_lookup;
 #[path = "migrations/0081_attachment_history.rs"]
 mod migration_0081_attachment_history;
+#[path = "migrations/0083_attachment_acquisition.rs"]
+mod migration_0083_attachment_acquisition;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -592,6 +594,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 82,
         name: "0082_deletion_provenance",
         apply: migration_0082_deletion_provenance::apply,
+    },
+    Migration {
+        version: 83,
+        name: "0083_attachment_acquisition",
+        apply: migration_0083_attachment_acquisition::apply,
     },
 ];
 

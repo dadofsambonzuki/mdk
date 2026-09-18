@@ -1635,6 +1635,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     for start in stream_starts {
         upsert_agent_stream_start_tx(tx, &start)?;
     }
+    crate::attachment_acquisition::reconcile_attachment_acquisition_tx(tx, group_id_hex, None)?;
     Ok(())
 }
 
@@ -2030,6 +2031,11 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         )
         .storage()?;
         reports::refresh(tx, group_id_hex, message_id_hex)?;
+        crate::attachment_acquisition::reconcile_attachment_acquisition_tx(
+            tx,
+            group_id_hex,
+            Some(message_id_hex),
+        )?;
         return Ok(());
     };
 
