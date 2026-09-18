@@ -24,6 +24,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   if refresh fails. Regenerate bindings and headers with the matching library.
   Android settings adoption remains a separate consumer change.
 
+- Message presentation records expose typed deletion provenance (`author`, `admin`, or `unknown`),
+  including conversation windows, chat-list and reply previews, moderation reads, and timeline JSON.
+  Provenance comes from the selected accepted deletion, independently of the original message kind.
+- Conversation-window bindings preserve custom-event tags for client-defined renderers.
+
+Update generated Swift/Kotlin bindings, native libraries, and C headers together. Storage migration 82
+adds provenance columns defaulting to unknown and preserves existing tombstones and deletion IDs.
+No historical backfill is scheduled; older tombstones can remain unknown indefinitely.
+See the [binding contract](../marmot-uniffi/README.md#deletion-provenance-and-custom-events).
+
 ## [0.10.1] - 2026-09-16
 
 Update generated bindings, native libraries, and C headers together. Apple consumers must also stage the matching privacy resource in their Swift wrapper. Account storage advances through migration 80; back up before upgrade because downgrade is unsupported. See [0.10.1 release notes](../../docs/release/0.10.1.md).
