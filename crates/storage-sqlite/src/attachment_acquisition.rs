@@ -51,6 +51,7 @@ pub enum AttachmentDemand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentAcquisitionStatus {
     pub state: AttachmentAcquisitionState,
+    /// Claims since the last durable forward checkpoint (the retry failure streak).
     pub attempts: u64,
     pub due: Option<u64>,
     pub byte_count: u64,
@@ -193,7 +194,7 @@ impl SqliteAccountStorage {
             CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE 'null' END
             FROM attachment_worker_demand d JOIN attachment_history h
             USING(group_id_hex,message_id_hex,attachment_index)
-            ORDER BY d.group_id_hex,d.message_id_hex,d.attachment_index LIMIT ?1").storage()?;
+            ORDER BY h.received_at DESC,d.group_id_hex,d.message_id_hex,d.attachment_index LIMIT ?1").storage()?;
         stmt.query_map([limit as i64], |r| {
             let slot: String = r.get(9)?;
             Ok(AttachmentWorkerDemand {
@@ -323,7 +324,7 @@ impl SqliteAccountStorage {
                  VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
                  DO UPDATE SET state=0,due=excluded.due
-                 WHERE attachment_acquisition.state=5",
+                 WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0",
                 params![
                     group,
                     message,
@@ -491,7 +492,8 @@ impl SqliteAccountStorage {
                 return Ok(None);
             }
             conn.execute(
-                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),
+                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,
+                    progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
                     attempts=min(attempts+1,2147483647) WHERE token=?1",
                 params![reference.token, deadline],
             )
@@ -647,7 +649,7 @@ impl SqliteAccountStorage {
         }
         Ok(conn
             .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL
+                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL
              WHERE token=?1 AND state IN (2,4,5)",
                 params![reference.token, u64_to_i64(now)?],
             )
@@ -703,6 +705,18 @@ impl SqliteAccountStorage {
         let index = u32::try_from(selected.attachment_index)
             .map_err(|_| invalid("invalid attachment index"))?;
         self.connection.with_transaction(|| {
+            let current = self.attachment_control_entry(
+                group,
+                &selected.message_id_hex,
+                &selected.source_message_id_hex,
+                index,
+                now,
+            )?;
+            if !current.is_some_and(|entry| {
+                entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
+            }) {
+                return Ok(AttachmentDemand::Unavailable);
+            }
             self.lock()?
                 .execute(
                     "DELETE FROM attachment_removal_suppression
@@ -710,7 +724,11 @@ impl SqliteAccountStorage {
                     params![group, selected.message_id_hex, index],
                 )
                 .storage()?;
-            self.request_attachment_acquisition(group, selected, digest, now)
+            let demand = self.request_attachment_acquisition(group, selected, digest, now)?;
+            if let AttachmentDemand::Requested(reference) = &demand {
+                self.explicitly_retry_attachment(reference, now)?;
+            }
+            Ok(demand)
         })
     }
 
@@ -845,3 +863,9 @@ pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPart
 
 mod access;
 pub use access::RetainedAttachmentAsset;
+
+mod controls;
+pub use controls::{
+    AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
+    AttachmentTransferStatus,
+};

@@ -120,6 +120,11 @@ impl BlossomHttpTransport {
         mut self,
         resume: Arc<super::attachment_resume::AttachmentResume>,
     ) -> Self {
+        if resume.automatic {
+            self.transfer_timeout = self
+                .transfer_timeout
+                .min(super::attachment_resume::AUTOMATIC_TRANSFER_TIMEOUT);
+        }
         self.resume = Some(resume);
         self
     }
@@ -831,6 +836,11 @@ where
         if let Some(part) = &partial
             && part.bytes.len() as u64 == part.identity.total
         {
+            if let Some(resume) = resume {
+                resume
+                    .progress(part.identity.total, Some(part.identity.total), true)
+                    .await?;
+            }
             return Ok(FetchedBlob {
                 bytes: partial.expect("checked").bytes,
                 response_url: current,
@@ -950,7 +960,11 @@ where
                     prefix,
                 )
                 .await;
-                if matches!(result, Err(AttachmentDownloadFailure::Stop(_))) {
+                if matches!(
+                    result,
+                    Err(AttachmentDownloadFailure::Stop(_)
+                        | AttachmentDownloadFailure::SizeLimit(_, _))
+                ) {
                     let _ = context.clear(Some(&current)).await;
                 }
                 return result.map(|bytes| FetchedBlob {

@@ -2,20 +2,14 @@ use super::*;
 
 #[test]
 fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
-    let p = crate::AttachmentAcquisitionPolicy::default();
-    assert_eq!(p.retained_bytes_per_account, 2 * 1024 * 1024 * 1024);
-    assert_eq!(p.minimum_free_disk_bytes, 256 * 1024 * 1024);
-    assert_eq!(p.maximum_transfer_bytes, 64 * 1024 * 1024);
-    let free = p.minimum_free_disk_bytes + 4 * p.maximum_transfer_bytes;
-    assert!(capacity(&p, free));
-    assert!(!capacity(&p, free - 1));
-    assert!(!capacity(
-        &crate::AttachmentAcquisitionPolicy {
-            maximum_transfer_bytes: u64::MAX,
-            ..p
-        },
-        u64::MAX
-    ));
+    let p = super::super::super::attachment_controls::default_policy(&MarmotAppConfig::default());
+    assert_eq!(p.retained_bytes, 2 * 1024 * 1024 * 1024);
+    assert_eq!(p.disk_reserve, 256 * 1024 * 1024);
+    assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
+    let free = p.disk_reserve + 4 * p.transfer_limit;
+    assert!(capacity(&p, p.transfer_limit, free));
+    assert!(!capacity(&p, p.transfer_limit, free - 1));
+    assert!(!capacity(&p, u64::MAX, u64::MAX));
 }
 
 use crate::tests::ScriptedPushRelayClient;
@@ -176,6 +170,11 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
 
 #[tokio::test]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
+    download_without_engine_and_retain(false).await;
+    download_without_engine_and_retain(true).await;
+}
+
+async fn download_without_engine_and_retain(explicit: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
@@ -274,6 +273,23 @@ async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_
         admission.is_waiting(),
         "eligible job must queue for global capacity"
     );
+    if explicit {
+        let now = crate::unix_now_seconds();
+        let asset = storage
+            .attachment_transfer_candidates(now, 1, true)
+            .unwrap()
+            .remove(0);
+        storage.explicitly_retry_attachment(&asset, now).unwrap();
+        let mut policy =
+            super::super::super::attachment_controls::default_policy(&client.app.config);
+        policy.automatic = false;
+        // Enough quota for the default admission reservation, but not the
+        // explicit 512 MiB ceiling. A tiny explicit file must still finish.
+        policy.retained_bytes = policy.transfer_limit;
+        storage
+            .set_attachment_download_policy(&policy, now)
+            .unwrap();
+    }
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert_eq!(shared.attachment_transfer.available_permits(), 0);
@@ -495,8 +511,8 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
 }
 
 #[tokio::test]
-async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off() {
-    assert!(MarmotAppConfig::default().attachment_acquisition.is_none());
+async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on() {
+    assert!(MarmotAppConfig::default().attachment_acquisition.is_some());
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     let entry = storage
@@ -540,7 +556,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_off
 mod resume;
 
 #[tokio::test]
-async fn attachment_worker_budget_pause_does_not_consume_attempts() {
+async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     let (_dir, mut client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     admit_demands(&store, now, false).unwrap();
@@ -551,7 +567,8 @@ async fn attachment_worker_budget_pause_does_not_consume_attempts() {
         .attachment_acquisition
         .as_mut()
         .unwrap()
-        .retained_bytes_per_account = 0;
+        .minimum_free_disk_bytes =
+        i64::MAX as u64 - 4 * crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES;
     let (http, _rx) = context();
     let shared = RuntimeSharedServices::default();
     let mut admission = Admission::default();
@@ -564,5 +581,34 @@ async fn attachment_worker_budget_pause_does_not_consume_attempts() {
         .unwrap();
     assert_eq!(status.attempts, 0);
     assert!(status.due.unwrap() > now);
+    let progress = store
+        .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.state,
+        storage_sqlite::AttachmentTransferState::RetryScheduled
+    );
+    assert_eq!(progress.retry_at, status.due);
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn attachment_cancellation_observation_error_is_not_cancellation() {
+    let (_dir, _client, store, _reference) = offline_fixture().await;
+    let now = crate::unix_now_seconds();
+    admit_demands(&store, now, false).unwrap();
+    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    let (_updates, watch) = watch::channel(());
+    store.close().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), cancelled(store, job, watch))
+            .await
+            .is_err(),
+        "an unobservable store must not masquerade as a durable cancel"
+    );
 }

@@ -18,7 +18,11 @@ pub struct AttachmentPartial {
     pub bytes: Vec<u8>,
 }
 
-fn valid_attempt(conn: &Connection, job: &AttachmentAcquisition, now: u64) -> StorageResult<bool> {
+pub(super) fn valid_attempt(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: u64,
+) -> StorageResult<bool> {
     if !matches_store(conn, &job.reference)? {
         return Ok(false);
     }
@@ -136,6 +140,15 @@ impl SqliteAccountStorage {
                 ],
             )
             .storage()?;
+            // Only newly retained resumable bytes break the failure streak.
+            // Re-reading/replacing the same prefix must not suppress backoff.
+            if end > old.as_ref().map_or(0, |old| old.4) {
+                conn.execute(
+                    "UPDATE attachment_acquisition SET attempts=1 WHERE token=?1",
+                    [&job.reference.token],
+                )
+                .storage()?;
+            }
             conn.execute(
                 "UPDATE attachment_partial SET received=?2,expires_at=?3 WHERE token=?1",
                 params![

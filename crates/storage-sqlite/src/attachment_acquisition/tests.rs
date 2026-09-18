@@ -1349,3 +1349,563 @@ fn attachment_asset_opaque_references_are_bounded_and_store_scoped() {
             .is_none()
     );
 }
+
+#[test]
+fn attachment_cancellation_is_durable_and_only_explicit_retry_readmits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel.db");
+    let key = SqlCipherKey::new("cancel-restart-key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    seed(&store, "cancel");
+    let reference = request(&store, "cancel");
+    let old = store
+        .claim_attachment_acquisition(&reference, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store.cancel_attachment_acquisition(&reference).unwrap(),
+        "cancel must persist user intent"
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&old, BODY, 13, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Superseded
+    );
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    request(&store, "cancel");
+    store.resume_attachment_acquisitions(200, 64).unwrap();
+    assert!(
+        store
+            .due_attachment_acquisitions(200, 64)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.retry_attachment_acquisition(&reference, 201).unwrap());
+    assert!(
+        store
+            .claim_attachment_acquisition(&reference, 201, 300)
+            .unwrap()
+            .is_some()
+    );
+}
+
+fn policy(automatic: bool, limit: u64) -> AttachmentDownloadPolicy {
+    AttachmentDownloadPolicy {
+        automatic,
+        retained_bytes: 10000,
+        disk_reserve: 0,
+        transfer_limit: limit,
+    }
+}
+fn transfer(
+    store: &SqliteAccountStorage,
+    message: &str,
+    automatic: bool,
+) -> AttachmentTransferStatus {
+    store
+        .attachment_transfer_status(
+            GROUP,
+            message,
+            &format!("source-{message}"),
+            0,
+            20,
+            automatic,
+        )
+        .unwrap()
+        .unwrap()
+}
+#[test]
+fn cancellation_preserves_partial_until_expiry_and_never_removes_ready_bytes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "partial");
+    let asset = request(&store, "partial");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    assert_eq!(partial_usage(&store), 3);
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert_eq!(partial_usage(&store), 3);
+    assert_eq!(
+        transfer(&store, "partial", true).state,
+        AttachmentTransferState::Cancelled
+    );
+    store
+        .set_attachment_download_policy(&policy(false, 64), 13)
+        .unwrap();
+    store
+        .set_attachment_download_policy(&policy(true, 128), 14)
+        .unwrap();
+    assert_eq!(
+        transfer(&store, "partial", true).state,
+        AttachmentTransferState::Cancelled
+    );
+    assert!(
+        store
+            .attachment_transfer_candidates(20, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .prune_attachment_partials(12 + 24 * 3600 + 1, 64)
+        .unwrap();
+    assert_eq!(partial_usage(&store), 0);
+    store.explicitly_retry_attachment(&asset, 20).unwrap();
+    let job = store
+        .claim_attachment_acquisition(&asset, 20, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 21, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert!(!store.cancel_attachment_acquisition(&asset).unwrap());
+    assert_eq!(
+        transfer(&store, "partial", true).state,
+        AttachmentTransferState::Ready
+    );
+    assert_eq!(
+        &*store
+            .read_retained_attachment(&asset, 21, 0, 100)
+            .unwrap()
+            .unwrap(),
+        BODY
+    );
+}
+#[test]
+fn disabled_policy_fences_automatic_completion_but_preserves_promoted_explicit_work() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["automatic", "explicit"] {
+        seed(&store, m);
+    }
+    let automatic = request(&store, "automatic");
+    let explicit = request(&store, "explicit");
+    let automatic_job = store
+        .claim_attachment_acquisition(&automatic, 12, 100)
+        .unwrap()
+        .unwrap();
+    let explicit_job = store
+        .claim_attachment_acquisition(&explicit, 12, 100)
+        .unwrap()
+        .unwrap();
+    // Promotion must preserve an already-running attempt, not start a duplicate.
+    store.explicitly_retry_attachment(&explicit, 13).unwrap();
+    store
+        .set_attachment_download_policy(&policy(false, 64), 14)
+        .unwrap();
+    assert!(
+        !store
+            .attachment_transfer_is_active(&automatic_job, 15)
+            .unwrap()
+    );
+    assert!(
+        store
+            .attachment_transfer_is_active(&explicit_job, 15)
+            .unwrap()
+    );
+    assert_eq!(
+        transfer(&store, "automatic", false).state,
+        AttachmentTransferState::Paused
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&automatic_job, BODY, 15, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Superseded
+    );
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&explicit_job, BODY, 15, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert!(
+        store
+            .attachment_transfer_candidates(20, 64, false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .attachment_download_policy(&policy(true, 100))
+            .unwrap(),
+        policy(false, 64)
+    );
+}
+#[test]
+fn cap_increase_readmits_size_failures_but_not_integrity_or_cancelled_work() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["size", "integrity", "cancel"] {
+        seed(&store, m);
+        let asset = request(&store, m);
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, 100)
+            .unwrap()
+            .unwrap();
+        match m {
+            "size" => store.block_attachment_size_policy(&job, 64, 13).unwrap(),
+            "integrity" => {
+                store.fail_attachment_acquisition(&job, None).unwrap();
+            }
+            _ => {
+                store.cancel_attachment_acquisition(&asset).unwrap();
+            }
+        }
+    }
+    store
+        .set_attachment_download_policy(&policy(true, 64), 13)
+        .unwrap();
+    assert!(
+        store
+            .attachment_transfer_candidates(20, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .set_attachment_download_policy(&policy(true, 128), 14)
+        .unwrap();
+    assert_eq!(
+        store.attachment_transfer_candidates(20, 64, true).unwrap(),
+        vec![request(&store, "size")]
+    );
+    assert_eq!(
+        transfer(&store, "integrity", true).state,
+        AttachmentTransferState::Failed
+    );
+    assert_eq!(
+        transfer(&store, "cancel", true).state,
+        AttachmentTransferState::Cancelled
+    );
+}
+#[test]
+fn progress_is_monotonic_per_http_generation_and_fenced_by_attempt() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "progress");
+    let asset = request(&store, "progress");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .update_attachment_progress(&job, 13, 1, 8, Some(12), true)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .update_attachment_progress(&job, 13, 1, 7, Some(12), false)
+            .unwrap()
+    );
+    let first = transfer(&store, "progress", true);
+    assert_eq!((first.attempt, first.received), (1, 8));
+    assert!(
+        store
+            .update_attachment_progress(&job, 14, 1, 0, None, true)
+            .unwrap()
+    );
+    assert!(
+        store
+            .update_attachment_progress(&job, 14, 1, 12, Some(12), false)
+            .unwrap()
+    );
+    store.update_attachment_phase(&job, 15, 2).unwrap();
+    let second = transfer(&store, "progress", true);
+    assert_eq!((second.attempt, second.received), (2, 12));
+    assert_eq!(second.state, AttachmentTransferState::VerifyingCiphertext);
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert!(!store.update_attachment_phase(&job, 16, 4).unwrap());
+    assert!(
+        !store
+            .update_attachment_progress(&job, 16, 1, 0, None, true)
+            .unwrap()
+    );
+}
+#[test]
+fn explicit_then_recent_candidates_precede_backfill_and_invalid_policy_is_atomic() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (m, t) in [("old", 1), ("new", 30), ("explicit", 2)] {
+        seed(&store, m);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attachment_history SET received_at=?2 WHERE message_id_hex=?1",
+                params![m, t],
+            )
+            .unwrap();
+        request(&store, m);
+    }
+    let explicit = request(&store, "explicit");
+    store.explicitly_retry_attachment(&explicit, 12).unwrap();
+    assert_eq!(
+        store.attachment_transfer_candidates(20, 64, true).unwrap(),
+        vec![explicit, request(&store, "new"), request(&store, "old")]
+    );
+    store
+        .set_attachment_download_policy(&policy(true, 64), 12)
+        .unwrap();
+    assert!(
+        store
+            .set_attachment_download_policy(&policy(false, 0), 13)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .attachment_download_policy(&policy(false, 10))
+            .unwrap(),
+        policy(true, 64)
+    );
+}
+#[test]
+fn stale_download_again_does_not_clear_removal_and_valid_request_is_explicit() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "removed");
+    request(&store, "removed");
+    store.remove_local_attachment(GROUP, "removed", 0).unwrap();
+    let mut stale = selected("removed");
+    stale.source_epoch = Some(4);
+    assert!(matches!(
+        store
+            .request_attachment_download_again(GROUP, &stale, digest(), 12)
+            .unwrap(),
+        AttachmentDemand::Unavailable
+    ));
+    assert_eq!(
+        transfer(&store, "removed", true).state,
+        AttachmentTransferState::Removed
+    );
+    let AttachmentDemand::Requested(asset) = store
+        .request_attachment_download_again(GROUP, &selected("removed"), digest(), 13)
+        .unwrap()
+    else {
+        panic!("request missing")
+    };
+    assert_eq!(
+        store.attachment_transfer_candidates(20, 64, false).unwrap(),
+        vec![asset]
+    );
+}
+
+#[test]
+fn attachment_promoted_explicit_transfer_retries_with_full_limit_after_old_cap() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "promoted");
+    let asset = request(&store, "promoted");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store.explicitly_retry_attachment(&asset, 13).unwrap();
+    store.block_attachment_size_policy(&job, 64, 14).unwrap();
+    assert_eq!(
+        store.attachment_transfer_candidates(20, 64, false).unwrap(),
+        vec![asset]
+    );
+    assert_eq!(
+        transfer(&store, "promoted", false).state,
+        AttachmentTransferState::Queued
+    );
+}
+
+#[test]
+fn attachment_retry_claim_resets_progress_before_any_response_body() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "retry-progress");
+    let asset = request(&store, "retry-progress");
+    let old = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .update_attachment_progress(&old, 13, 1, 8, Some(12), true)
+        .unwrap();
+    let previous = transfer(&store, "retry-progress", true);
+    store.fail_attachment_acquisition(&old, Some(14)).unwrap();
+    let current = store
+        .claim_attachment_acquisition(&asset, 14, 100)
+        .unwrap()
+        .unwrap();
+    let claimed = transfer(&store, "retry-progress", true);
+    assert_eq!(claimed.state, AttachmentTransferState::Downloading);
+    assert!(
+        claimed.attempt > previous.attempt,
+        "claim must identify the new attempt before HTTP starts"
+    );
+    assert_eq!((claimed.received, claimed.total), (0, None));
+    store
+        .update_attachment_progress(&current, 15, 1, 8, Some(12), true)
+        .unwrap();
+    let resumed = transfer(&store, "retry-progress", true);
+    assert_eq!(
+        resumed.attempt, claimed.attempt,
+        "first body belongs to the claimed generation"
+    );
+    assert_eq!(resumed.received, 8);
+    store
+        .update_attachment_progress(&current, 16, 1, 0, None, true)
+        .unwrap();
+    assert!(
+        transfer(&store, "retry-progress", true).attempt > resumed.attempt,
+        "locator fallback explicitly resets generation"
+    );
+}
+
+#[test]
+fn attachment_policy_rejects_quota_smaller_than_admission_without_mutating() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let original = policy(true, 64);
+    store.set_attachment_download_policy(&original, 12).unwrap();
+    let mut invalid = original.clone();
+    invalid.retained_bytes = 63;
+    assert!(store.set_attachment_download_policy(&invalid, 13).is_err());
+    assert_eq!(
+        store.attachment_download_policy(&original).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn attachment_transfer_snapshot_does_not_take_the_writer_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.sqlite");
+    let key = SqlCipherKey::new("snapshot test key").unwrap();
+    let options = crate::SqliteStorageOptions {
+        busy_timeout_ms: 0,
+        ..Default::default()
+    };
+    let store =
+        SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone()).unwrap();
+    seed(&store, "snapshot");
+    request(&store, "snapshot");
+    let other = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options).unwrap();
+    let conn = other.lock().unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let frame =
+        store.attachment_transfer_snapshot(GROUP, &[("snapshot", "source-snapshot", 0)], 20, true);
+    let single =
+        store.attachment_transfer_status(GROUP, "snapshot", "source-snapshot", 0, 20, true);
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        frame.is_ok(),
+        "read snapshot must coexist with a separate WAL writer: {frame:?}"
+    );
+    assert!(
+        single.is_ok(),
+        "single read must coexist with a separate WAL writer: {single:?}"
+    );
+}
+
+#[test]
+fn attachment_transfer_candidates_seek_past_future_backoff() {
+    use crate::query_work_test_support::{QUERY_MEASUREMENT, measure};
+    let _guard = QUERY_MEASUREMENT.lock().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "future");
+    let ready = request(&store, "future");
+    store.lock().unwrap().execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<20000)
+        INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,due,explicit_request)
+        SELECT randomblob(16),group_id_hex,message_id_hex,i,source_message_id_hex,source_epoch,slot_json,plaintext_digest,100000,1
+        FROM attachment_acquisition CROSS JOIN n WHERE attachment_index=0;").unwrap();
+    for automatic in [true, false] {
+        store.explicitly_retry_attachment(&ready, 11).unwrap();
+        let (result, steps) = measure(&store, || {
+            store
+                .attachment_transfer_candidates(20, 32, automatic)
+                .unwrap()
+        });
+        assert_eq!(result, vec![ready.clone()]);
+        assert!(
+            steps < 500,
+            "future backoff must be skipped by a range seek: {steps}"
+        );
+    }
+}
+
+#[test]
+fn attachment_partial_forward_progress_resets_backoff_but_replay_does_not() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "slow");
+    let asset = request(&store, "slow");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(12);
+    store
+        .checkpoint_attachment_partial(&job, &identity, 0, b"abcd", 13, 100)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE attachment_acquisition SET attempts=9 WHERE token=?1",
+            [&asset.token],
+        )
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &identity, 0, b"abcd", 14, 100)
+        .unwrap();
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .attempts,
+        9
+    );
+    store
+        .checkpoint_attachment_partial(&job, &identity, 4, b"ef", 15, 100)
+        .unwrap();
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .attempts,
+        1,
+        "new resumable bytes must break a failure streak"
+    );
+}
+
+#[test]
+fn attachment_transfer_snapshot_reports_expiry_even_for_ready_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "expiry");
+    let asset = request(&store, "expiry");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .complete_attachment_acquisition(&job, BODY, 13, 1000)
+        .unwrap();
+    sql(&store, "UPDATE app_events SET retention_expires_at=25");
+    let AttachmentTransferFrame {
+        rows,
+        next_expiry: next,
+        ..
+    } = store
+        .attachment_transfer_snapshot(GROUP, &[("expiry", "source-expiry", 0)], 20, true)
+        .unwrap();
+    assert_eq!(
+        rows[0].as_ref().unwrap().state,
+        AttachmentTransferState::Ready
+    );
+    assert_eq!(next, Some(25));
+    let AttachmentTransferFrame {
+        rows,
+        next_expiry: next,
+        ..
+    } = store
+        .attachment_transfer_snapshot(GROUP, &[("expiry", "source-expiry", 0)], 25, true)
+        .unwrap();
+    assert!(rows[0].is_none());
+    assert_eq!(next, None);
+}
