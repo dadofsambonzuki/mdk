@@ -15,6 +15,7 @@
 //! Commands with struct/byte inputs are written by hand below the macro
 //! block.
 
+use crate::attachment_access::MarmotAttachmentLocalBytes;
 use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
@@ -25,10 +26,10 @@ use crate::MarmotStatus;
 use crate::memory::{CFree, boxed, owned_c_string, required_str, str_array};
 use crate::status::status_from_error;
 use crate::types::account::{
-    MarmotAccountKeyPackageList, MarmotAccountKeyPackageRelayEventList,
-    MarmotAccountSetupReadiness, MarmotAccountSummary, MarmotAccountSummaryList,
-    MarmotAccountUnreadList, MarmotIdentityCreationResult, MarmotSendSummary, MarmotSignOutOutcome,
-    MarmotUserProfileMetadata, MarmotWipeOutcome,
+    MarmotAccountKeyPackageInventoryEntryList, MarmotAccountKeyPackageList,
+    MarmotAccountKeyPackageRelayEventList, MarmotAccountSetupReadiness, MarmotAccountSummary,
+    MarmotAccountSummaryList, MarmotAccountUnreadList, MarmotIdentityCreationResult,
+    MarmotSendSummary, MarmotSignOutOutcome, MarmotUserProfileMetadata, MarmotWipeOutcome,
 };
 use crate::types::agent_stream::MarmotAgentStreamStart;
 use crate::types::audit::{
@@ -516,6 +517,12 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
+    /// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
+    /// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
+    /// Free the result with `marmot_attachment_local_bytes_free`.
+    async fn marmot_read_attachment_asset(account_ref: str, reference: str, offset: val u64, limit: val u32) -> rec(MarmotAttachmentLocalBytes) = read_attachment_asset;
+
     /// Register up to 16 visible avatar targets without awaiting HTTP.
     /// Free the returned list with `marmot_avatar_asset_list_free`.
     async fn marmot_request_avatar_assets(account_ref: str, targets/targets_len: str_arr) -> rec(MarmotAvatarAssetList) = request_avatar_assets;
@@ -594,6 +601,17 @@ c_cmd! {
     /// Local + current-slot relay-published KeyPackages for the account. Free
     /// with `marmot_account_key_package_list_free`.
     async fn marmot_account_key_packages(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageList) = account_key_packages;
+
+    /// Local-storage KeyPackage inventory with typed durable provenance.
+    /// Synchronous SQLCipher I/O on the calling thread; keep it off a UI or
+    /// main thread. Free with
+    /// `marmot_account_key_package_inventory_entry_list_free`.
+    sync fn marmot_local_account_key_packages(account_ref: str) -> rec(MarmotAccountKeyPackageInventoryEntryList) = local_account_key_packages;
+
+    /// Fetch validated relay observations, then merge a fresh local snapshot.
+    /// Empty bootstrap relays remain network-enabled. Free with
+    /// `marmot_account_key_package_inventory_entry_list_free`.
+    async fn marmot_refresh_account_key_packages(account_ref: str, bootstrap_relays/bootstrap_relays_len: str_arr) -> rec(MarmotAccountKeyPackageInventoryEntryList) = refresh_account_key_packages;
 
     /// Observed relay KeyPackage history, including superseded events. Free
     /// with `marmot_account_key_package_relay_event_list_free`.
@@ -2828,11 +2846,44 @@ pub unsafe extern "C" fn marmot_message_edit_history(
 mod identity_pointer_tests {
     use super::{
         marmot_account_id_hex, marmot_account_key_package_relay_events,
-        marmot_default_profile_pseudonym, marmot_random_profile_pseudonym,
+        marmot_default_profile_pseudonym, marmot_local_account_key_packages,
+        marmot_random_profile_pseudonym, marmot_refresh_account_key_packages,
     };
     use crate::MarmotStatus;
     use std::ffi::CString;
     use std::ptr;
+
+    #[test]
+    fn local_account_key_packages_rejects_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                marmot_local_account_key_packages(ptr::null(), account.as_ptr(), ptr::null_mut())
+            },
+            MarmotStatus::NullPointer
+        );
+    }
+
+    #[test]
+    fn refresh_account_key_packages_rejects_null_out_before_work() {
+        let account =
+            CString::new("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .unwrap();
+        assert_eq!(
+            unsafe {
+                marmot_refresh_account_key_packages(
+                    ptr::null(),
+                    account.as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            MarmotStatus::NullPointer
+        );
+    }
 
     #[test]
     fn account_key_package_relay_events_rejects_null_out_before_work() {

@@ -24,7 +24,7 @@ Choose the runtime you already use:
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install release `wn-agent-v0.10.0`, create
+may invite and message the agent. They install release `wn-agent-v0.10.2`, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
@@ -51,7 +51,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.10.2"
 ```
 
 ### Hermes
@@ -205,7 +205,7 @@ present it on every later stream operation. They also reuse one stable envelope 
 
 The release installers are published with the `wn-agent-v*` release family:
 
-- `scripts/install-hermes-marmot.sh`
+- `scripts/install-hermes-marmot.sh` (passive `--doctor [--json]` report; not delivery proof)
 - `scripts/install-openclaw-marmot.sh`
 - `scripts/install-claude-marmot.sh`
 - `scripts/install-codex-marmot.sh`

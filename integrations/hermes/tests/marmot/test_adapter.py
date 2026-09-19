@@ -18,8 +18,27 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
-TEST_SPOOL_ROOT = tempfile.TemporaryDirectory(prefix="mdk-hermes-spool-suite-")
+UNIX_SOCKET_PATH_MAX = 104
+
+
+def _unix_tempdir(suffix: str, prefix: str = "hs"):
+    tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    directory = tempfile.TemporaryDirectory(prefix=prefix, dir=tmp)
+    staged = str(Path(directory.name) / suffix.lstrip("/"))
+    if len(staged.encode("utf-8")) > UNIX_SOCKET_PATH_MAX:
+        directory.cleanup()
+        raise AssertionError(
+            f"staged unix path exceeds {UNIX_SOCKET_PATH_MAX} bytes under {tmp}"
+        )
+    return directory
+
+
+TEST_SPOOL_ROOT = _unix_tempdir("h/marmot/diagnostics.sock", prefix="hs")
 atexit.register(TEST_SPOOL_ROOT.cleanup)
+os.environ.setdefault(
+    "HERMES_HOME",
+    str(Path(TEST_SPOOL_ROOT.name) / "h"),
+)
 
 
 def wire_event(event):
@@ -227,7 +246,7 @@ async def write_json_line(writer, value):
 class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter = load_adapter_module()
-        self.tempdir = tempfile.TemporaryDirectory()
+        self.tempdir = _unix_tempdir("wn-agent.sock", prefix="ac")
         self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
 
@@ -770,6 +789,36 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(event["type"], "inbound_message")
         self.assertEqual(event["text"], "ping")
+
+    async def test_inbound_subscription_invokes_on_ack_before_events(self):
+        ack_seen = asyncio.Event()
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "ack",
+                },
+            )
+            await writer.drain()
+            await ack_seen.wait()
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        acknowledged = []
+
+        def on_ack():
+            acknowledged.append(True)
+            ack_seen.set()
+
+        events = client.inbound_events(account_id_hex="11" * 32, on_ack=on_ack)
+        with self.assertRaises(StopAsyncIteration):
+            await asyncio.wait_for(anext(events), timeout=1.0)
+        self.assertEqual(acknowledged, [True])
 
     async def test_inbound_subscription_waits_without_request_timeout_after_ack(self):
         ack_sent = asyncio.Event()
@@ -1456,7 +1505,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         # keyword-only argument raises TypeError before the platform ever
         # comes up (#836).
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 await asyncio.Event().wait()
                 yield {}  # unreachable: marks this as an async generator
 
@@ -1561,7 +1610,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield inbound
 
         adapter = self.adapter_module.MarmotPlatformAdapter(
@@ -1616,7 +1665,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1655,7 +1704,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1680,7 +1729,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         attempts = {"n": 0}
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 # Yield control so the event loop can run the test's poll/cancel between
                 # reconnect attempts (the consume loop reconnects in a tight cycle otherwise).
@@ -1758,10 +1807,16 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             make_event(group_b, "02" * 32, "fast group B"),
         ]
 
+        started_a = asyncio.Event()
+        finished_a = asyncio.Event()
+        finished_b = asyncio.Event()
+
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
+                    if event["group_id_hex"] == group_a:
+                        await started_a.wait()
                 # Keep the subscription open after yielding so the consume loop parks on the
                 # next event instead of draining the queue (which would serialize the turns).
                 await asyncio.sleep(3600)
@@ -1783,18 +1838,19 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             chat_id = event.source.chat_id
             if chat_id == group_a:
                 # Group A's turn is "slow/hung": it blocks until the test releases it.
+                started_a.set()
                 await release_a.wait()
             completed.append(chat_id)
+            (finished_a if chat_id == group_a else finished_b).set()
 
         adapter.handle_message = handle_message
 
         loop_task = asyncio.ensure_future(adapter._consume_inbound_once())
         try:
-            # Group B should complete while group A is still blocked: no head-of-line blocking.
-            for _ in range(200):
-                if group_b in completed:
-                    break
-                await asyncio.sleep(0.01)
+            # Establish A's blocked turn before testing B's independent progress.
+            # Storage/executor startup is not part of the concurrency assertion.
+            await asyncio.wait_for(started_a.wait(), timeout=10)
+            await asyncio.wait_for(finished_b.wait(), timeout=10)
             self.assertIn(
                 group_b,
                 completed,
@@ -1808,16 +1864,14 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             # Releasing group A lets its turn finish too — nothing was dropped.
             release_a.set()
-            for _ in range(200):
-                if group_a in completed:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(finished_a.wait(), timeout=10)
             self.assertIn(group_a, completed, "group A turn must complete once released")
         finally:
+            release_a.set()
             loop_task.cancel()
             with suppress(asyncio.CancelledError):
                 await loop_task
-            await adapter._inbound_queue.cancel_all()
+            await adapter.disconnect()
 
     async def test_same_group_turns_dispatch_in_fifo_order(self):
         # Per-group ordering must be preserved: two messages for the SAME group run strictly
@@ -1846,7 +1900,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -1898,7 +1952,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -2053,7 +2107,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.published_profiles = []
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 
@@ -2105,7 +2159,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         attempts = {"n": 0}
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
@@ -2225,7 +2279,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self._prompt_started = asyncio.Event()
                 self._release = asyncio.Event()
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
 
@@ -2312,7 +2366,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.calls = 0
                 self.final_sends = []
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 if False:  # pragma: no cover - generator shape only
                     yield {}
 
@@ -3678,7 +3732,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
             async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
@@ -3855,7 +3909,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in (event, dict(event)):
                     yield wire_event(value)
 
@@ -4142,7 +4196,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
             async def timeline_list(self, account_id_hex, group_id_hex, **kwargs):
@@ -4222,7 +4276,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         }
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield wire_event(event)
 
         adapter = self._adapter(FakeClient())
@@ -4361,7 +4415,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4401,7 +4455,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         handler_calls = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield {
                     "type": "message_deleted",
                     "account_id_hex": "11" * 32,
@@ -4772,7 +4826,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4823,7 +4877,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for value in events:
                     yield wire_event(value)
 
@@ -4862,7 +4916,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         delays = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
@@ -4927,7 +4981,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         delays = []
 
         class FakeClient:
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 # Never yields: a clean EOF on the inbound stream.
@@ -4972,6 +5026,263 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delays[0][1], 1000)
         self.assertGreater(delays[1][1], delays[0][1])
         self.assertGreater(delays[2][1], delays[1][1])
+
+    async def test_ack_without_events_backs_off_and_marks_established(self):
+        attempts = {"n": 0}
+        delays = []
+        first_event_callbacks = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
+                attempts["n"] += 1
+                if on_ack is not None:
+                    on_ack()
+                await asyncio.sleep(0)
+                return
+                yield  # pragma: no cover
+
+        adapter = self._adapter(FakeClient())
+        original_established = adapter._consume_inbound_once
+
+        async def wrapped(*, drain=False, on_established=None):
+            def tracked():
+                first_event_callbacks["n"] += 1
+                if callable(on_established):
+                    on_established()
+
+            await original_established(drain=drain, on_established=tracked)
+
+        adapter._consume_inbound_once = wrapped
+        real_backoff = self.adapter_module.reconnect_backoff_ms
+
+        def recording_backoff(attempt, base_ms, cap_ms, rand=None):
+            value = real_backoff(attempt, base_ms, cap_ms, rand=rand)
+            delays.append((attempt, value))
+            return 0
+
+        self.adapter_module.reconnect_backoff_ms = recording_backoff
+        try:
+            loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 1.0))
+            for _ in range(300):
+                if len(delays) >= 4:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            self.adapter_module.reconnect_backoff_ms = real_backoff
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertGreaterEqual(adapter._observations.reconnect_count, 1)
+        self.assertGreaterEqual(adapter._observations.recovery_count, 1)
+        self.assertEqual(first_event_callbacks["n"], 0)
+        self.assertEqual([attempt for attempt, _ in delays[:4]], [0, 1, 2, 3])
+        self.assertEqual(delays[0][1], 1000)
+        self.assertGreater(delays[1][1], delays[0][1])
+
+    async def test_first_event_after_ack_still_runs_established_callback(self):
+        called = {"n": 0}
+
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
+                if on_ack is not None:
+                    on_ack()
+                yield wire_event({
+                    "type": "inbound_message",
+                    "account_id_hex": "11" * 32,
+                    "group_id_hex": "22" * 32,
+                    "message_id_hex": "33" * 32,
+                    "sender_account_id_hex": "44" * 32,
+                    "text": "hello",
+                    "mentions_self": True,
+                })
+
+        adapter = self._adapter(FakeClient(), {"group_activation": "always"})
+
+        def on_established():
+            called["n"] += 1
+
+        await adapter._consume_inbound_once(on_established=on_established)
+        self.assertEqual(called["n"], 1)
+        self.assertTrue(adapter._inbound_established)
+        self.assertEqual(adapter._observations.state, "established")
+
+    def test_observation_fingerprint_matches_doctor_and_detects_replacements(self):
+        diag = self.adapter_module.marmot_diagnostics
+
+        extra = {
+            "account_id_hex": "11" * 32,
+            "socket_path": "/tmp/doctor-match.sock",
+            "allow_all_users": "false",
+            "allowed_users": "aa" * 32,
+            "welcomer_allowlist": "bb" * 32,
+            "home_channel": "cc" * 16,
+            "group_id_hex": "dd" * 16,
+        }
+        config = self.config_cls(
+            extra=extra,
+            home_channel=type("Home", (), {"platform": "marmot", "chat_id": "cc" * 16})(),
+        )
+
+        class FakeClient:
+            pass
+
+        with unittest.mock.patch.dict(os.environ, {"MARMOT_ALLOW_ALL_USERS": "false"}):
+            adapter = self.adapter_module.MarmotPlatformAdapter(config, client=FakeClient())
+            doctor_fields = diag.nonsecret_config_fields(
+                senders=["aa" * 32],
+                allow_all=diag.parse_config_bool("false"),
+                welcomers=diag.resolve_welcomers(extra),
+                account_id_hex=adapter.account_id_hex,
+                socket_path=adapter.socket_path,
+                home_route="cc" * 16,
+                inbound_media_dir=str(adapter._inbound_media_dir),
+                outbound_media_dir=str(adapter._outbound_media_dir),
+            )
+            self.assertEqual(
+                adapter._observations.loaded_fingerprint,
+                diag.config_fingerprint(doctor_fields),
+            )
+            self.assertFalse(adapter._observations.allow_all)
+            self.assertTrue(adapter._observations.home_configured)
+            replaced = dict(extra)
+            replaced["account_id_hex"] = "22" * 32
+            replaced["socket_path"] = "/tmp/doctor-other.sock"
+            other = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra=replaced,
+                    home_channel=type("Home", (), {"platform": "marmot", "chat_id": "cc" * 16})(),
+                ),
+                client=FakeClient(),
+            )
+            self.assertNotEqual(
+                adapter._observations.loaded_fingerprint,
+                other._observations.loaded_fingerprint,
+            )
+
+    def test_media_path_resolvers_match_diagnostics(self):
+        diag = self.adapter_module.marmot_diagnostics
+        extra = {
+            "home": "/tmp/custom-home",
+            "inbound_media_dir": "/tmp/in-media",
+            "outbound_media_dir": "/tmp/out-media",
+        }
+        socket = "/tmp/custom-home/dev/wn-agent.sock"
+        self.assertEqual(
+            self.adapter_module.resolve_inbound_media_dir(extra, socket),
+            diag.resolve_inbound_media_dir(extra, socket),
+        )
+        self.assertEqual(
+            self.adapter_module.resolve_outbound_media_dir(extra, socket),
+            diag.resolve_outbound_media_dir(extra, socket),
+        )
+        self.assertEqual(
+            self.adapter_module.resolve_marmot_home({}, socket),
+            diag.resolve_marmot_home({}, socket),
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "MARMOT_INBOUND_MEDIA_DIR": "/tmp/env-in",
+                "MARMOT_OUTBOUND_MEDIA_DIR": "/tmp/env-out",
+            },
+        ):
+            self.assertEqual(
+                self.adapter_module.resolve_inbound_media_dir({}, socket),
+                diag.resolve_inbound_media_dir({}, socket),
+            )
+            self.assertEqual(
+                str(self.adapter_module.resolve_inbound_media_dir({}, socket)),
+                "/tmp/env-in",
+            )
+
+    async def test_diagnostics_endpoint_retries_after_failed_bind(self):
+        adapter = self._adapter(type("Client", (), {})())
+        server = unittest.mock.Mock()
+        server.start = unittest.mock.AsyncMock(side_effect=[False, True])
+        with unittest.mock.patch.object(
+            self.adapter_module.marmot_diagnostics,
+            "DiagnosticSocketServer",
+            return_value=server,
+        ):
+            await adapter._ensure_diagnostics_endpoint()
+            self.assertIsNone(adapter._diagnostic_server)
+            await adapter._ensure_diagnostics_endpoint()
+            self.assertIs(adapter._diagnostic_server, server)
+        self.assertEqual(server.start.await_count, 2)
+
+    def test_welcomer_aliases_match_doctor_projection(self):
+        diag = self.adapter_module.marmot_diagnostics
+        cases = (
+            {"welcomer_allowlist": ["aa" * 32]},
+            {"welcomerAllowlist": "bb" * 32},
+            {"dm_allow_from": ["cc" * 32]},
+            {"dmAllowFrom": ""},
+            {"welcomer_allowlist": []},
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.assertEqual(
+                    self.adapter_module.resolve_welcomer_allowlist(extra),
+                    diag.resolve_welcomers(extra),
+                )
+        with unittest.mock.patch.dict(os.environ, {"MARMOT_WELCOMER_ALLOWLIST": "dd" * 32}):
+            self.assertEqual(
+                self.adapter_module.resolve_welcomer_allowlist({"welcomer_allowlist": []}),
+                [],
+            )
+            self.assertEqual(
+                self.adapter_module.resolve_welcomer_allowlist({}),
+                ["dd" * 32],
+            )
+
+    def test_enablement_seed_matches_diagnostics_and_replaces_yaml_home(self):
+        diag = self.adapter_module.marmot_diagnostics
+        plugin_settings = {
+            "socket_path": "/tmp/plugin.sock",
+            "account_id_hex": "11" * 32,
+            "home_channel": "aa" * 16,
+        }
+        env = {
+            "MARMOT_AGENT_SOCKET": "/tmp/env.sock",
+            "MARMOT_HOME_CHANNEL": "bb" * 16,
+            "MARMOT_ACCOUNT_ID_HEX": "22" * 32,
+            "MARMOT_HOME": "",
+            "MARMOT_GROUP_ID_HEX": "",
+            "MARMOT_AGENT_AUTH_TOKEN_FILE": "",
+            "MARMOT_HOME_CHANNEL_NAME": "",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(
+                self.adapter_module._enablement_seed(plugin_settings),
+                diag.env_enablement_seed(plugin_settings),
+            )
+            seed = self.adapter_module._enablement_seed(plugin_settings)
+        self.assertEqual(seed["socket_path"], "/tmp/env.sock")
+        self.assertEqual(seed["account_id_hex"], "22" * 32)
+        self.assertEqual(seed["home_channel"]["chat_id"], "bb" * 16)
+        merged = {
+            "extra": {"socket_path": "/tmp/yaml.sock", "account_id_hex": "33" * 32},
+            "home_channel": "aa" * 16,
+            "home_platform": "marmot",
+        }
+        effective = diag.apply_enablement_seed(merged, seed)
+        self.assertEqual(effective["extra"]["socket_path"], "/tmp/env.sock")
+        self.assertEqual(effective["home_channel"], "bb" * 16)
+
+    async def test_recovery_count_increments_through_awaiting_ack(self):
+        observations = self.adapter_module.marmot_diagnostics.PluginObservations()
+        observations.mark("starting")
+        observations.mark("awaiting_ack")
+        observations.mark("established")
+        observations.mark("reconnecting", reason="socket_closed")
+        observations.mark("awaiting_ack")
+        observations.mark("established")
+        self.assertEqual(observations.recovery_count, 1)
+        snapshot = observations.snapshot()
+        self.assertEqual(snapshot["last_disconnect_reason"], "socket_closed")
 
     # --- Behavior 8: preview vs durable timeout -------------------------------
     async def test_preview_ops_use_short_timeout_durable_uses_full(self):
@@ -6688,6 +6999,69 @@ class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"added": [], "removed": []})
         self.assertEqual(current, ["33" * 32])
 
+    async def test_whitespace_primary_env_matches_legacy_and_skips_sync(self):
+        diag = self.adapter_module.marmot_diagnostics
+        config_cls = sys.modules["gateway.config"].PlatformConfig
+        legacy_id = "bb" * 32
+
+        def legacy_resolve(extra):
+            for key in ("welcomer_allowlist", "welcomerAllowlist", "dm_allow_from", "dmAllowFrom"):
+                if key in extra:
+                    return self.adapter_module._split_config_list(extra[key])
+            configured = os.getenv("MARMOT_WELCOMER_ALLOWLIST") or os.getenv("MARMOT_DM_ALLOW_FROM")
+            return self.adapter_module._split_config_list(configured) if configured else []
+
+        cases = (
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "   ", "MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "\t", "MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "", "MARMOT_DM_ALLOW_FROM": legacy_id}, [legacy_id]),
+            ({}, {"MARMOT_DM_ALLOW_FROM": legacy_id}, [legacy_id]),
+            ({}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32, "MARMOT_DM_ALLOW_FROM": legacy_id}, ["cc" * 32]),
+            ({"welcomer_allowlist": []}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32}, []),
+            ({"dm_allow_from": ""}, {"MARMOT_DM_ALLOW_FROM": legacy_id}, []),
+            ({"dmAllowFrom": [legacy_id]}, {"MARMOT_WELCOMER_ALLOWLIST": "cc" * 32}, [legacy_id]),
+        )
+        for extra, env, expected in cases:
+            with self.subTest(extra=extra, env=env):
+                with unittest.mock.patch.dict(os.environ, env, clear=False):
+                    for name in ("MARMOT_WELCOMER_ALLOWLIST", "MARMOT_DM_ALLOW_FROM"):
+                        if name not in env:
+                            os.environ.pop(name, None)
+                    live = self.adapter_module.resolve_welcomer_allowlist(extra)
+                    doctor = diag.resolve_welcomers(extra)
+                    projected = diag.project_effective_env({}, environ=dict(os.environ))
+                    self.assertEqual(live, expected)
+                    self.assertEqual(doctor, expected)
+                    self.assertEqual(legacy_resolve(extra), expected)
+                    self.assertEqual(diag.resolve_welcomers(extra, env_values=projected), expected)
+
+        calls: list[str] = []
+
+        class RecordingClient:
+            async def allowlist_list(self, account_id_hex):
+                calls.append("list")
+                return {"welcomer_account_ids_hex": ["aa" * 32]}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                calls.append("add")
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                calls.append("remove")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"MARMOT_WELCOMER_ALLOWLIST": "   ", "MARMOT_DM_ALLOW_FROM": legacy_id},
+            clear=False,
+        ):
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                config_cls(extra={"account_id_hex": "11" * 32}),
+                client=RecordingClient(),
+            )
+            self.assertEqual(adapter.welcomer_allowlist, [])
+            await adapter._sync_welcomer_allowlist()
+        self.assertEqual(calls, [])
+        self.assertEqual(adapter._observations.reconciliation, "not_configured")
+
 
 class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -8125,7 +8499,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         dispatch = asyncio.create_task(
             adapter._dispatch_inbound_message(event, spool_message_id=message_id)
         )
-        await asyncio.wait_for(handed.wait(), timeout=1)
+        # Wait for the actual handoff; disk-backed setup is not under test.
+        await asyncio.wait_for(handed.wait(), timeout=10)
         self.assertEqual("handed", adapter._inbound_spool.get(message_id).state)
         await adapter._inbound_spool_call(adapter._inbound_spool.close, graceful=False)
         dispatch.cancel()
@@ -8153,8 +8528,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.02)
         self.assertFalse(handling.done())
         self.assertLess(time.monotonic() - started, 0.10)
-        await asyncio.wait_for(handling, timeout=1)
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        # The responsiveness assertion above is complete. Allow durable work
+        # to settle without imposing a one-second filesystem deadline.
+        await asyncio.wait_for(handling, timeout=10)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=10)
         self.assertEqual(["durable"], [message.text for message in adapter.events])
         await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
@@ -8201,7 +8578,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
-        self.tempdir = tempfile.TemporaryDirectory()
+        self.tempdir = _unix_tempdir("wn-agent.sock", prefix="ac")
         self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
 
@@ -8682,7 +9059,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     is_direct=False,
                 )
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 yield {
                     "type": "group_state_changed",
                     "account_id_hex": self_outer.ACCOUNT,
@@ -8732,7 +9109,7 @@ class ChatNameResolutionTests(unittest.IsolatedAsyncioTestCase):
                     f"Name {group_id_hex[:4]}",
                 )
 
-            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 for event in events:
                     yield wire_event(event)
 

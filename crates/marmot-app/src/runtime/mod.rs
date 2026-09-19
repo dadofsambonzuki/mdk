@@ -1,5 +1,8 @@
 use zeroize::Zeroizing;
 
+use crate::RuntimePerformanceOperation as RuntimeOp;
+use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -37,8 +40,8 @@ use crate::{
     ACCOUNT_SETUP_ADVISORY_WAIT, APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
-    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountRelayListBootstrap,
-    AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
+    AccountKeyPackageInventoryEntry, AccountKeyPackageRecord, AccountKeyPackageRelayEvent,
+    AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
@@ -81,7 +84,22 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+mod attachment_controls;
+pub use attachment_controls::{
+    AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
+    RuntimeAttachmentTransferSubscription,
+};
+mod attachment_access;
+mod attachment_history;
+pub use attachment_access::{
+    AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+};
 mod avatar;
+pub use attachment_history::{
+    AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
+};
 mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
@@ -228,6 +246,8 @@ pub struct AccountManager {
     onboarding_test_holds: Arc<OnboardingTestHolds>,
     #[cfg(test)]
     reconcile_rollback_waiters: Arc<StdMutex<Vec<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)]
+    reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
     generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
 }
@@ -256,6 +276,9 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    attachment_transfer: Arc<tokio::sync::Semaphore>,
+    attachment_updates: watch::Sender<()>,
+    attachment_cancellations: watch::Sender<()>,
     product_analytics: crate::ProductAnalytics,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
@@ -343,6 +366,9 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_updates: watch::channel(()).0,
+            attachment_cancellations: watch::channel(()).0,
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             app_performance_telemetry: AppPerformanceTelemetry::default(),
             product_analytics: crate::ProductAnalytics::default(),
@@ -385,6 +411,9 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_updates: watch::channel(()).0,
+            attachment_cancellations: watch::channel(()).0,
             relay_plane: app.relay_plane.clone(),
             app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
                 app.product_analytics.clone(),
@@ -1379,6 +1408,11 @@ impl MarmotAppRuntime {
     /// catch-up continue asynchronously after this method returns.
     pub async fn start(&self) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
+        attachment_controls::default_policy(&self.accounts.app.config)
+            .validate()
+            .map_err(|_| {
+                AppError::InvalidEncryptedMedia("invalid attachment download policy".into())
+            })?;
         *self
             .shared
             .diagnostics_executor
@@ -2644,7 +2678,10 @@ impl MarmotAppRuntime {
     ) -> Result<crate::ProductRecordResult, AppError> {
         let outcome = match outcome {
             crate::HostPerformanceOutcome::Success => "success",
-            crate::HostPerformanceOutcome::Failure => "failure",
+            crate::HostPerformanceOutcome::Failure
+            | crate::HostPerformanceOutcome::Cancelled
+            | crate::HostPerformanceOutcome::Timeout
+            | crate::HostPerformanceOutcome::Unavailable => "failure",
         };
         self.record_product_event(crate::ProductEvent {
             name,
@@ -3337,6 +3374,37 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Read KeyPackage maintenance status from an already-running worker only.
+    ///
+    /// `Ok(None)` means no worker is running. This path never calls `reconcile`,
+    /// starts an account, publishes, syncs, or schedules maintenance.
+    pub async fn diagnostic_key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<Option<cgka_traits::KeyPackageLifecycleState>>, AppError> {
+        self.accounts
+            .diagnostic_key_package_maintenance_status(account_ref)
+            .await
+    }
+
+    /// Read group MLS state from an already-running worker only.
+    pub async fn diagnostic_group_mls_state(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<AppGroupMlsState>, AppError> {
+        self.accounts
+            .diagnostic_group_mls_state(account_ref, group_id)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn reconcile_invocation_count(&self) -> u64 {
+        self.accounts
+            .reconcile_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn durably_owned_key_packages(
         &self,
         account_ref: &str,
@@ -3408,6 +3476,45 @@ impl MarmotAppRuntime {
         self.accounts
             .account_key_packages(account_ref, bootstrap_relays)
             .await
+    }
+
+    /// Local-storage KeyPackage inventory. Does not wait for network startup,
+    /// issue a worker RPC, or start a directory query. The read is synchronous
+    /// SQLCipher I/O on the caller's thread; hosts should keep it off a UI or
+    /// main thread.
+    pub fn local_account_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.accounts.local_account_key_packages(account_ref)
+    }
+
+    /// Fetch validated relay observations, then merge a fresh local snapshot.
+    ///
+    /// Empty `bootstrap_relays` remains network-enabled. On failure, callers
+    /// should keep a previously rendered local result.
+    pub async fn refresh_account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.accounts
+            .refresh_account_key_packages(account_ref, bootstrap_relays)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.accounts
+            .set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        self.accounts.app_for_test()
     }
 
     pub async fn account_key_package_relay_events(
@@ -4954,6 +5061,7 @@ impl MarmotAppRuntime {
                     .app
                     .account_home()
                     .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
+                self.accounts.app.presentation_signals.catalog_changed();
                 Ok(bytes)
             } else {
                 let lifecycle = self
@@ -5505,6 +5613,8 @@ impl AccountManager {
             onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
             #[cfg(test)]
             reconcile_rollback_waiters: Arc::new(StdMutex::new(Vec::new())),
+            #[cfg(test)]
+            reconcile_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
                 accepting: true,
                 handles: Vec::new(),
@@ -5515,6 +5625,19 @@ impl AccountManager {
                 handles: Vec::new(),
             })),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.app.set_inventory_snapshot_between_reads_for_test(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app_for_test(&self) -> &crate::MarmotApp {
+        &self.app
     }
 
     #[cfg(test)]
@@ -5609,7 +5732,12 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
         self.set_account_tearing_down(&account.account_id_hex, true);
@@ -5657,7 +5785,12 @@ impl AccountManager {
         nsec: &str,
         acknowledge_possible_key_package_orphan: bool,
     ) -> Result<(), AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         if !acknowledge_possible_key_package_orphan {
             return Err(AppError::AccountSetupRecoveryRequired);
@@ -5733,7 +5866,12 @@ impl AccountManager {
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
         self.set_account_tearing_down(&account.account_id_hex, true);
@@ -5782,7 +5920,12 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<ManagedAccount, AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self
             .app
@@ -5805,7 +5948,15 @@ impl AccountManager {
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
+        #[cfg(test)]
+        self.reconcile_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.reconcile_locked().await
     }
 
@@ -5852,7 +6003,12 @@ impl AccountManager {
                 let stale_account_ids = workers
                     .iter()
                     .filter_map(|(account_id, worker)| {
-                        if active_account_ids.contains(account_id) && !worker.handle.is_finished() {
+                        // A previous cancelled reconcile may have left startup unsettled.
+                        if active_account_ids.contains(account_id)
+                            && worker.ready
+                            && !worker.handle.is_finished()
+                            && !worker.commands.is_closed()
+                        {
                             None
                         } else {
                             Some(account_id.clone())
@@ -5911,6 +6067,7 @@ impl AccountManager {
                     workers.insert(
                         account.account_id_hex,
                         ManagedAccountWorker {
+                            ready: false,
                             handle,
                             commands: command_tx,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
@@ -5938,11 +6095,27 @@ impl AccountManager {
                         )));
                     }
                 };
-                self.shared.app_performance_telemetry().record(
-                    AppPerformanceOperation::AccountOpen,
-                    account_open_elapsed,
-                    matches!(ready_result, Ok(Ok(Ok(())))),
-                );
+                self.shared
+                    .app_performance_telemetry()
+                    .record_classified_result(
+                        AppPerformanceOperation::AccountOpen,
+                        account_open_elapsed,
+                        match &ready_result {
+                            Ok(Ok(Ok(()))) => None,
+                            Ok(Ok(Err(error))) => Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                error.sync_error_class(),
+                            )),
+                            Ok(Err(_)) => Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                crate::SyncErrorClass::TransportClosed,
+                            )),
+                            Err(_) => Some(SyncFailureClassification::new(
+                                SyncFailureStage::AccountWorker,
+                                crate::SyncErrorClass::Timeout,
+                            )),
+                        },
+                    );
                 match ready_result {
                     Ok(Ok(Ok(()))) => {}
                     Ok(Ok(Err(error))) => {
@@ -5964,6 +6137,13 @@ impl AccountManager {
                     }
                 }
             }
+            // Publish fast-path eligibility only after the entire startup batch succeeds.
+            let mut workers = self.workers.lock().await;
+            for account_id in spawned_account_ids {
+                if let Some(worker) = workers.get_mut(&account_id) {
+                    worker.ready = true;
+                }
+            }
             Ok(())
         }
         .await;
@@ -5976,7 +6156,12 @@ impl AccountManager {
     }
 
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let worker = self.workers.lock().await.remove(account_id_hex);
         if let Some(worker) = worker {
@@ -5988,6 +6173,10 @@ impl AccountManager {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<CatchUpAccountsSummary, AppError> {
+        let observation = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::CatchUpRequested);
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
@@ -6010,6 +6199,7 @@ impl AccountManager {
                     .err()
                     .map(account_catch_up_metric_classification),
             );
+        observation.finish_app(&result);
         result
     }
 
@@ -6145,22 +6335,47 @@ impl AccountManager {
         account_ref: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        Ok(self
+            .refresh_account_key_packages(account_ref, bootstrap_relays)
+            .await?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    pub fn local_account_key_packages(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let account = self.resolve(account_ref)?;
+        self.app
+            .local_account_key_package_inventory_snapshot(&account.label)
+    }
+
+    pub async fn refresh_account_key_packages(
+        &self,
+        account_ref: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.resolve(account_ref)?;
         if account.can_sign() && !account.signed_out {
-            // Unlike local runtime reads, this API reports relay visibility.
-            // Wait for the managed worker's initial activation, catch-up, and
-            // open maintenance before issuing the directory query.
             self.wait_for_account_network_startup_to_settle(&account.label)
                 .await?;
         }
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
-            &self.app.account_storage(&account.label)?,
-            cgka_traits::group::ProtocolProfile::Current,
-        )
-        .map_err(cgka_session::SessionError::from)?;
-        self.app
-            .account_key_package_records(&account.label, bootstrap_relays, owned)
-            .await
+        let relays = self
+            .app
+            .fetch_validated_account_key_package_records(
+                &account.label,
+                bootstrap_relays,
+                "refresh_account_key_packages",
+            )
+            .await?;
+        let locals = self
+            .app
+            .local_account_key_package_inventory_snapshot(&account.label)?;
+        Ok(crate::key_package_records::merge_key_package_inventory(
+            locals, relays,
+        ))
     }
 
     pub async fn account_key_package_relay_events(
@@ -6202,6 +6417,25 @@ impl AccountManager {
             .map(|(commands, _)| commands)
     }
 
+    /// Look up an already-running worker without starting or reconciling one.
+    async fn existing_worker_commands(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<mpsc::Sender<AccountWorkerCommand>>, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if !account.can_sign() {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+        }
+        if account.signed_out {
+            return Err(AppError::RelayDirectory("account is signed out".into()));
+        }
+        let workers = self.workers.lock().await;
+        Ok(workers
+            .get(&account.account_id_hex)
+            .map(|worker| worker.commands.clone()))
+    }
+
     async fn worker_commands_for_setup(
         &self,
         account_ref: &str,
@@ -6237,22 +6471,44 @@ impl AccountManager {
         &self,
         account: AccountSummary,
     ) -> Result<(mpsc::Sender<AccountWorkerCommand>, Arc<Semaphore>), AppError> {
-        if !account.can_sign() {
-            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
-        }
-        if account.signed_out {
-            return Err(AppError::RelayDirectory("account is signed out".into()));
-        }
-        self.reconcile().await?;
-        let workers = self.workers.lock().await;
-        workers
-            .get(&account.account_id_hex)
-            .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
-            .ok_or_else(|| {
-                AppError::RelayDirectory(
-                    "managed account worker is not running for local signing account".into(),
-                )
+        self.shared
+            .app_performance_telemetry()
+            .measure_app(RuntimeOp::WorkerAcquire, async {
+                if !account.can_sign() {
+                    return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+                }
+                if account.signed_out {
+                    return Err(AppError::RelayDirectory("account is signed out".into()));
+                }
+                {
+                    let workers = self.workers.lock().await;
+                    self.shared.lifecycle().ensure_running()?;
+                    if let Some(worker) = workers.get(&account.account_id_hex)
+                        && worker.ready
+                        && !worker.handle.is_finished()
+                        && !worker.commands.is_closed()
+                        && !self.account_is_tearing_down(&account.account_id_hex)
+                        && (!account.external_signing
+                            || self.app.has_external_signer(&account.account_id_hex))
+                        && self.onboarding_worker_allowed(&account.label)?
+                    {
+                        return Ok((worker.commands.clone(), worker.media_admission.clone()));
+                    }
+                }
+                self.reconcile().await?;
+                let workers = self.workers.lock().await;
+                workers
+                    .get(&account.account_id_hex)
+                    .filter(|worker| worker.ready)
+                    .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
+                    .ok_or_else(|| {
+                        AppError::RelayDirectory(
+                            "managed account worker is not running for local signing account"
+                                .into(),
+                        )
+                    })
             })
+            .await
     }
 
     pub async fn create_or_import_account(
@@ -7373,7 +7629,12 @@ impl AccountManager {
         for task in invite_catch_up_tasks {
             let _ = task.await;
         }
+        let lock_wait = self
+            .shared
+            .app_performance_telemetry()
+            .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
         // An admitted cancellation or reconcile can register a worker reaper
         // after the first handle snapshot. Cancellation tasks have now joined,
         // and this lock excludes every remaining reaper producer. Reapers do

@@ -13,6 +13,8 @@ use cgka_traits::app_event::{
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
+#[cfg(feature = "test-policy-overrides")]
+use marmot_app::AccountKeyPackageLocalState;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, ChatListRow, MarmotApp,
@@ -2653,6 +2655,115 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     restarted.shutdown().await;
     second_runtime.shutdown().await;
     drop(relay);
+}
+
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn local_account_key_packages_are_readable_while_startup_is_held() {
+    async fn read_while_startup_is_held(
+        runtime: &MarmotAppRuntime,
+        account_id: &str,
+        startup_barrier: &tokio::sync::Barrier,
+    ) -> Vec<marmot_app::AccountKeyPackageInventoryEntry> {
+        let mut read = tokio::task::spawn_blocking({
+            let runtime = runtime.clone();
+            let account_id = account_id.to_owned();
+            move || runtime.local_account_key_packages(&account_id)
+        });
+        let result = timeout(Duration::from_secs(2), &mut read).await;
+        if result.is_err() {
+            // A timed-out blocking task is not cancelled. Release startup
+            // before failing so runtime teardown can finish the read.
+            timeout(Duration::from_secs(5), startup_barrier.wait())
+                .await
+                .expect("release startup after local inventory timeout");
+        }
+        result
+            .expect("local inventory must not wait for startup")
+            .expect("local inventory task must not panic")
+            .unwrap()
+    }
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let app = MarmotApp::with_relay_and_config(first_dir.path(), url.clone(), config.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let created = runtime
+        .create_or_import_account(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let account_id = created.account.account_id_hex.clone();
+    runtime.rotate_key_package(&account_id).await.unwrap();
+    let current_ref = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .and_then(|lifecycle| lifecycle.current_key_package_ref)
+        .map(hex::encode)
+        .expect("rotation must promote a current locally owned package");
+
+    runtime.catch_up_accounts().await.unwrap();
+    let startup_sync_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup_sync_barrier.clone());
+    timeout(Duration::from_secs(5), runtime.restart_account(&account_id))
+        .await
+        .expect("restart must not wait for initial catch-up")
+        .unwrap();
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("restarted worker must reach initial sync");
+
+    let local = read_while_startup_is_held(&runtime, &account_id, &startup_sync_barrier).await;
+    let current = local
+        .iter()
+        .find(|entry| entry.record.key_package_ref_hex == current_ref)
+        .expect("committed current package is visible locally");
+    assert_eq!(current.local_state, AccountKeyPackageLocalState::Current);
+    assert!(current.record.local);
+    assert!(!current.record.relay);
+
+    let refresh = runtime.refresh_account_key_packages(&account_id, vec![endpoint(&url)]);
+    tokio::pin!(refresh);
+    assert!(
+        timeout(Duration::from_millis(150), &mut refresh)
+            .await
+            .is_err(),
+        "refresh must remain pending while startup is held"
+    );
+    let local_again =
+        read_while_startup_is_held(&runtime, &account_id, &startup_sync_barrier).await;
+    assert_eq!(
+        local_again
+            .iter()
+            .find(|entry| entry.record.key_package_ref_hex == current_ref)
+            .map(|entry| entry.local_state),
+        Some(AccountKeyPackageLocalState::Current)
+    );
+
+    timeout(Duration::from_secs(5), startup_sync_barrier.wait())
+        .await
+        .expect("initial sync must remain held during local reads");
+    let refreshed = timeout(Duration::from_secs(10), refresh)
+        .await
+        .expect("refresh completes after startup release")
+        .unwrap();
+    assert!(
+        refreshed
+            .iter()
+            .any(|entry| entry.record.key_package_ref_hex == current_ref
+                && entry.local_state == AccountKeyPackageLocalState::Current)
+    );
+
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -14546,10 +14657,38 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
         assert_eq!(labels.labels[0].event_id_hex, dismissal.message_ids[0]);
         assert_eq!(labels.labels[0].explanation, "reviewed");
     }
+    let ordinary = bob.send(&group, b"ordinary author deletion").await.unwrap();
+    bob.delete_message(&group, &ordinary.message_ids[0])
+        .await
+        .unwrap();
+    alice.sync().await.unwrap();
+    for account in ["alice", "bob"] {
+        let row = runtime
+            .timeline_message(account, &group_hex, &ordinary.message_ids[0])
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted && row.plaintext.is_empty());
+        assert_eq!(row.deletion_source, marmot_app::DeletionSource::Author);
+    }
     // Admin removal is independent of reports and also applies to their own chat.
     let unreported = bob.send(&group, b"unreported").await.unwrap();
     alice.sync().await.unwrap();
     let own = alice.send(&group, b"admin message").await.unwrap();
+    bob.sync().await.unwrap();
+    assert!(
+        bob.delete_message(&group, &own.message_ids[0])
+            .await
+            .is_err()
+    );
+    alice.sync().await.unwrap();
+    for account in ["alice", "bob"] {
+        let row = runtime
+            .timeline_message(account, &group_hex, &own.message_ids[0])
+            .unwrap()
+            .unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.deletion_source, marmot_app::DeletionSource::Unknown);
+    }
     for id in [target, &unreported.message_ids[0], &own.message_ids[0]] {
         let removed = alice.delete_message(&group, id).await.unwrap();
         assert_eq!(
@@ -14568,6 +14707,7 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
                 .unwrap()
                 .unwrap();
             assert!(message.deleted && message.plaintext.is_empty());
+            assert_eq!(message.deletion_source, marmot_app::DeletionSource::Admin);
         }
         let reports = runtime
             .content_reports(account, &group, Some(target), None, 10)

@@ -23,10 +23,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::error::AppError;
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
-    AccountKeyPackageRecord, AccountKeyPackageRelayEvent, AccountRelayListBootstrap,
-    AccountRelayListStatus, DirectoryFreshness, DirectoryKeyPackage, DirectorySelection,
-    FetchedKeyPackage, UserDirectoryRecord, push_unique_strings, relay_list_state_from_event,
-    sort_directory_records,
+    AccountKeyPackageInventoryEntry, AccountKeyPackageLocalState, AccountKeyPackageRecord,
+    AccountKeyPackageRelayEvent, AccountRelayListBootstrap, AccountRelayListStatus,
+    DirectoryFreshness, DirectoryKeyPackage, DirectorySelection, FetchedKeyPackage,
+    UserDirectoryRecord, push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
 pub(crate) fn merge_relay_list_status(
@@ -128,54 +128,124 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
-fn latest_key_package_from_records(
+/// Temporary interoperability policy. Retire this ranking when device-aware
+/// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
+/// single-package selection. Keep separate from cryptographic admission so
+/// multi-device selection can replace this preference without changing validity.
+/// Labels are self-asserted and do not authenticate an application; they only
+/// rank candidates after admission checks and never relax cryptographic gates.
+pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
+    let mut tags = event.tags.iter().filter(|tag| {
+        tag.first()
+            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
+    });
+    let Some(tag) = tags.next() else {
+        return 1;
+    };
+    if tags.next().is_some() || tag.len() < 2 {
+        return 1;
+    }
+    let name = tag[1].trim();
+    if name.eq_ignore_ascii_case("whitenoise") {
+        2
+    } else if name.eq_ignore_ascii_case("amethyst") {
+        0
+    } else {
+        1
+    }
+}
+
+/// Directory reads deliberately share the client ranking and slot-supersession
+/// policy used by invitation discovery, but have no target-group requirements.
+/// A malformed current slot never revives an older publication; if no usable
+/// slot remains, the lookup returns the validation error.
+pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
-    sort_directory_records(&mut records);
+    records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+    let selection =
+        preferred_fresh_key_package_from_records(account_id_hex, &records, freshness, None)?;
+    Ok(DirectorySelection {
+        value: selection.value.map(|selected| selected.fetched),
+        rejected_future: selection.rejected_future,
+    })
+}
+
+pub(crate) struct PreferredKeyPackage {
+    pub(crate) fetched: FetchedKeyPackage,
+    pub(crate) priority: u8,
+}
+
+pub(crate) fn preferred_fresh_key_package_from_records(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    let mut records = records.iter().collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        a.event
+            .created_at
+            .cmp(&b.event.created_at)
+            .then_with(|| a.event.id.cmp(&b.event.id))
+    });
+    let mut rejected_future = false;
     let mut newest_error = None;
+    let mut selected = None;
+    let mut selected_priority = 0;
+    let mut slots = BTreeSet::new();
     for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        match key_package_from_record(record) {
+        if !freshness.accepts(record) {
+            rejected_future = true;
+            continue;
+        }
+        // A fresh publication supersedes its slot even when its payload or
+        // metadata is invalid. Falling back within that slot can invite a
+        // package whose private material has already been retired.
+        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
+            && !slots.insert(slot.to_owned())
+        {
+            continue;
+        }
+        let priority = key_package_client_priority(&record.event);
+        let fetched = match key_package_from_borrowed_record(record) {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
-                return Ok(fetched);
+                fetched
             }
-            Ok(_) => {}
+            Ok(_) => continue,
             Err(error) => {
                 newest_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if let Some(requirements) = requirements
+            && let Err(error) = requirements.validate(&fetched.key_package)
+        {
+            newest_error.get_or_insert(AppError::from(cgka_session::SessionError::from(error)));
+            continue;
+        }
+        if selected.is_none() || priority > selected_priority {
+            selected = Some(PreferredKeyPackage { fetched, priority });
+            selected_priority = priority;
+            // Newest-first order already breaks ties; nothing can outrank this.
+            if selected_priority == 2 {
+                break;
             }
         }
     }
-    Err(newest_error.unwrap_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned())))
-}
-
-pub(crate) fn latest_fresh_key_package_from_records(
-    account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
-    freshness: DirectoryFreshness,
-) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
-    let mut rejected_future = false;
-    records.retain(|record| {
-        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
-            return true;
-        }
-        let accepted = freshness.accepts(record);
-        rejected_future |= !accepted;
-        accepted
-    });
-    match latest_key_package_from_records(account_id_hex, records) {
-        Ok(value) => Ok(DirectorySelection {
-            value: Some(value),
-            rejected_future,
-        }),
-        Err(AppError::MissingKeyPackage(_)) => Ok(DirectorySelection {
-            value: None,
-            rejected_future,
-        }),
-        Err(err) => Err(err),
+    if selected.is_none()
+        && let Some(error) = newest_error
+    {
+        return Err(error);
     }
+    Ok(DirectorySelection {
+        value: selected,
+        rejected_future,
+    })
 }
 
 fn cached_key_package_from_entry(
@@ -291,8 +361,14 @@ pub(crate) fn fresh_or_cached_key_package(
 pub(crate) fn key_package_from_record(
     record: RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
-    let event = record.event;
-    require_key_package_tag(&event, "mls_protocol_version", |value| value == "1.0")?;
+    key_package_from_borrowed_record(&record)
+}
+
+fn key_package_from_borrowed_record(
+    record: &RelayEventRecord,
+) -> Result<FetchedKeyPackage, AppError> {
+    let event = &record.event;
+    require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
         .tag_value("d")
         .filter(|value| !value.is_empty())
@@ -323,21 +399,21 @@ pub(crate) fn key_package_from_record(
     .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
-    require_key_package_tag(&event, "mls_ciphersuite", |value| {
+    require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_extensions",
         metadata.mls_extensions.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "mls_proposals",
         metadata.mls_proposals.iter().copied(),
     )?;
     require_multi_value_key_package_tag_matches(
-        &event,
+        event,
         "app_components",
         metadata
             .app_components
@@ -361,16 +437,16 @@ pub(crate) fn key_package_from_record(
         &mut source_relays,
         record
             .endpoints
-            .into_iter()
-            .map(|endpoint| endpoint.0)
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
     Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey,
+        account_id_hex: event.pubkey.clone(),
         key_package,
         key_package_id,
         key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id,
+        key_package_event_id: event.id.clone(),
         created_at: event.created_at,
         source_relays,
         relay_lists: AccountRelayListStatus::empty(),
@@ -567,6 +643,76 @@ fn sort_inventory_records(records: &mut [AccountKeyPackageRecord]) {
             .then_with(|| left.key_package_ref_hex.cmp(&right.key_package_ref_hex))
             .then_with(|| left.key_package_id.cmp(&right.key_package_id))
     });
+}
+
+pub(crate) fn owned_key_package_local_state(
+    key_package_ref: &[u8],
+    lifecycle: Option<&cgka_traits::KeyPackageLifecycleState>,
+) -> AccountKeyPackageLocalState {
+    let Some(lifecycle) = lifecycle else {
+        return AccountKeyPackageLocalState::OtherOwned;
+    };
+    if lifecycle.current_key_package_ref.as_deref() == Some(key_package_ref) {
+        return AccountKeyPackageLocalState::Current;
+    }
+    if lifecycle
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| pending.key_package_ref == key_package_ref)
+    {
+        return AccountKeyPackageLocalState::PendingReplacement;
+    }
+    if lifecycle
+        .retained_private_material
+        .iter()
+        .any(|retained| retained.key_package_ref == key_package_ref)
+    {
+        return AccountKeyPackageLocalState::RetainedPrivateMaterial;
+    }
+    AccountKeyPackageLocalState::OtherOwned
+}
+
+pub(crate) fn merge_key_package_inventory(
+    locals: impl IntoIterator<Item = AccountKeyPackageInventoryEntry>,
+    relays: impl IntoIterator<Item = AccountKeyPackageRecord>,
+) -> Vec<AccountKeyPackageInventoryEntry> {
+    let locals = locals.into_iter().collect::<Vec<_>>();
+    let mut records = locals
+        .iter()
+        .map(|entry| entry.record.clone())
+        .collect::<Vec<_>>();
+    records.extend(relays);
+    attach_local_state(merge_key_package_records(records), &locals)
+}
+
+fn attach_local_state(
+    records: Vec<AccountKeyPackageRecord>,
+    locals: &[AccountKeyPackageInventoryEntry],
+) -> Vec<AccountKeyPackageInventoryEntry> {
+    records
+        .into_iter()
+        .map(|record| {
+            let local_state = if record.local {
+                locals
+                    .iter()
+                    .find(|entry| {
+                        entry.record.account_id_hex == record.account_id_hex
+                            && !entry.record.key_package_ref_hex.is_empty()
+                            && entry.record.key_package_ref_hex == record.key_package_ref_hex
+                    })
+                    .map(|entry| entry.local_state)
+                    // Owned rows have nonempty refs preserved by the overlay,
+                    // so this lookup should always hit for production inputs.
+                    .unwrap_or(AccountKeyPackageLocalState::OtherOwned)
+            } else {
+                AccountKeyPackageLocalState::NotLocal
+            };
+            AccountKeyPackageInventoryEntry {
+                record,
+                local_state,
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn merge_key_package_records(
@@ -1192,5 +1338,214 @@ mod merge_tests {
         let expected = merge_key_package_records(input.clone());
         let actual = merge_key_package_records(input.into_iter().rev().collect());
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::{
+        KeyPackageLifecycleState, PendingKeyPackageReplacement, RetainedKeyPackagePrivateMaterial,
+        Timestamp,
+    };
+
+    fn entry(
+        event: &str,
+        reference: &str,
+        local: bool,
+        relay: bool,
+        local_state: AccountKeyPackageLocalState,
+    ) -> AccountKeyPackageInventoryEntry {
+        AccountKeyPackageInventoryEntry {
+            record: record(event, reference, local, relay),
+            local_state,
+        }
+    }
+
+    fn record(event: &str, reference: &str, local: bool, relay: bool) -> AccountKeyPackageRecord {
+        AccountKeyPackageRecord {
+            account_label: local.then(|| "device".to_owned()),
+            account_id_hex: "account".to_owned(),
+            key_package_id: format!("slot-{event}-{reference}"),
+            key_package_ref_hex: reference.to_owned(),
+            key_package_event_id: event.to_owned(),
+            published_at: event.len() as u64,
+            key_package_bytes: 123,
+            source_relays: if relay {
+                vec!["wss://relay.example".to_owned()]
+            } else {
+                Vec::new()
+            },
+            local,
+            relay,
+        }
+    }
+
+    #[test]
+    fn owned_lifecycle_refs_map_to_exact_local_states() {
+        let current = vec![1_u8, 2, 3];
+        let pending = vec![4_u8, 5, 6];
+        let retained = vec![7_u8, 8, 9];
+        let other = vec![10_u8, 11, 12];
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("stable-slot".into());
+        lifecycle.current_key_package_ref = Some(current.clone());
+        lifecycle.pending_replacement = Some(PendingKeyPackageReplacement {
+            generation_revision: 1,
+            key_package: KeyPackage::new(vec![0]),
+            key_package_ref: pending.clone(),
+            authored_created_at: Timestamp(1),
+            not_before: Timestamp(1),
+            not_after: Timestamp(2),
+            refresh_at: Timestamp(2),
+            signed_event: None,
+            targets: Vec::new(),
+            attempt_count: 0,
+            last_failure_code: None,
+        });
+        lifecycle.retained_private_material = vec![RetainedKeyPackagePrivateMaterial {
+            key_package: KeyPackage::new(vec![1]),
+            key_package_ref: retained.clone(),
+            not_after: Timestamp(2),
+            replaced_at: Timestamp(1),
+        }];
+
+        assert_eq!(
+            owned_key_package_local_state(&current, Some(&lifecycle)),
+            AccountKeyPackageLocalState::Current
+        );
+        assert_eq!(
+            owned_key_package_local_state(&pending, Some(&lifecycle)),
+            AccountKeyPackageLocalState::PendingReplacement
+        );
+        assert_eq!(
+            owned_key_package_local_state(&retained, Some(&lifecycle)),
+            AccountKeyPackageLocalState::RetainedPrivateMaterial
+        );
+        assert_eq!(
+            owned_key_package_local_state(&other, Some(&lifecycle)),
+            AccountKeyPackageLocalState::OtherOwned
+        );
+        assert_eq!(
+            owned_key_package_local_state(&current, None),
+            AccountKeyPackageLocalState::OtherOwned
+        );
+    }
+
+    #[test]
+    fn typed_merge_keeps_current_echo_retained_and_relay_only_states() {
+        let locals = vec![
+            entry(
+                "event-current",
+                "ref-current",
+                true,
+                false,
+                AccountKeyPackageLocalState::Current,
+            ),
+            entry(
+                "",
+                "ref-retained",
+                true,
+                false,
+                AccountKeyPackageLocalState::RetainedPrivateMaterial,
+            ),
+            entry(
+                "",
+                "ref-other",
+                true,
+                false,
+                AccountKeyPackageLocalState::OtherOwned,
+            ),
+        ];
+        let relays = vec![
+            record("event-current", "ref-current", false, true),
+            record("event-foreign", "ref-foreign", false, true),
+        ];
+        let merged = merge_key_package_inventory(locals, relays);
+        let by_ref = merged
+            .iter()
+            .map(|entry| {
+                (
+                    entry.record.key_package_ref_hex.as_str(),
+                    entry.local_state,
+                    entry.record.local,
+                    entry.record.relay,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(by_ref.contains(&(
+            "ref-current",
+            AccountKeyPackageLocalState::Current,
+            true,
+            true
+        )));
+        assert!(by_ref.contains(&(
+            "ref-retained",
+            AccountKeyPackageLocalState::RetainedPrivateMaterial,
+            true,
+            false
+        )));
+        assert!(by_ref.contains(&(
+            "ref-other",
+            AccountKeyPackageLocalState::OtherOwned,
+            true,
+            false
+        )));
+        assert!(by_ref.contains(&(
+            "ref-foreign",
+            AccountKeyPackageLocalState::NotLocal,
+            false,
+            true
+        )));
+        assert!(!merged.iter().any(|entry| entry.local_state
+            == AccountKeyPackageLocalState::NotLocal
+            && entry.record.local));
+        assert!(!merged.iter().any(|entry| {
+            entry.local_state == AccountKeyPackageLocalState::RetainedPrivateMaterial
+                && entry.record.relay
+        }));
+    }
+
+    #[test]
+    fn observed_retained_material_keeps_retained_state_and_relay_fact() {
+        let locals = vec![entry(
+            "",
+            "ref-retained",
+            true,
+            false,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial,
+        )];
+        let relays = vec![record("event-retained", "ref-retained", false, true)];
+        let merged = merge_key_package_inventory(locals, relays);
+        let retained = merged
+            .iter()
+            .find(|entry| entry.record.key_package_ref_hex == "ref-retained")
+            .expect("retained row remains");
+        assert_eq!(
+            retained.local_state,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial
+        );
+        assert!(retained.record.local);
+        assert!(retained.record.relay);
+        assert_eq!(retained.record.key_package_event_id, "event-retained");
+    }
+
+    #[test]
+    fn unsigned_pending_stays_pending_and_does_not_claim_publication() {
+        let pending = entry(
+            "",
+            "ref-pending",
+            true,
+            false,
+            AccountKeyPackageLocalState::PendingReplacement,
+        );
+        let merged = merge_key_package_inventory(vec![pending], Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].local_state,
+            AccountKeyPackageLocalState::PendingReplacement
+        );
+        assert!(merged[0].record.local);
+        assert!(!merged[0].record.relay);
+        assert!(merged[0].record.key_package_event_id.is_empty());
     }
 }

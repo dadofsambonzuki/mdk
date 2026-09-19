@@ -41,7 +41,10 @@ pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
-use cgka_traits::storage::{DisbandTombstoneStorage, KeyPackageBundleStorage, MaintenanceStorage};
+use cgka_traits::storage::{
+    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, KeyPackageBundleStorage,
+    LeaveRequestStorage, MaintenanceStorage,
+};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
@@ -166,8 +169,9 @@ pub use agent_streams::{
 };
 pub use app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    HostPerformanceOperation, HostPerformanceOutcome, SyncErrorClass, SyncFailureClassification,
-    SyncFailureCount, SyncFailureStage,
+    HostPerformanceOperation, HostPerformanceOutcome, RuntimePerformanceOperation,
+    RuntimePerformanceSnapshot, SyncErrorClass, SyncFailureClassification, SyncFailureCount,
+    SyncFailureStage,
 };
 pub use audit_log::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
@@ -178,8 +182,8 @@ pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
 pub use config::{
-    AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
-    MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
+    AttachmentAcquisitionPolicy, AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence,
+    MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
     RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
@@ -248,7 +252,7 @@ pub use relay_telemetry_export::{
 };
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, ExistingDirectConversation,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
     MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
     TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
@@ -306,7 +310,7 @@ fn chat_pin_error_from_storage(error: storage_sqlite::ChatPinError) -> AppError 
 
 use conversions::{
     account_group_push_token_from_app, account_push_registration_from_app,
-    account_state_from_stored, app_message_record_from_stored,
+    account_state_from_stored, app_group_from_stored_group, app_message_record_from_stored,
     chat_notification_settings_from_account, group_push_token_from_account,
     normalize_relay_telemetry_settings, notification_settings_from_account,
     pending_push_registration_removal_from_account, relay_telemetry_settings_from_storage,
@@ -505,6 +509,8 @@ pub struct MarmotApp {
     local_open_gates: local_open_test_gate::LocalOpenGates,
     #[cfg(test)]
     legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    #[cfg(test)]
+    inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
     #[cfg(test)]
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
@@ -1078,6 +1084,47 @@ pub struct AccountKeyPackageRecord {
     pub relay: bool,
 }
 
+/// Durable ownership classification for one inventory row.
+///
+/// Classification comes from durable lifecycle references, never an empty
+/// event ID, timestamp, or pubkey match. `AccountKeyPackageRecord::local` is
+/// true exactly when this is not [`NotLocal`](Self::NotLocal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKeyPackageLocalState {
+    /// No corresponding durably owned private bundle.
+    NotLocal,
+    /// Owned ref equals the durable current ref.
+    Current,
+    /// Owned ref equals the durable pending replacement ref.
+    PendingReplacement,
+    /// Owned ref occurs in durable retained material.
+    RetainedPrivateMaterial,
+    /// Genuinely owned, but not classified by the durable lifecycle
+    /// (including legacy or unclassified cases).
+    OtherOwned,
+}
+
+impl AccountKeyPackageLocalState {
+    /// True for every state that has a usable local private bundle.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        !matches!(self, Self::NotLocal)
+    }
+}
+
+/// One KeyPackage inventory row plus its typed local provenance.
+///
+/// `record.local` and `record.relay` remain orthogonal facts.
+/// `record.relay` means a validated relay observation, never merely an
+/// authored event or a configured relay. `local_state` and `record.relay`
+/// are the authoritative display distinctions; `published_at` and
+/// `source_relays` keep their legacy semantics and are not publication proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageInventoryEntry {
+    pub record: AccountKeyPackageRecord,
+    pub local_state: AccountKeyPackageLocalState,
+}
+
 /// Observed relay history for an account's kind-30443 KeyPackage events.
 ///
 /// This is the validated, event-ID-deduplicated window returned by a single
@@ -1402,6 +1449,8 @@ impl MarmotApp {
             #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
@@ -1484,6 +1533,8 @@ impl MarmotApp {
             local_open_gates: local_open_test_gate::LocalOpenGates::default(),
             #[cfg(test)]
             legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
@@ -1656,6 +1707,7 @@ impl MarmotApp {
         let _ = open.runtime.take_maintenance_activity();
         let mut client = AppClient {
             conversation_captures: Vec::new(),
+            runtime_telemetry: None,
             send_telemetry: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
@@ -3421,19 +3473,21 @@ impl MarmotApp {
     }
 
     pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        // Keep overlays aligned with group(); keyed_group_matches_list checks parity.
         self.ensure_account_state(label)?;
-        let mut groups = self.load_state(label)?.groups;
-        // `leave_requested_at_ms` is not part of the stored projection, so stamp
-        // it from the engine-owned leave-request table here. This is the single
-        // population point for the group record: `visible_groups`, `group`, and
-        // `subscribe_chats` all read through this method.
-        let pending = self.pending_leave_requests(label)?;
+        let storage = self.account_storage(label)?;
+        let mut groups = storage
+            .account_groups(None)?
+            .into_iter()
+            .map(app_group_from_stored_group)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Engine-owned leave and disband state can change without an app projection write.
+        let pending = storage.pending_leave_requests()?;
         if !pending.is_empty() {
             for group in &mut groups {
                 group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
             }
         }
-        let storage = self.account_storage(label)?;
         let disbanding = storage.disbanding_group_ids_hex()?;
         let requests = storage.disband_requests_by_group_hex()?;
         let disbanded = storage
@@ -3552,10 +3606,33 @@ impl MarmotApp {
         label: &str,
         group_id_hex: &str,
     ) -> Result<Option<AppGroupRecord>, AppError> {
-        Ok(self
-            .groups(label)?
-            .into_iter()
-            .find(|group| group.group_id_hex == group_id_hex))
+        // Keep overlays aligned with groups(); keyed_group_matches_list checks parity.
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?;
+        let Some(stored) = storage.account_groups(Some(group_id_hex))?.pop() else {
+            return Ok(None);
+        };
+        let mut group = app_group_from_stored_group(stored)?;
+        // Defend parity for noncanonical persisted ids: list overlays only match
+        // lowercase hex keys, even when the projection row itself matches exactly.
+        let Ok(group_id) = hex::decode(group_id_hex) else {
+            return Ok(Some(group));
+        };
+        if hex::encode(&group_id) != group_id_hex {
+            return Ok(Some(group));
+        }
+        let group_id = GroupId::new(group_id);
+        group.leave_requested_at_ms = storage
+            .leave_request(&group_id)?
+            .map(|request| request.requested_at_ms);
+        let request = storage.disband_request(&group_id)?;
+        group.disbanding = request
+            .as_ref()
+            .is_some_and(|request| request.status == DisbandRequestStatus::Pending)
+            || storage.has_disband_candidates(&group_id)?;
+        group.disband_request = request.map(Into::into);
+        group.disbanded = storage.disband_tombstone(&group_id)?.is_some();
+        Ok(Some(group))
     }
 
     pub fn set_group_archived(
@@ -3609,15 +3686,21 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         let peeler = NostrMlsPeeler::new().with_welcome_signer(nostr_signer.clone());
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
-        let session_key = if let AccountSigner::Local(keys) = &signer {
-            self.sqlcipher_key(label, keys, &session_path, SqlcipherDatabaseKind::Session)?
-        } else {
-            self.external_sqlcipher_key(
-                label,
-                &account.account_id_hex,
-                &session_path,
-                SqlcipherDatabaseKind::Session,
-            )?
+        // load_state/account_storage above completed the first database open.
+        // Serialize any remaining key-migration probe with other openers.
+        let session_key = {
+            let lock = sqlcipher::database_open_lock(&session_path);
+            let database = lock.lock();
+            if let AccountSigner::Local(keys) = &signer {
+                self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
+            } else {
+                self.external_sqlcipher_key(
+                    label,
+                    &account.account_id_hex,
+                    &database,
+                    SqlcipherDatabaseKind::Session,
+                )?
+            }
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
@@ -4131,16 +4214,70 @@ impl MarmotApp {
         label: &str,
         owned_key_packages: Vec<KeyPackage>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
+        Ok(self
+            .project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    /// Local inventory from one consistent ownership-and-lifecycle snapshot.
+    ///
+    /// Both new inventory entrypoints use this so a concurrent rotation cannot
+    /// pair a pre-rotation owned set with a post-rotation lifecycle.
+    pub(crate) fn local_account_key_package_inventory_snapshot(
+        &self,
+        label: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let (owned_key_packages, lifecycle) =
+            self.capture_local_key_package_ownership_and_lifecycle(label)?;
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
+    }
+
+    fn capture_local_key_package_ownership_and_lifecycle(
+        &self,
+        label: &str,
+    ) -> Result<
+        (
+            Vec<KeyPackage>,
+            Option<cgka_traits::KeyPackageLifecycleState>,
+        ),
+        AppError,
+    > {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
+            let owned = cgka_engine::key_package::durably_owned_key_packages(
+                storage,
+                cgka_traits::group::ProtocolProfile::Current,
+            )
+            .map_err(cgka_session::SessionError::from)?;
+            #[cfg(test)]
+            self.run_inventory_snapshot_between_reads_for_test();
+            let lifecycle = storage.key_package_lifecycle()?;
+            Ok((owned, lifecycle))
+        })
+    }
+
+    fn project_local_account_key_package_inventory(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
         let account = self.account_home().account(label)?;
         let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
-        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
         let source_relays = self.account_nip65_relays(label).unwrap_or_default();
-        let mut records = Vec::with_capacity(owned_key_packages.len());
+        let mut entries = Vec::with_capacity(owned_key_packages.len());
 
         for key_package in owned_key_packages {
             let metadata = key_package_metadata(&key_package)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+            let local_state = crate::key_package_records::owned_key_package_local_state(
+                &key_package_ref,
+                lifecycle.as_ref(),
+            );
             let mut key_package_id = metadata.key_package_ref_hex.clone();
             let mut key_package_event_id = String::new();
             let mut published_at = 0;
@@ -4198,23 +4335,26 @@ impl MarmotApp {
                 }
             }
 
-            records.push(AccountKeyPackageRecord {
-                account_label: Some(account.label.clone()),
-                account_id_hex: account.account_id_hex.clone(),
-                key_package_id,
-                key_package_ref_hex: metadata.key_package_ref_hex,
-                key_package_event_id,
-                published_at,
-                key_package_bytes: key_package.bytes().len(),
-                source_relays: source_relays.clone(),
-                local: true,
-                relay: false,
+            entries.push(AccountKeyPackageInventoryEntry {
+                record: AccountKeyPackageRecord {
+                    account_label: Some(account.label.clone()),
+                    account_id_hex: account.account_id_hex.clone(),
+                    key_package_id,
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    key_package_event_id,
+                    published_at,
+                    key_package_bytes: key_package.bytes().len(),
+                    source_relays: source_relays.clone(),
+                    local: true,
+                    relay: false,
+                },
+                local_state,
             });
         }
-        Ok(records)
+        Ok(entries)
     }
 
-    async fn fetch_validated_account_key_package_records(
+    pub(crate) async fn fetch_validated_account_key_package_records(
         &self,
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
@@ -4686,52 +4826,6 @@ impl MarmotApp {
         self.display_names_for_account_ids(&account_ids)
     }
 
-    pub(crate) fn local_account_labels_by_id(&self) -> Result<HashMap<String, String>, AppError> {
-        Ok(self
-            .account_home()
-            .accounts()?
-            .into_iter()
-            .map(|account| (account.account_id_hex, account.label))
-            .collect())
-    }
-
-    fn display_names_for_account_ids(
-        &self,
-        account_id_hexes: &[String],
-    ) -> Result<HashMap<String, String>, AppError> {
-        let mut account_ids = account_id_hexes
-            .iter()
-            .map(|account_id| parse_account_id_hex(account_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        account_ids.sort();
-        account_ids.dedup();
-        if account_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let caches = self.directory_caches()?;
-        let shared_storage = self.shared_storage()?;
-        let local_names = self.local_account_labels_by_id()?;
-        let mut names = HashMap::new();
-
-        for account_id in account_ids {
-            if let Some(entry) = self.directory_entry_for_account_id_with_handles(
-                &account_id,
-                &caches,
-                &shared_storage,
-            )? && let Some(name) = display_name_for_profile(entry.profile.as_ref())
-            {
-                names.insert(account_id, name);
-                continue;
-            }
-            if let Some(name) = local_names.get(&account_id) {
-                names.insert(account_id, name.clone());
-            }
-        }
-
-        Ok(names)
-    }
-
     fn display_name_for_account_id(
         &self,
         account_id_hex: &str,
@@ -4744,6 +4838,7 @@ impl MarmotApp {
     /// back to a local account's label. Split out so callers that already hold
     /// the entry (e.g. notification building, #639) don't re-query
     /// `directory_entry_for_account_id`.
+    /// Preserve its first-alias fallback; batched name reads historically use the last alias.
     pub(crate) fn display_name_from_directory_entry(
         &self,
         account_id_hex: &str,
@@ -4791,16 +4886,23 @@ impl MarmotApp {
         }
         let caches = self.directory_caches()?;
         let shared = self.shared_storage()?;
-        let local = self.local_account_labels_by_id()?;
+        let local_accounts = self.local_accounts_by_id()?;
         let mut names = HashMap::new();
         for id in ids {
             let profile = self
-                .directory_entry_for_account_id_with_handles(&id, &caches, &shared)?
+                .directory_entry_for_account_id_with_handles(
+                    &id,
+                    &caches,
+                    &shared,
+                    &local_accounts,
+                )?
                 .and_then(|entry| entry.profile);
             let name = conversation_presentation::identity_display_name(
                 &id,
                 profile.as_ref(),
-                local.get(&id).map(String::as_str),
+                local_accounts
+                    .get(&id)
+                    .map(|account| account.label.as_str()),
             );
             names.insert(id, name);
         }
@@ -5373,15 +5475,28 @@ impl MarmotApp {
         )
         .entered();
         let path = self.account_storage_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
+        // Another opener may have filled the cache while we waited. Hold the
+        // database guard through key selection, migrations and publication.
+        if let Some(storage) = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+        {
+            return Ok(storage);
+        }
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?
+            self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
         } else {
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::Session,
             )?
         };
@@ -5819,25 +5934,80 @@ impl MarmotApp {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<LegacyProjectionOpenHook>,
+    ) {
+        *self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    #[cfg(test)]
+    fn run_inventory_snapshot_between_reads_for_test(&self) {
+        let hook = self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_durably_owned_key_packages_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        cgka_engine::key_package::durably_owned_key_packages(
+            &self.account_storage(label)?,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_key_package_lifecycle_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        Ok(self.account_storage(label)?.key_package_lifecycle()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_local_account_key_package_inventory_for_test(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
+    }
+
     fn legacy_account_projection(
         &self,
         label: &str,
     ) -> Result<LegacyAccountProjectionDb, AppError> {
         let path = self.legacy_account_projection_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
             let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key(
+            self.sqlcipher_key_locked(
                 label,
                 &keys,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::AccountProjection,
             )?
         } else {
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
-                &path,
+                &database,
                 SqlcipherDatabaseKind::AccountProjection,
             )?
         };
@@ -6358,6 +6528,14 @@ impl AppKeyPackagePublisher {
             ));
         }
         Ok(NostrKeyPackagePublication {
+            client_name: self
+                .app
+                .config
+                .key_package_client_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
             key_package_slot_id: publication.slot_id.clone(),
@@ -6443,9 +6621,13 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         publication: &KeyPackagePublication,
         artifact: &cgka_traits::SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
-        let nostr_publication = self.nostr_publication(publication)?;
+        let mut nostr_publication = self.nostr_publication(publication)?;
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        // A retry belongs to its durable signed artifact, not the current host config.
+        nostr_publication.client_name = event
+            .tag_value(transport_nostr_adapter::CLIENT_TAG)
+            .map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
             || event.created_at != artifact.created_at.0
         {
@@ -6709,3 +6891,11 @@ pub use storage_sqlite::{
     AvatarAssetTarget, AvatarAvailability,
 };
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
+
+pub use runtime::{
+    AttachmentAssetRef, AttachmentCategory, AttachmentControl, AttachmentDownloadPolicy,
+    AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentLocalTarget,
+    AttachmentPage, AttachmentPageRead, AttachmentTransferState, AttachmentTransferStatus,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
+};

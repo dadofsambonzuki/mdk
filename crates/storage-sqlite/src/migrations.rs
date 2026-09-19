@@ -170,6 +170,19 @@ mod migration_0078_avatar_acquisition;
 mod migration_0079_content_reports;
 #[path = "migrations/0080_avatar_target_lookup.rs"]
 mod migration_0080_avatar_target_lookup;
+#[path = "migrations/0081_attachment_history.rs"]
+mod migration_0081_attachment_history;
+#[path = "migrations/0083_attachment_acquisition.rs"]
+mod migration_0083_attachment_acquisition;
+#[path = "migrations/0084_attachment_worker_demand.rs"]
+mod migration_0084_attachment_worker_demand;
+#[path = "migrations/0085_attachment_partials.rs"]
+mod migration_0085_attachment_partials;
+#[path = "migrations/0086_attachment_controls.rs"]
+mod migration_0086_attachment_controls;
+
+#[path = "migrations/0082_deletion_provenance.rs"]
+mod migration_0082_deletion_provenance;
 
 pub(crate) struct Migration {
     pub(crate) version: i64,
@@ -577,6 +590,36 @@ const MIGRATIONS: &[Migration] = &[
         version: 80,
         name: "0080_avatar_target_lookup",
         apply: migration_0080_avatar_target_lookup::apply,
+    },
+    Migration {
+        version: 81,
+        name: "0081_attachment_history",
+        apply: migration_0081_attachment_history::apply,
+    },
+    Migration {
+        version: 82,
+        name: "0082_deletion_provenance",
+        apply: migration_0082_deletion_provenance::apply,
+    },
+    Migration {
+        version: 83,
+        name: "0083_attachment_acquisition",
+        apply: migration_0083_attachment_acquisition::apply,
+    },
+    Migration {
+        version: 84,
+        name: "0084_attachment_worker_demand",
+        apply: migration_0084_attachment_worker_demand::apply,
+    },
+    Migration {
+        version: 85,
+        name: "0085_attachment_partials",
+        apply: migration_0085_attachment_partials::apply,
+    },
+    Migration {
+        version: 86,
+        name: "0086_attachment_controls",
+        apply: migration_0086_attachment_controls::apply,
     },
 ];
 
@@ -3302,6 +3345,83 @@ mod content_reports_tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             5
+        );
+    }
+}
+
+#[cfg(test)]
+mod deletion_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_provenance_migration_preserves_legacy_tombstones() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..81]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, deleted,
+                deleted_by_message_id_hex
+            ) VALUES (
+                'group', 'message', 'received', 'author', '', 9,
+                '[]', 1, 1, '{}', 1, 'missing-evidence'
+            );",
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let row: (bool, String, String, String) = conn
+            .query_row(
+                "SELECT deleted, plaintext, deleted_by_message_id_hex, deletion_source
+             FROM message_timeline",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                true,
+                String::new(),
+                "missing-evidence".into(),
+                "unknown".into()
+            )
+        );
+        run(&mut conn, MIGRATIONS).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod attachment_history_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_history_upgrade_indexes_existing_delivered_slots_and_tracks_removal() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..80]).unwrap();
+        conn.execute_batch(r#"
+            INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,
+                direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json)
+            VALUES('aa','old','source','received','alice','',9,'[]',1,2,'[]',
+                '{"imeta":[["imeta","url https://example.com/a"],null]}');
+        "#).unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM attachment_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "legacy delivered slots, including a rejected slot, stay discoverable"
+        );
+        conn.execute(
+            "UPDATE message_timeline SET deleted=1 WHERE message_id_hex='old'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM attachment_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }

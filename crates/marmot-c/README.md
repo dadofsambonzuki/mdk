@@ -1,7 +1,29 @@
 # marmot-c
 
-Stable C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
+C ABI over the Marmot app runtime (`marmot-uniffi`), for C/C++ and
 any raw-FFI consumer (Zig, Nim, Go, Odin, Lua, PHP, …).
+
+## Integration documentation
+
+Start with the [shared binding integration guide](../marmot-uniffi/README.md#integration-guide-and-api-reference)
+for runtime lifecycle, screen contracts, API selection, localization and upgrade policy.
+Use the [complete C symbol reference](API-REFERENCE.md) for every function declaration,
+including ownership helpers, and the [shared method reference](../marmot-uniffi/API-REFERENCE.md)
+for runtime purposes and recommended alternatives to older screen paths.
+
+The [0.10.1 → 0.10.2 integration guide](../../docs/integration/0.10.2.md) explains
+new defaults, media adoption, KeyPackages and changed records. Future releases have
+companions in the [integration index](../../docs/integration/README.md).
+Read the exact version's header and docs; C record layout compatibility is not implied
+by a shared major/minor number. External-signer onboarding/login/registration remain
+UniFFI-only until a C signer callback interface exists; the host secret-store vtable
+is already supported and is a different interface.
+
+Before OS suspension/root handoff, use `marmot_client_shutdown_and_close` and observe
+its status; `marmot_client_shutdown` alone does not close shared database handles.
+Release subscriptions before clients, and never free an object while another call uses it.
+The catalog includes C-only compatibility shims; prefer the v4 audit configuration
+setter and the composable runtime options constructor for new integrations.
 
 ## What you get
 
@@ -17,6 +39,16 @@ Build the bundle locally:
 
 Tagged releases (`marmotc-v*`) publish a Linux x86_64 zip with the same
 contents.
+
+## Binary compatibility
+
+Build clients against the header shipped with the exact native library they load.
+Output records have concrete C layouts; this API has no tail-extension or
+cross-release layout-compatibility guarantee. Do not swap in a new library under
+an application compiled against older record layouts.
+
+See [the changelog](CHANGELOG.md) for record-layout changes and upgrade requirements
+for each release.
 
 ## Using the ABI
 
@@ -44,8 +76,8 @@ int main(void) {
         return 1;
     }
     /* ... */
-    if (marmot_client_shutdown(client) != MARMOT_STATUS_OK) {
-        report("client_shutdown");
+    if (marmot_client_shutdown_and_close(client) != MARMOT_STATUS_OK) {
+        report("client_shutdown_and_close");
         marmot_client_free(client);
         return 1;
     }
@@ -85,12 +117,35 @@ superseded events. Free that list with
 `MarmotAccountKeyPackage` layout and `marmot_account_key_package_list_free`
 are unchanged.
 
+`marmot_local_account_key_packages` is the local-first inventory. Call it
+immediately, then independently await `marmot_refresh_account_key_packages` and
+replace the displayed snapshot. The local read is synchronous SQLCipher I/O on
+the calling thread; do not invoke it on a UI or main thread. A retained package
+stays `MARMOT_ACCOUNT_KEY_PACKAGE_LOCAL_STATE_RETAINED_PRIVATE_MATERIAL` even
+when that exact event is observed; `relay` becomes true while `local_state`
+remains retained. On refresh failure, keep the local result.
+Free either list with `marmot_account_key_package_inventory_entry_list_free`.
+The new entry embeds the existing record plus
+`MarmotAccountKeyPackageLocalState`; existing structs and frees are unchanged.
+Regenerate `marmot.h` and use a matching library. Android device rendering is
+a separate consumer adoption issue.
+
 `examples/smoke.c` is a worked example covering lifecycle, Markdown
 tagged-union walking, offline reads, the error taxonomy, and best-effort
 identity creation. `./crates/marmot-c/c-smoke.sh` builds and runs it
 against both linkage models (valgrind when available). Pass `--debug` first
 to reuse debug/test-profile dependencies for a faster local or PR smoke run;
-release and scheduled validation use the default release build.
+release and scheduled validation use the default release build. On macOS both
+build scripts pin release `strip=none`, matching MarmotKit's Apple policy: Rust's
+debug-stripping path can emit a misaligned Mach-O string table that Xcode 27
+rejects. Optimization remains enabled; Linux packaging is unchanged. Revisit the
+pin after a Rust toolchain upgrade incorporating
+[rust-lang/rust#158410](https://github.com/rust-lang/rust/pull/158410), and remove it
+only after the default optimized shared/static smoke passes without the override.
+The C CI workflows run on Linux; the Darwin branch currently has local smoke
+evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
+alternating these scripts with an unpinned `cargo build --release` can rebuild
+release dependencies.
 
 ## Audit v4 adoption
 
@@ -115,8 +170,9 @@ it never reinterprets an old device name as a hardware model. Both setters use t
   discriminants — use the generated `MARMOT_*` constants. Out-of-range
   values are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`.
 - Required out-pointers are checked and zeroed before the call does any
-  work, so a rejected call never leaves a side effect behind and is always
-  safe to retry.
+  work, so an invalid required output pointer cannot cause the operation
+  to run. Other failures/timeouts can follow durable intent or external side
+  effects; inspect authoritative state before retrying a mutation.
 - Blocking functions may be called from a subscription callback.
 - Subscriptions offer blocking `*_next` (`0` timeout = wait forever;
   `MARMOT_STATUS_TIMEOUT` / `MARMOT_STATUS_CLOSED` otherwise) or callback

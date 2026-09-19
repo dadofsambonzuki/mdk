@@ -2,6 +2,152 @@
 
 UniFFI bindings for the Marmot app runtime.
 
+## Integration guide and API reference
+
+This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
+The [C guide](../marmot-c/README.md) adds ABI ownership and blocking-call rules for C and raw FFI hosts.
+Read the documentation at the tag matching your binaries; `master` can describe unreleased APIs.
+
+| Document | Use it for |
+| --- | --- |
+| [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
+| [0.10.2 integration guide](../../docs/integration/0.10.2.md) | Detailed upgrade from 0.10.1: required changes, changed defaults, optional adoption, examples and acceptance checks. |
+| [Release integration index](../../docs/integration/README.md) | Find the companion guide for your upgrade; read intervening guides when skipping versions. |
+| [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
+| [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
+| [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
+| [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
+
+### What MDK owns and what the host owns
+
+MDK owns account storage, cryptographic state, relay work, durable chat presentation,
+message interpretation, read state, drafts, avatar bytes and retained attachment acquisition.
+A screen projection is a coherent local view, not a request to fetch every profile or
+message individually. Background work updates those projections as new information arrives.
+
+The host owns navigation, localization, accessibility, layout, visible pixel anchors,
+image/audio/video decoding, temporary exports, and OS scheduling/notification delivery.
+Keep bounded decoded/display caches; do not assume an MDK byte cache is an image decoder
+or that starting a runtime grants indefinite background execution on iOS or Android.
+A successful send or publication is not proof that another person received or read it.
+
+One runtime can serve several accounts. Each account-device identity has its own encrypted
+database; every account-scoped handle/result must stay with the account that created it.
+`groupIdHex` identifies opaque MLS group bytes (commonly 16 bytes), not a 32-byte Nostr
+routing ID. Use canonical member/account references from MDK. Treat opaque cursor, revision,
+asset and stream handles as their documented types, never as parseable persistent identifiers.
+
+### Choose the right level of API
+
+These are recommendations for new chat clients, **not Rust deprecation annotations or
+scheduled removals**. Compatibility methods remain callable. Lower-level methods remain
+supported for custom clients and non-chat uses; they are not obsolete merely because a
+screen API exists. The method reference marks explicit alternatives individually.
+
+| Use case | Recommended starting point | Existing alternative and when to use it |
+| --- | --- | --- |
+| Runtime construction | `newWithConfiguration` with `MarmotOptions` | `new` for defaults; specialized constructors remain compatibility conveniences. Preserve secret store and cursor policy when migrating. |
+| Main Chats/Unread/Archived/Left screens | `openChatListWindow` | `presentedChatList` / `openPresentedChatList` for a full selected list; `chatList` / `subscribeChatList` for raw rows and custom filters. Do not filter a loaded page to implement full-account search. |
+| One chat row | `presentedChatListRow` | `chatListRow` when raw fields are specifically required. Avoid account-wide reads for one row. |
+| Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
+| Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
+| Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
+| Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
+| Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
+| Display received media | `attachmentLocalAssets` then `readAttachmentAsset`, plus transfer observation/controls | `downloadMedia` is a supported one-shot network download returning full transient bytes. It is not a retained-cache read. |
+| KeyPackage settings | `localAccountKeyPackages`, then `refreshAccountKeyPackages` | `accountKeyPackages` for the existing network-oriented inventory; `accountKeyPackageRelayEvents` remains useful for observed publication history. |
+| Interactive imported-account onboarding | `beginOnboarding` / `beginExternalSignerOnboarding`, workflow snapshots and revision/epoch-aware approvals | `login` / `loginExternalSigner` remain compatible direct flows; they do not implement the interactive repair/notice UI for you. |
+| Group administration | Detailed mutation methods where available, plus `groupManagementState` | Shorter mutation methods remain supported; use detailed results when the UI needs operation outcomes. |
+
+### Feature map
+
+All methods, including less common management/diagnostic operations, are listed in the
+[complete reference](API-REFERENCE.md). These are the responsibilities of the main API families:
+
+| Family | Integration boundary |
+| --- | --- |
+| Accounts and onboarding | Identity creation/import, setup readiness, local sign-in/out, wipe/export and external signers. Keep local removal, leaving groups, remote publication and wiping credentials distinct; inspect returned cleanup/send outcomes. Interactive onboarding is a persisted approval workflow, not a series of unconditional setters. |
+| Directory and profiles | Canonical member-reference parsing, safe names, cached identities, profile/relay refresh and user search. Cached reads and explicit network refresh are separate. Use prepared identity references on chat screens instead of per-row lookups. |
+| Groups and administration | Creation, staged/prepared images, invitations, membership/admin changes, retention, archive/leave/disband, recovery, quarantine and maintenance. Use current capabilities; a displayed roster is not authorization. Queued operations and uncertain publication require result-aware UI. |
+| Messages, edits and reactions | Send/reply/edit/custom events, reaction changes, deletion and edit history. Render effective prepared content and viewer reaction state; use raw history only when the feature needs it. |
+| Moderation and blocking | Typed reports, individual dismissals, deletion-masked report targets and live block lists. Reports are not deletion evidence; the host designs moderation queue UI from the provided records. |
+| Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
+| Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
+| Notifications and push | Notification preferences, native registration, bounded wake/catch-up and notification subscriptions. The host owns OS tokens, permission prompts, background budgets and notification presentation. |
+| Relays and maintenance | Relay safety/classification, account/user relay lists, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
+| Agent streams | Start/watch live text previews or use a publisher handle to append then finish a durable transcript. Preview transport and durable message delivery have different outcomes; ephemeral handles do not provide restart persistence. |
+| Diagnostics | Fixed performance milestones/snapshots, consent-gated product events, relay telemetry, audit recording/files/uploads. Keep each configuration and consent boundary explicit; do not dump secrets or DTOs into logs. |
+
+### Runtime lifecycle, threads and errors
+
+1. Install matching generated sources, native libraries and platform resources. Android must
+   initialize `MarmotAndroid` before construction; Apple wrappers must carry the privacy resource.
+2. Construct with the intended root, relay policy, cursor persistence and secret store. For White
+   Noise publications, supply `clientName: "whitenoise"` in every foreground/background runtime.
+   A frozen notification-extension cursor must remain frozen when adding options.
+3. Use local reads for initial UI where their contracts allow it. Start the runtime for live
+   account workers, relay synchronization and acquisition. Local data and send readiness are
+   distinct: render a conversation's available history while honoring its composer capabilities.
+4. Keep synchronous storage reads off the UI thread. Async Swift/Kotlin calls may suspend;
+   C methods are blocking unless documented otherwise. Host signer/secret-store callbacks may
+   run concurrently on worker threads and must be thread-safe.
+5. Bind one receive loop to each subscription. On account/view change discard late results from
+   the old handle, cancel waiting tasks and release handles. Some handles have explicit `cancel`;
+   consult the reference rather than assuming all handles share that method.
+6. Before terminal suspension or transfer of root ownership, await `shutdownAndClose()`.
+   It closes storage and releases locks even if host references remain. Reads on the closed
+   runtime fail; reconstruct a runtime and its handles on foreground. `shutdown()` only stops
+   work and does not by itself provide the terminal storage/root-release contract.
+
+`RuntimeBusy` is contention for the exclusive root lease, not an empty account set. Handle
+storage/closed/stopping/not-ready errors separately from successful empty results. On a timeout
+or task cancellation, a durable mutation may already be queued; refresh authoritative state
+before retrying. Do not translate every error into an empty list, restart the entire runtime on
+every subscription update, or delete lock/database files to recover ownership.
+
+### Screen snapshots, paging and ownership
+
+Prepared list/conversation updates are complete replacements for their bounded window.
+Apply generation/sequence ordering; do not append a replacement as if it were a page delta.
+Pass current navigation tokens and preserve the visible row's pixel offset in the host.
+The unread/latest anchor chooses content to load; the host still performs scrolling after layout.
+Mark messages read when actually visible, not simply because an API returned them.
+
+Legacy `nextUpdate` methods have different delta semantics; never mix them with `next` on the
+same handle. Attachment-history cursors/versions have their own restart rules. Recreate opaque
+runtime-scoped objects after reconstruction. Swift uses ARC; Kotlin hosts close disposable
+UniFFI handles after cancelling/joining consumers. C hosts use only the matching deep-free and
+never free handles during concurrent use. Returned plaintext and copies made by host decoders
+remain the host's responsibility, including removal of downstream copies after local deletion.
+
+### Localization, privacy and diagnostics
+
+Use typed presentation, capability, deletion and group-system fields rather than parsing English
+strings or guessing from membership counts. Clients localize fallback labels and system wording.
+Preserve unknown variants/provenance as neutral presentation rather than inventing an actor.
+Configure consent-gated analytics, audit uploads and relay telemetry deliberately; endpoint URLs
+are not credentials. Never log message bodies, asset references, keys, account/group identifiers,
+raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
+and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
+
+### Compatibility and documentation maintenance
+
+Generated source, DTOs, enums, errors, headers and native code form one versioned contract.
+An additive Rust method does not imply that an old generated binding can call a new library;
+C record layouts are especially sensitive. Database upgrades are separate from source-level API
+compatibility, and rolling back only the library can be unsupported.
+
+The reference's names, signatures and source-line links are checked with `just binding-docs-gate`.
+Use `just binding-docs-update` (or `python3 scripts/check_binding_docs.py --write`) to refresh
+mechanical metadata while preserving authored prose. New exports receive scaffold entries that
+fail validation until their guidance is completed; removed/duplicate entries require explicit
+editorial cleanup. Review prose, selection guidance and affected feature contracts after changes:
+the gate cannot tell whether those descriptions still match runtime behavior.
+Every release from 0.10.2 has concise release notes and a separate detailed integration guide;
+see [the release checklist](../../release.md#release-documentation).
+
+## Building local bindings
+
 The Rust API in `src/` is the source of truth for both generated Swift and generated Kotlin. Platform scripts only
 package that shared surface:
 
@@ -21,6 +167,48 @@ same UniFFI surface, and releases publish it once.
 `<details>` / `<summary>` display blocks. Hosts must regenerate Swift/Kotlin
 bindings to handle the new tag; older generated sources cannot render it.
 No generated Swift or Kotlin files are committed here.
+
+## Deletion provenance and custom events
+
+Timeline records (including conversation windows and `reportedMessage`), reply previews,
+and chat-list previews expose `deletionSource: DeletionSourceFfi`:
+
+- `Author`: the selected accepted deletion is an author-authorized kind 5.
+- `Admin`: the selected accepted deletion is kind 4891, authorized by authenticated
+  source-state evidence. This includes an admin removing their own message.
+- `Unknown`: no classified deletion evidence is available, including older projected tombstones
+  and legacy kind-5 removals of another author's content.
+
+Consult this field only when `deleted` is true. Use the existing ordinary-deletion wording
+for `Author`, “This message was deleted by an admin.” for `Admin`, and a neutral deleted-message
+fallback for `Unknown`. Clients own localization. The message's `kind` remains its original
+inner event kind, never the deletion kind. Existing deletion IDs and content masking are retained.
+`invalidationStatus` describes convergence separately and does not imply deletion.
+
+See [deletion semantics](../../docs/marmot-architecture/overview/content-moderation.md)
+for the storage and authorization contract.
+
+When multiple accepted deletions apply, the largest `(authenticated event timestamp, event ID)`
+pair wins, matching `deletedByMessageIdHex`. Arrival order, reports, and current admin status
+play no part. Invalidated deletion evidence is withdrawn; projections update to the remaining
+winner (or restore the undeleted state). Provenance-only changes participate in live projection
+and conversion-cache updates.
+
+Database migration 0082 adds provenance columns with an `unknown` default.
+It preserves older tombstones, deletion IDs, and cached chat presentation without scanning or
+reinterpreting history. No historical backfill is scheduled: existing tombstones can remain `Unknown` indefinitely.
+If a later operation reprojects a target or rebuilds its group, it uses available accepted evidence.
+Legacy serialized records with an absent field also default to `Unknown`. No client database
+migration or deletion index is needed. Regenerate Swift/Kotlin bindings and consume the matching
+native libraries together; C consumers must rebuild against the updated header and library.
+Older MDK binaries reject the upgraded database schema; do not roll back only the library.
+This is a binding layout change, not an MLS/wire-format change.
+
+Custom events retain their numeric `kind` and verbatim `plaintext` content. Conversation windows
+now also carry their ordered `tags`, so clients can render app-defined event types without fetching
+raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows. MDK-owned kinds continue
+to use prepared fields and references there. Custom-event tag changes invalidate the conversion
+cache. This does not change custom-event chat-list activity or notification policy.
 
 ## Group-system previews
 
@@ -92,8 +280,26 @@ superseded `eventIdHex` and its `sourceRelays` to the existing delete API.
 This does not change the Published-list filter (`relay == true`) and does not
 replace Android history UI work.
 
-Regenerate Swift/Kotlin bindings after pulling this surface. Android
-mention/QR/edit-profile migration remains
+`localAccountKeyPackages` is the local-first inventory: render it immediately.
+It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
+UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
+replace the displayed snapshot with its result. On refresh failure or
+cancellation, keep the local result. Both return
+`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
+`AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
+authoritative display distinctions; empty event IDs and `publishedAt` are not
+publication proof. A retained package stays `RetainedPrivateMaterial` even when
+that exact event is observed; `record.relay` becomes true while `localState`
+remains retained. Empty bootstrap relays remain network-enabled. After a
+mutation, re-read the local inventory instead of applying an out-of-order
+refresh.
+
+Regenerate Swift/Kotlin bindings after pulling this surface. Hosts must use a
+matching library: the new methods and enum are additive, but older generated
+sources cannot call them. Android device rendering remains a separate consumer
+adoption issue.
+
+Android mention/QR/edit-profile migration remains
 [whitenoise-android#1584](https://github.com/marmot-protocol/whitenoise-android/issues/1584);
 MDK completion enables that follow-through but does not replace it.
 
@@ -135,7 +341,9 @@ Swift error `MarmotKitError.RuntimeBusy`. An NSE should take its bounded
 fallback path, while a foreground app can retry after the current owner exits.
 Calling `shutdown()` stops runtime work but intentionally does not release the
 lease while the `Marmot` object or one of its runtime handles is still alive.
-Release the final object reference before constructing a replacement.
+Await `shutdownAndClose()` before suspension or root handoff; it terminally closes
+storage and releases the lease without waiting for every host reference to disappear.
+Reconstruct the runtime and its handles for the next foreground session.
 
 ## Service Endpoint Defaults
 
@@ -458,7 +666,8 @@ with their own localization and load the selected avatar descriptor without a ro
 
 First use can await bounded local preparation. `ChatPresentationNotReady` means preparation did not advance and may be
 retried after maintenance; it is not an empty list or missing group. Storage errors remain errors. Ready reads do no
-network fetching or repair writes. Selected values survive offline reopen; avatar bytes still use the existing loaders.
+network fetching or repair writes. Selected values survive offline reopen; visible avatar bytes should use
+`requestAvatarAssets` / `readAvatarAssets` as described below.
 
 Order updates by the handle's generation and sequence. `presentationVersion` only versions selected presentation:
 an unread, pin, archive or mute update can have the same presentation revision. Drop the old handle when changing
@@ -511,3 +720,98 @@ completes. `clearAvatarCache` clears durable bytes and demand; later visible req
 Use matching regenerated Swift/Kotlin and native libraries. Keep host persistent caches until migration and device
 validation are complete. See [the avatar contract](../../docs/marmot-architecture/further-context/avatar-cache-storage.md)
 for source/account fencing, result states and lifecycle rules.
+
+## Bounded attachment history
+
+Use the asynchronous attachment history page/version methods for canonical media-library
+discovery. See [the C8-B native handoff](ATTACHMENT-HISTORY.md) for filtering, refresh,
+removal and cursor ownership. `list_media` remains a compatibility API.
+
+## KeyPackage client preference and publication label
+
+Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
+then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
+substring). These are advisory labels, never proof of a particular application.
+Only valid packages compatible with the proposed/existing group qualify. Within a
+tier, the existing recency order applies. Amethyst remains selectable when no
+higher-priority compatible package is available. A replacement in a publication
+slot supersedes the old package before ranking; one package per account is selected.
+This temporary selection policy applies to all hosts of this runtime; only the
+publication label is host-configurable. Compatibility alone cannot identify a
+client that publishes usable packages but does not process Welcomes.
+
+Client ranking and slot supersession also apply to directory lookup (including
+`wn-cli key-package`) and composition prewarm, without target-group requirements. A
+malformed current publication never revives an older package in the same slot.
+If no usable slot remains, prewarm reports failure while retaining successfully
+discovered routes for other members. Its success must not imply readiness based
+on superseded material. Bounded batch results are not exhaustive, so rejected
+candidates still permit a per-account fallback fetch. A lower-priority batch
+winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
+batch limit, even if it returned fewer records than requested: relays may impose
+lower caps. Already observed replacements remain authoritative during the refetch.
+This adds a per-author request for each lower-priority batch winner. A White Noise
+winner already has the highest tier in a newest-first prefix, so it skips that
+request. Both paths remain bounded discovery: neither guarantees completeness
+when a relay omits newer events instead of returning a newest-first prefix.
+If that supplementary fetch fails, a still-valid, compatible package from the
+current batch remains usable; previously cached packages are never substituted.
+Prewarm skips preference-only refetches because it only checks existence.
+Prewarm checks discovery readiness only; it has no proposed group configuration
+and does not guarantee capability compatibility. Final creation/invitation checks
+the actual group's requirements. Device-aware delivery in
+[MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
+replacement for this temporary client ranking.
+
+`MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, and
+`secretStore` in `Marmot.newWithConfiguration`. Each field is optional in generated
+Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
+an omitted label stays untagged and omitted storage uses the platform keychain.
+Existing constructors keep their signatures and delegate to this same configuration
+path. Use the options constructor when combining a label with a custom relay policy.
+C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
+struct; zero initialization selects the same defaults. Use the matching header
+and library for that struct's layout.
+
+```swift
+let options = MarmotOptions(clientName: "whitenoise")
+let marmot = try Marmot.newWithConfiguration(
+    rootPath: rootPath, relayUrls: relayUrls, options: options
+)
+```
+
+Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swift`
+and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
+./crates/marmot-uniffi/options-smoke.sh kotlin`.
+
+Host applications opt into public tagging at construction. Existing constructors
+remain untagged. Swift hosts can use:
+
+```swift
+let marmot = try Marmot.newWithClientName(
+    rootPath: rootPath,
+    relayUrls: relayUrls,
+    clientName: "whitenoise",
+    cursorPersistence: .advance,
+    secretStore: nil
+)
+```
+
+Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
+`marmot_client_new_with_client_name`. Rust hosts set
+`MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
+Supply the name on every host runtime construction, including background and
+notification-extension entry points (which retain their frozen cursor policy).
+Absent or whitespace-only names omit the tag. New initial publications and normal
+rotations carry the configured label. Existing events are not republished, and
+already-signed pending publications retry with their original tags even if the
+configuration changes. No workspace/binding version bump is part of this change.
+
+## Local attachment access
+
+Use `attachmentLocalAssets` to locate verified retained bytes for visible source
+slots, then `readAttachmentAsset` for bounded local chunks without network work.
+See [the native attachment handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
+source revalidation, host buffer ownership and integration guidance. Acquisition
+now defaults on with bounded per-account policy. Native progress snapshots/subscriptions
+and durable cancellation, retry, remove and download-again controls use the same source slots.
