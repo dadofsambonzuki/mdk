@@ -220,6 +220,77 @@ def macho64_mh_object_text_and_llvm(
     return header + command + native + bitcode
 
 
+def macho64_mh_object_midfile_llvm_with_version_min(
+    little: bool,
+    leading: bytes,
+    bitcode: bytes,
+    trailing: bytes,
+    extra_cmd: bytes | None = None,
+) -> bytes:
+    """MH_OBJECT with mid-file __LLVM,__bitcode plus LC_VERSION_MIN_IPHONEOS."""
+    header_size = 32
+    nsects = 3
+    segment_cmdsize = 72 + 80 * nsects
+    version_cmdsize = 16
+    extra = extra_cmd or b""
+    sizeofcmds = segment_cmdsize + version_cmdsize + len(extra)
+    ncmds = 2 + (1 if extra else 0)
+    lead_off = header_size + sizeofcmds
+    bitcode_off = lead_off + len(leading)
+    trail_off = bitcode_off + len(bitcode)
+    total = trail_off + len(trailing)
+
+    def section(sectname: bytes, segname: bytes, addr: int, size: int, offset: int) -> bytes:
+        return (
+            sectname.ljust(16, b"\0")
+            + segname.ljust(16, b"\0")
+            + _pack("Q", addr, little=little)
+            + _pack("Q", size, little=little)
+            + _pack("I", offset, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+        )
+
+    header = (
+        _pack("I", 0xFEEDFACF, little=little)
+        + _pack("i", 0x0100000C, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", ncmds, little=little)
+        + _pack("I", sizeofcmds, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    segment = (
+        _pack("I", 0x19, little=little)
+        + _pack("I", segment_cmdsize, little=little)
+        + b"__TEXT".ljust(16, b"\0")
+        + _pack("Q", 0, little=little)
+        + _pack("Q", total, little=little)
+        + _pack("Q", 0, little=little)
+        + _pack("Q", total, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("I", nsects, little=little)
+        + _pack("I", 0, little=little)
+        + section(b"__text", b"__TEXT", 0, len(leading), lead_off)
+        + section(b"__bitcode", b"__LLVM", len(leading), len(bitcode), bitcode_off)
+        + section(b"__const", b"__TEXT", len(leading) + len(bitcode), len(trailing), trail_off)
+    )
+    version = (
+        _pack("I", 0x25, little=little)
+        + _pack("I", version_cmdsize, little=little)
+        + _pack("I", 0x00120000, little=little)
+        + _pack("I", 0x00120000, little=little)
+    )
+    return header + segment + version + extra + leading + bitcode + trailing
+
+
 def macho32(little: bool, segname: bytes) -> bytes:
     header = (
         _pack("I", 0xFEEDFACE, little=little)
@@ -491,6 +562,65 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertFalse(
             archive.member_has_bitcode(list(archive.iter_ar_members(bundle_path.read_bytes()))[0][2])
         )
+
+    def test_sanitize_preserves_version_min_after_midfile_bitcode_removal(self):
+        leading = b"LEADINGOBJ"
+        bitcode = b"\x22" * 0xE80
+        trailing = b"TRAILINGOBJ"
+        uuid = (
+            struct.pack("<I", 0x1B)
+            + struct.pack("<I", 24)
+            + bytes(range(16))
+        )
+        member = macho64_mh_object_midfile_llvm_with_version_min(
+            True, leading, bitcode, trailing, extra_cmd=uuid
+        )
+        path = self.root / "midfile-version-min.a"
+        archive.write_archive(
+            path,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    member,
+                )
+            ],
+        )
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+        count = archive.sanitize_archive(path)
+        self.assertEqual(count, 1)
+        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
+        self.assertFalse(archive.member_has_bitcode(stripped))
+        self.assertIn(leading, stripped)
+        self.assertIn(trailing, stripped)
+        self.assertNotIn(bitcode, stripped)
+        self.assertIn(struct.pack("<I", 0x25), stripped)
+        self.assertIn(bytes(range(16)), stripped)
+        self.assertLess(len(stripped), len(member))
+
+    def test_sanitize_still_rejects_unknown_midfile_load_command(self):
+        unknown = struct.pack("<I", 0x99) + struct.pack("<I", 8)
+        member = macho64_mh_object_midfile_llvm_with_version_min(
+            True, b"LEADINGOBJ", b"\x33" * 0x80, b"TRAILINGOBJ", extra_cmd=unknown
+        )
+        path = self.root / "unknown-midfile.a"
+        archive.write_archive(path, [("obj.o", member)])
+        with self.assertRaisesRegex(archive.ArchiveError, "unknown Mach-O load command 0x99"):
+            archive.sanitize_archive(path)
+
+    def test_bsd_long_name_length_uses_archive_error(self):
+        header = (
+            b"#1/xx".ljust(16)
+            + b"0".ljust(12)
+            + b"0".ljust(6)
+            + b"0".ljust(6)
+            + b"644".ljust(8)
+            + b"4".rjust(10)
+            + b"`\n"
+            + b"name"
+        )
+        with self.assertRaisesRegex(archive.ArchiveError, "invalid BSD long name length"):
+            list(archive.iter_ar_members(b"!<arch>\n" + header))
 
     def test_sanitize_does_not_whitelist_raw_bitcode_members(self):
         path = self.root / "raw-bitcode.a"

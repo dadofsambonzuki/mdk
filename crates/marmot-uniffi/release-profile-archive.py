@@ -13,7 +13,9 @@ data. Relocatable MH_OBJECT members often keep those sections inside a
 parent `__TEXT` load command, with `segname __LLVM` on the section
 itself. `--sanitize` removes those Mach-O segments and section-level
 `__LLVM` / `__bitcode` leftovers from every member without skipping
-names. Raw LLVM bitcode members still fail closed.
+names. Offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`
+are left unchanged when leftover bitcode is removed from the middle
+of a member. Raw LLVM bitcode members still fail closed.
 """
 
 from __future__ import annotations
@@ -49,20 +51,28 @@ LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
 LC_DYSYMTAB = 0x0B
+LC_UUID = 0x1B
+LC_CODE_SIGNATURE = 0x1D
+LC_SEGMENT_SPLIT_INFO = 0x1E
+LC_ENCRYPTION_INFO = 0x21
 LC_DYLD_INFO = 0x22
 LC_DYLD_INFO_ONLY = 0x80000022
-LC_CODE_SIGNATURE = 0x1D
-LC_SEGMENT_SPLIT_INFO = 0x1B
+LC_VERSION_MIN_MACOSX = 0x24
+LC_VERSION_MIN_IPHONEOS = 0x25
 LC_FUNCTION_STARTS = 0x26
 LC_DATA_IN_CODE = 0x29
+LC_SOURCE_VERSION = 0x2A
 LC_DYLIB_CODE_SIGN_DRS = 0x2B
+LC_ENCRYPTION_INFO_64 = 0x2C
+LC_LINKER_OPTION = 0x2D
 LC_LINKER_OPTIMIZATION_HINT = 0x2E
+LC_VERSION_MIN_TVOS = 0x2F
+LC_VERSION_MIN_WATCHOS = 0x30
+LC_NOTE = 0x31
+LC_BUILD_VERSION = 0x32
 LC_DYLD_EXPORTS_TRIE = 0x33
 LC_DYLD_CHAINED_FIXUPS = 0x34
 LC_ATOM_INFO = 0x36
-LC_NOTE = 0x31
-LC_ENCRYPTION_INFO = 0x21
-LC_ENCRYPTION_INFO_64 = 0x2C
 EMBED_BITCODE_RUSTFLAG = "-C embed-bitcode=no"
 LINKEDIT_DATA_COMMANDS = {
     LC_CODE_SIGNATURE,
@@ -74,6 +84,18 @@ LINKEDIT_DATA_COMMANDS = {
     LC_DYLD_EXPORTS_TRIE,
     LC_DYLD_CHAINED_FIXUPS,
     LC_ATOM_INFO,
+}
+# These commands carry no file offsets, so mid-file bitcode removal must
+# keep their payloads intact. 0x25 is LC_VERSION_MIN_IPHONEOS.
+OFFSET_FREE_COMMANDS = {
+    LC_UUID,
+    LC_VERSION_MIN_MACOSX,
+    LC_VERSION_MIN_IPHONEOS,
+    LC_SOURCE_VERSION,
+    LC_LINKER_OPTION,
+    LC_VERSION_MIN_TVOS,
+    LC_VERSION_MIN_WATCHOS,
+    LC_BUILD_VERSION,
 }
 
 
@@ -112,7 +134,10 @@ def iter_ar_members(data: bytes):
         size = int(size_field)
         offset += 60
         if name.startswith("#1/"):
-            name_len = int(name[3:])
+            try:
+                name_len = int(name[3:])
+            except ValueError as error:
+                raise ArchiveError(f"invalid BSD long name length for {name}") from error
             if offset + size > len(data) or name_len > size:
                 raise ArchiveError(f"truncated BSD long name for {name}")
             raw_name = data[offset : offset + name_len]
@@ -362,6 +387,8 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
     if cmd == LC_NOTE:
         _patch_u64(patched, 24, little, _adjust_offset(_u64(raw, 24, little), removed, "note"))
         return bytes(patched)
+    if cmd in OFFSET_FREE_COMMANDS:
+        return raw
     if removed:
         raise ArchiveError(f"unknown Mach-O load command {cmd:#x} after mid-file bitcode removal")
     return raw

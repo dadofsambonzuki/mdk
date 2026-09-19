@@ -26,11 +26,15 @@ from every member without skipping names. Exact-head macOS CI on
 `2c1fd5b97bd16c9577e18a795564579c2902f909` then failed sanitization because
 relocatable `compiler_builtins` members keep `__LLVM,__bitcode` as a section
 inside a parent `__TEXT` load command. The sanitizer now removes those
-section-level leftovers; it still does not whitelist members. This revision
-only merges origin/master `9c342fa4ccf3193408e5ceedf41f5a1973a00115` (0.10.3);
-profile-affecting MarmotKit sources and these dated bytes are unchanged. Fresh
-exact-head CI is required after publication; these dated numbers describe the
-pre-fix candidate.
+section-level leftovers; it still does not whitelist members. Exact-head macOS
+CI on `e9fb5a8f577d2c6352d12eebf76111afbe8d6e01` then failed sanitization with
+`unknown Mach-O load command 0x25 after mid-file bitcode removal`
+(`LC_VERSION_MIN_IPHONEOS`). The sanitizer now keeps those offset-free
+commands intact. This revision also merges origin/master
+`7d8bba365def75a66774f2b2036f839411010001`. Profile-affecting MarmotKit
+sources and these dated bytes are unchanged except for that sanitizer repair.
+Fresh exact-head CI is required after publication; these dated numbers
+describe the pre-fix candidate.
 
 | Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |

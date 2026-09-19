@@ -32,7 +32,8 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
   `-C embed-bitcode=no` (iOS rustc defaults to embedding bitcode). After cargo writes each `.a`,
   `release-profile-archive.py --sanitize` removes leftover `__LLVM` / `__bitcode` segments and
   MH_OBJECT section-level `__LLVM` leftovers from every member, including toolchain
-  `compiler_builtins` objects; it does not skip names or accept raw LLVM bitcode. This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none` and
+  `compiler_builtins` objects; it does not skip names or accept raw LLVM bitcode. Mid-file
+  leftover removal keeps offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`. This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none` and
   `debug=0`, and the packagers publish that profile as provenance. Package the sanitized native
   archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
   from the packaged source's `apple-privacy/` and publish it separately with a checksum; also include it in the

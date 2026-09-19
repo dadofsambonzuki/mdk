@@ -20,7 +20,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments and
   MH_OBJECT section-level leftovers from every archive member (including toolchain
   `compiler_builtins` objects) without skipping names or weakening the native-archive
-  validator. This is not a symbol strip.
+  validator. Mid-file leftover removal keeps offset-free load commands such as
+  `LC_VERSION_MIN_IPHONEOS` intact. This is not a symbol strip.
 
 ### Changed
 
@@ -43,6 +44,9 @@ Update generated bindings, native libraries, and C headers together for the chan
   a private diagnostics socket.
 
 ### Fixed
+
+- C client teardown on ordinary host threads drains runtime workers before returning,
+  preventing a SQLCipher process-exit race after publisher shutdown.
 
 - Public profile searches continue when relays request optional authentication.
 - Android identity salt publication uses a locked, no-replace path compatible with API 26; concurrent creators retain one canonical salt.
