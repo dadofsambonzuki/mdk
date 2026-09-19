@@ -8,9 +8,12 @@ are rejected as well.
 
 Apple Cargo invocations must pass `-C embed-bitcode=no` because rustc
 defaults to embedding bitcode on Apple targets. The toolchain's
-compiler_builtins objects can still retain a leftover `__LLVM,__bitcode`
-section; `--sanitize` removes those Mach-O segments from every member
-without skipping names. Raw LLVM bitcode members still fail closed.
+compiler_builtins objects can still retain leftover `__LLVM,__bitcode`
+data. Relocatable MH_OBJECT members often keep those sections inside a
+parent `__TEXT` load command, with `segname __LLVM` on the section
+itself. `--sanitize` removes those Mach-O segments and section-level
+`__LLVM` / `__bitcode` leftovers from every member without skipping
+names. Raw LLVM bitcode members still fail closed.
 """
 
 from __future__ import annotations
@@ -72,6 +75,19 @@ LINKEDIT_DATA_COMMANDS = {
     LC_DYLD_CHAINED_FIXUPS,
     LC_ATOM_INFO,
 }
+
+
+def _cname(raw: bytes) -> bytes:
+    return raw.split(b"\0", 1)[0]
+
+
+def _section_is_llvm_bitcode(sectname: bytes, section_segname: bytes) -> bool:
+    """True for leftover Apple bitcode, including MH_OBJECT section fields."""
+    return sectname == b"__bitcode" or section_segname == b"__LLVM"
+
+
+def _range_overlap(start: int, end: int, other_start: int, other_end: int) -> int:
+    return max(0, min(end, other_end) - max(start, other_start))
 
 
 class ArchiveError(ValueError):
@@ -157,7 +173,8 @@ def macho_has_llvm_bitcode(content: bytes) -> bool:
                     if sect + 32 > offset + cmdsize:
                         break
                     sectname = content[sect : sect + 16].split(b"\0", 1)[0]
-                    if sectname == b"__bitcode":
+                    section_segname = content[sect + 16 : sect + 32].split(b"\0", 1)[0]
+                    if _section_is_llvm_bitcode(sectname, section_segname):
                         return True
                     sect += section_size
         offset += cmdsize
@@ -265,13 +282,30 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
         filesize_at = 48 if is_64 else 36
         if is_64:
             fileoff = _u64(raw, fileoff_at, little)
-            _patch_u64(patched, fileoff_at, little, _adjust_offset(fileoff, removed, "segment"))
+            filesize = _u64(raw, filesize_at, little)
+            new_off = fileoff
+            if fileoff or filesize:
+                new_off = _adjust_offset(fileoff, removed, "segment")
+            overlap = sum(
+                _range_overlap(fileoff, fileoff + filesize, start, start + size)
+                for start, size in removed
+                if size > 0
+            )
+            _patch_u64(patched, fileoff_at, little, new_off)
+            _patch_u64(patched, filesize_at, little, max(0, filesize - overlap))
         else:
             fileoff = _u32(raw, fileoff_at, little)
-            _patch_u32(patched, fileoff_at, little, _adjust_offset(fileoff, removed, "segment"))
             filesize = _u32(raw, filesize_at, little)
-            if filesize:
-                _ = filesize
+            new_off = fileoff
+            if fileoff or filesize:
+                new_off = _adjust_offset(fileoff, removed, "segment")
+            overlap = sum(
+                _range_overlap(fileoff, fileoff + filesize, start, start + size)
+                for start, size in removed
+                if size > 0
+            )
+            _patch_u32(patched, fileoff_at, little, new_off)
+            _patch_u32(patched, filesize_at, little, max(0, filesize - overlap))
         section_size = 80 if is_64 else 68
         nsects_off = 64 if is_64 else 48
         nsects = _u32(raw, nsects_off, little)
@@ -333,6 +367,75 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
     return raw
 
 
+def _section_file_range(
+    raw: bytes, sect: int, is_64: bool, little: bool
+) -> list[tuple[int, int]]:
+    if is_64:
+        size = _u64(raw, sect + 40, little)
+        fileoff = _u32(raw, sect + 48, little)
+        reloff = _u32(raw, sect + 56, little)
+        nreloc = _u32(raw, sect + 60, little)
+    else:
+        size = _u32(raw, sect + 36, little)
+        fileoff = _u32(raw, sect + 40, little)
+        reloff = _u32(raw, sect + 48, little)
+        nreloc = _u32(raw, sect + 52, little)
+    ranges = []
+    if size and fileoff > 0:
+        ranges.append((fileoff, size))
+    if nreloc and reloff > 0:
+        ranges.append((reloff, nreloc * 8))
+    return ranges
+
+
+def _strip_segment_command(
+    raw: bytes, cmd: int, little: bool
+) -> tuple[bytes | None, list[tuple[int, int]]]:
+    """Drop leftover LLVM bitcode from one segment command.
+
+    MH_OBJECT files keep `__LLVM,__bitcode` as sections inside a parent
+    `__TEXT` load command. Those section-level leftovers are removed here
+    instead of failing closed or skipping the member.
+    """
+    is_64 = cmd == LC_SEGMENT_64
+    segname = _cname(raw[8:24])
+    section_size = 80 if is_64 else 68
+    nsects_off = 64 if is_64 else 48
+    nsects = _u32(raw, nsects_off, little) if nsects_off + 4 <= len(raw) else 0
+    header_len = 72 if is_64 else 56
+    sect = header_len
+    native: list[bytes] = []
+    removed: list[tuple[int, int]] = []
+    for _ in range(nsects):
+        if sect + 32 > len(raw):
+            raise ArchiveError("truncated Mach-O section while removing bitcode")
+        sectname = _cname(raw[sect : sect + 16])
+        section_segname = _cname(raw[sect + 16 : sect + 32])
+        if _section_is_llvm_bitcode(sectname, section_segname) or segname == b"__LLVM":
+            removed.extend(_section_file_range(raw, sect, is_64, little))
+        else:
+            native.append(raw[sect : sect + section_size])
+        sect += section_size
+    if not native:
+        if nsects == 0 and segname == b"__LLVM":
+            if is_64:
+                fileoff = _u64(raw, 40, little)
+                filesize = _u64(raw, 48, little)
+            else:
+                fileoff = _u32(raw, 32, little)
+                filesize = _u32(raw, 36, little)
+            if filesize and fileoff > 0:
+                removed.append((fileoff, filesize))
+        return None, removed
+    new_cmdsize = header_len + section_size * len(native)
+    rebuilt = bytearray(raw[:header_len])
+    rebuilt[4:8] = _pack32(new_cmdsize, little)
+    _patch_u32(rebuilt, nsects_off, little, len(native))
+    for section in native:
+        rebuilt.extend(section)
+    return bytes(rebuilt), removed
+
+
 def _strip_thin_macho(content: bytes) -> bytes:
     magic_le = struct.unpack_from("<I", content, 0)[0]
     little = magic_le in LITTLE_ENDIAN_ON_LE_DECODE
@@ -357,31 +460,14 @@ def _strip_thin_macho(content: bytes) -> bytes:
             raise ArchiveError("invalid Mach-O load command size")
         raw = content[offset : offset + cmdsize]
         if cmd in {LC_SEGMENT, LC_SEGMENT_64}:
-            segname = raw[8:24].split(b"\0", 1)[0]
-            section_size = 80 if cmd == LC_SEGMENT_64 else 68
-            nsects_off = 64 if cmd == LC_SEGMENT_64 else 48
-            nsects = _u32(raw, nsects_off, little) if nsects_off + 4 <= len(raw) else 0
-            sect = 72 if cmd == LC_SEGMENT_64 else 56
-            if segname == b"__LLVM":
-                if cmd == LC_SEGMENT_64:
-                    fileoff = _u64(raw, 40, little)
-                    filesize = _u64(raw, 48, little)
-                else:
-                    fileoff = _u32(raw, 32, little)
-                    filesize = _u32(raw, 36, little)
-                if filesize:
-                    removed_ranges.append((fileoff, filesize))
+            rebuilt, extra_removed = _strip_segment_command(raw, cmd, little)
+            removed_ranges.extend(extra_removed)
+            if rebuilt is None:
                 offset += cmdsize
                 continue
-            for _ in range(nsects):
-                if sect + 16 > len(raw):
-                    break
-                sectname = raw[sect : sect + 16].split(b"\0", 1)[0]
-                if sectname == b"__bitcode":
-                    raise ArchiveError(
-                        "embedded __bitcode section outside __LLVM cannot be sanitized"
-                    )
-                sect += section_size
+            kept.append(rebuilt)
+            offset += cmdsize
+            continue
         kept.append(raw)
         offset += cmdsize
     new_cmds = b"".join(kept)
@@ -518,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sanitize",
         action="store_true",
-        help="Remove leftover Mach-O __LLVM bitcode segments from every member",
+        help="Remove leftover Mach-O __LLVM / __bitcode segments and MH_OBJECT sections",
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     os.umask(0o077)

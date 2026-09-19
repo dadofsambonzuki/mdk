@@ -162,6 +162,64 @@ def macho64_trailing_llvm(little: bool, payload: bytes) -> bytes:
     return header + segment(b"__TEXT", 0, 0) + segment(b"__LLVM", fileoff, len(payload)) + payload
 
 
+def macho64_mh_object_text_and_llvm(
+    little: bool,
+    native: bytes,
+    bitcode: bytes,
+    llvm_sectname: bytes = b"__bitcode",
+) -> bytes:
+    """MH_OBJECT with __TEXT,__text and a section-level __LLVM leftover."""
+    header_size = 32
+    nsects = 2
+    cmdsize = 72 + 80 * nsects
+    text_off = header_size + cmdsize
+    bitcode_off = text_off + len(native)
+    total = bitcode_off + len(bitcode)
+
+    def section(sectname: bytes, segname: bytes, addr: int, size: int, offset: int) -> bytes:
+        return (
+            sectname.ljust(16, b"\0")
+            + segname.ljust(16, b"\0")
+            + _pack("Q", addr, little=little)
+            + _pack("Q", size, little=little)
+            + _pack("I", offset, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+        )
+
+    header = (
+        _pack("I", 0xFEEDFACF, little=little)
+        + _pack("i", 0x0100000C, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", cmdsize, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    command = (
+        _pack("I", 0x19, little=little)
+        + _pack("I", cmdsize, little=little)
+        + b"__TEXT".ljust(16, b"\0")
+        + _pack("Q", 0, little=little)
+        + _pack("Q", total, little=little)
+        + _pack("Q", 0, little=little)
+        + _pack("Q", total, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("I", nsects, little=little)
+        + _pack("I", 0, little=little)
+        + section(b"__text", b"__TEXT", 0, len(native), text_off)
+        + section(llvm_sectname, b"__LLVM", len(native), len(bitcode), bitcode_off)
+    )
+    return header + command + native + bitcode
+
+
 def macho32(little: bool, segname: bytes) -> bytes:
     header = (
         _pack("I", 0xFEEDFACE, little=little)
@@ -333,12 +391,16 @@ class ReleaseProfileTests(unittest.TestCase):
                 native = macho64(little, b"__TEXT")
                 llvm = macho64(little, b"__LLVM")
                 bitcode_section = macho64(little, b"__TEXT", sectname=b"__bitcode")
+                llvm_bundle = macho64_mh_object_text_and_llvm(
+                    little, b"TEXT", b"B" * 0x80, llvm_sectname=b"__bundle"
+                )
                 native32 = macho32(little, b"__TEXT")
                 llvm32 = macho32(little, b"__LLVM")
                 self.assertFalse(archive.member_has_bitcode(native))
                 self.assertFalse(archive.member_has_bitcode(native32))
                 self.assertTrue(archive.member_has_bitcode(llvm))
                 self.assertTrue(archive.member_has_bitcode(bitcode_section))
+                self.assertTrue(archive.member_has_bitcode(llvm_bundle))
                 self.assertTrue(archive.member_has_bitcode(llvm32))
                 accepted = self.root / f"native-{'le' if little else 'be'}.a"
                 rejected = self.root / f"llvm-{'le' if little else 'be'}.a"
@@ -389,6 +451,46 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertEqual(len(members), 1)
         self.assertFalse(archive.member_has_bitcode(members[0][2]))
         self.assertLess(len(members[0][2]), 0xE80)
+
+    def test_sanitize_removes_mh_object_section_level_llvm_bitcode(self):
+        native = b"NATIVEOBJ"
+        bitcode = b"\x11" * 0xE80
+        member = macho64_mh_object_text_and_llvm(True, native, bitcode)
+        path = self.root / "compiler-builtins-mh-object.a"
+        archive.write_archive(
+            path,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    member,
+                )
+            ],
+        )
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+        count = archive.sanitize_archive(path)
+        self.assertEqual(count, 1)
+        names = [name for _, name, content in archive.iter_ar_members(path.read_bytes())]
+        self.assertTrue(any(name.startswith("compiler_builtins-") for name in names), names)
+        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
+        self.assertFalse(archive.member_has_bitcode(stripped))
+        self.assertIn(native, stripped)
+        self.assertNotIn(bitcode, stripped)
+        self.assertLess(len(stripped), len(member))
+        text_only = macho64(True, b"__TEXT", sectname=b"__bitcode")
+        text_path = self.root / "text-bitcode-section.a"
+        archive.write_archive(text_path, [("obj.o", text_only)])
+        archive.sanitize_archive(text_path)
+        self.assertFalse(
+            archive.member_has_bitcode(list(archive.iter_ar_members(text_path.read_bytes()))[0][2])
+        )
+        bundle = macho64_mh_object_text_and_llvm(True, native, bitcode, llvm_sectname=b"__bundle")
+        bundle_path = self.root / "llvm-bundle.a"
+        archive.write_archive(bundle_path, [("obj.o", bundle)])
+        archive.sanitize_archive(bundle_path)
+        self.assertFalse(
+            archive.member_has_bitcode(list(archive.iter_ar_members(bundle_path.read_bytes()))[0][2])
+        )
 
     def test_sanitize_does_not_whitelist_raw_bitcode_members(self):
         path = self.root / "raw-bitcode.a"

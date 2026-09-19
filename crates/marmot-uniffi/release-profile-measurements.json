@@ -457,7 +457,7 @@
     "cpu_local": "dated exact-head Linux CI create_group rows; candidate faster on every collected row, no >5% slowdown",
     "linux_ci_on_f469eb912664fc274734bcbe150eaefe97e72949": "Linux Android and host profile measurements succeeded; Android primary ARM ABIs shrank 19-22 percent; report sha256 e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c",
     "macos_ci_on_f469eb912664fc274734bcbe150eaefe97e72949": "Apple slices measured (+85 percent archive growth) then Validate Apple archives failed on compiler_builtins __LLVM,__bitcode; report sha256 16a485692a20cf406f0aba644666cadd457e9cb996c083df3ef27df984b616e8",
-    "apple_growth_investigation": "Growth matches Apple rustc default embed-bitcode=yes (native+bitcode) plus a leftover 0xe80 __LLVM,__bitcode section in the Rust 1.97.1 iOS compiler_builtins rlib. This revision disables embed-bitcode on Apple Cargo invocations and sanitizes leftover Mach-O bitcode sections without whitelisting members. Fresh exact-head CI is required after publication."
+    "apple_growth_investigation": "Growth matches Apple rustc default embed-bitcode=yes (native+bitcode) plus a leftover 0xe80 __LLVM,__bitcode section in the Rust 1.97.1 iOS compiler_builtins rlib. Exact-head macOS CI on 2c1fd5b97bd16c9577e18a795564579c2902f909 then failed sanitization because those leftovers live as MH_OBJECT section fields inside a parent __TEXT load command. This revision disables embed-bitcode on Apple Cargo invocations and sanitizes leftover Mach-O bitcode segments and section-level __LLVM leftovers without whitelisting members. Fresh exact-head CI is required after publication."
   },
   "schema_version": 1,
   "source_sha": "f469eb912664fc274734bcbe150eaefe97e72949",

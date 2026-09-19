@@ -24,9 +24,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   members are rejected without otool, and the non-publishing profile workflow uploads logs, raw
   Criterion data, and toolchain versions even when a later step fails.
 - MarmotKit Apple archives no longer ship leftover LLVM bitcode. Apple Cargo invocations pass
-  `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments from every
-  archive member (including toolchain `compiler_builtins` objects) without skipping names or
-  weakening the native-archive validator. This is not a symbol strip.
+  `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments and
+  MH_OBJECT section-level leftovers from every archive member (including toolchain
+  `compiler_builtins` objects) without skipping names or weakening the native-archive
+  validator. This is not a symbol strip.
 - Hermes doctor distinguishes failed, stopped, and automatically restarting systemd units, keeps socket-check ownership stable,
   and removes the always-ready media check and inline-token command-line option. Diagnostic replay and
   KeyPackage states are typed, and replay no longer exposes overlapping failure/error counters.

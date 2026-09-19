@@ -22,8 +22,13 @@ thin-LTO members carried native code plus LLVM bitcode, and the matching Rust
 section of size `0xe80`. macOS job `105104464502` then failed Validate Apple
 archives on `compiler_builtins-*.rcgu.o`. This revision disables embed-bitcode
 on Apple Cargo invocations and sanitizes leftover Mach-O bitcode sections
-from every member without skipping names. Fresh exact-head CI is required
-after publication; these dated numbers describe the pre-fix candidate.
+from every member without skipping names. Exact-head macOS CI on
+`2c1fd5b97bd16c9577e18a795564579c2902f909` then failed sanitization because
+relocatable `compiler_builtins` members keep `__LLVM,__bitcode` as a section
+inside a parent `__TEXT` load command. The sanitizer now removes those
+section-level leftovers; it still does not whitelist members. Fresh exact-head
+CI is required after publication; these dated numbers describe the pre-fix
+candidate.
 
 | Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
