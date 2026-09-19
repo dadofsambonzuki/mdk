@@ -127,6 +127,41 @@ def macho64(little: bool, segname: bytes, sectname: bytes | None = None) -> byte
     return header + command
 
 
+def macho64_trailing_llvm(little: bool, payload: bytes) -> bytes:
+    """64-bit Mach-O with empty __TEXT plus a trailing __LLVM bitcode payload."""
+    cmdsize = 72
+    header_size = 32
+    sizeofcmds = cmdsize * 2
+    fileoff = header_size + sizeofcmds
+
+    def segment(name: bytes, off: int, size: int) -> bytes:
+        return (
+            _pack("I", 0x19, little=little)
+            + _pack("I", cmdsize, little=little)
+            + name.ljust(16, b"\0")
+            + _pack("Q", 0, little=little)
+            + _pack("Q", size, little=little)
+            + _pack("Q", off, little=little)
+            + _pack("Q", size, little=little)
+            + _pack("i", 0, little=little)
+            + _pack("i", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+        )
+
+    header = (
+        _pack("I", 0xFEEDFACF, little=little)
+        + _pack("i", 0x0100000C, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", 2, little=little)
+        + _pack("I", sizeofcmds, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    return header + segment(b"__TEXT", 0, 0) + segment(b"__LLVM", fileoff, len(payload)) + payload
+
+
 def macho32(little: bool, segname: bytes) -> bytes:
     header = (
         _pack("I", 0xFEEDFACE, little=little)
@@ -223,6 +258,10 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn("host dylib must keep its symbol table", kotlin)
         apple = (HERE / "xcframework.sh").read_text() + (HERE / "xcframework-macos.sh").read_text()
         self.assertNotIn("CARGO_PROFILE_RELEASE_STRIP=symbols", apple)
+        self.assertIn("embed-bitcode=no", apple)
+        self.assertIn("release-profile-archive.py\" --sanitize", apple)
+        self.assertNotIn("whitelist", apple.lower())
+        self.assertIn("Do not skip", apple)
 
     def test_serializers_type_false_and_thin_lto(self):
         env = env_file_values(HERE / "marmotkit-release-profile.env")
@@ -308,6 +347,72 @@ class ReleaseProfileTests(unittest.TestCase):
                 self.assertGreater(archive.check_archive(accepted), 0)
                 with self.assertRaises(archive.ArchiveError):
                     archive.check_archive(rejected)
+
+    def test_sanitize_removes_llvm_from_compiler_builtins_named_member(self):
+        native = macho64(True, b"__TEXT")
+        llvm = macho64(True, b"__LLVM")
+        path = self.root / "libmarmot_uniffi.a"
+        archive.write_archive(
+            path,
+            [
+                ("obj.o", native),
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    llvm,
+                ),
+            ],
+        )
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+        count = archive.sanitize_archive(path)
+        self.assertEqual(count, 2)
+        self.assertGreater(archive.check_archive(path), 0)
+        names = [name for _, name, _ in archive.iter_ar_members(path.read_bytes())]
+        self.assertTrue(
+            any(name.startswith("compiler_builtins-") for name in names),
+            names,
+        )
+        trailing = self.root / "trailing-llvm.a"
+        payload = b"\x00" * 0xE80
+        archive.write_archive(
+            trailing,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    macho64_trailing_llvm(True, payload),
+                )
+            ],
+        )
+        self.assertTrue(archive.member_has_bitcode(macho64_trailing_llvm(True, payload)))
+        archive.sanitize_archive(trailing)
+        members = list(archive.iter_ar_members(trailing.read_bytes()))
+        self.assertEqual(len(members), 1)
+        self.assertFalse(archive.member_has_bitcode(members[0][2]))
+        self.assertLess(len(members[0][2]), 0xE80)
+
+    def test_sanitize_does_not_whitelist_raw_bitcode_members(self):
+        path = self.root / "raw-bitcode.a"
+        archive.write_archive(
+            path,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.rcgu.o",
+                    archive.LLVM_BITCODE_MAGIC + b"ir",
+                )
+            ],
+        )
+        with self.assertRaisesRegex(archive.ArchiveError, "raw LLVM bitcode"):
+            archive.sanitize_archive(path)
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+
+    def test_measurement_applies_apple_embed_bitcode_flag(self):
+        env = measure.apply_apple_native_archive_rustflags(
+            {"CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS": "-C link-arg=-something"},
+            "aarch64-apple-ios",
+        )
+        self.assertIn("embed-bitcode=no", env["CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"])
+        self.assertIn("link-arg=-something", env["CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"])
 
     def test_clang_llvm_bitcode_archive_rejected_without_otool(self):
         clang = shutil.which("clang")
@@ -524,15 +629,21 @@ class ReleaseProfileTests(unittest.TestCase):
             "mkdir -p \"$out\"\n"
             "printf 'xcframework' > \"$out/Info.plist\"\n",
         )
+        native = macho64(True, b"__TEXT")
+        write_ar(self.root / f"{script}-native.a", [("obj.o", native)])
         write_executable(
             bin_dir / "cargo",
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
             "from pathlib import Path\n"
             f"log = Path({str(log)!r})\n"
+            f"native = Path({str(self.root / (script + '-native.a'))!r}).read_bytes()\n"
             "entry = {'argv': sys.argv[1:], 'strip': os.environ.get('CARGO_PROFILE_RELEASE_STRIP'),"
             " 'lto': os.environ.get('CARGO_PROFILE_RELEASE_LTO'),"
-            " 'codegen': os.environ.get('CARGO_PROFILE_RELEASE_CODEGEN_UNITS')}\n"
+            " 'codegen': os.environ.get('CARGO_PROFILE_RELEASE_CODEGEN_UNITS'),"
+            " 'ios_rustflags': os.environ.get('CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS'),"
+            " 'ios_sim_rustflags': os.environ.get('CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS'),"
+            " 'darwin_rustflags': os.environ.get('CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS')}\n"
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(entry) + '\\n')\n"
             "args = sys.argv[1:]\n"
@@ -545,7 +656,7 @@ class ReleaseProfileTests(unittest.TestCase):
             "    else:\n"
             "        out = target_dir / 'release' / 'libmarmot_uniffi.dylib'\n"
             "    out.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    out.write_bytes(b'archive' if triple else b'host')\n"
+            "    out.write_bytes(native if triple else b'host')\n"
             "elif args and args[0] == 'run':\n"
             "    out_dir = Path(args[args.index('--out-dir') + 1])\n"
             "    out_dir.mkdir(parents=True, exist_ok=True)\n"
@@ -572,6 +683,17 @@ class ReleaseProfileTests(unittest.TestCase):
             self.assertEqual(row["lto"], "thin")
             self.assertEqual(row["codegen"], "1")
             self.assertNotIn("CARGO_PROFILE_RELEASE_STRIP=symbols", " ".join(row["argv"]))
+        target_builds = [row for row in builds if "--target" in row["argv"]]
+        self.assertEqual(len(target_builds), len(extras["targets"]))
+        for row in target_builds:
+            triple = row["argv"][row["argv"].index("--target") + 1]
+            if triple == "aarch64-apple-ios":
+                self.assertIn("embed-bitcode=no", row["ios_rustflags"] or "")
+            elif triple == "aarch64-apple-ios-sim":
+                self.assertIn("embed-bitcode=no", row["ios_sim_rustflags"] or "")
+            elif triple == "aarch64-apple-darwin":
+                self.assertIn("embed-bitcode=no", row["darwin_rustflags"] or "")
+                self.assertIn("link-arg=-mmacosx-version-min=", row["darwin_rustflags"] or "")
         self.assertEqual(len(generate), 1)
         self.assertTrue((crate / extras["output"]).exists())
 

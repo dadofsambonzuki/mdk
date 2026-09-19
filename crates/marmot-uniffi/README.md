@@ -179,9 +179,12 @@ debug and static symbol sections from each packaged Android JNI library.
 Standard MarmotKit release builds use the workspace `[profile.release]` together with
 `marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
 `debug=0`, `panic=unwind`, and `strip=none`. Android target invocations override only
-`CARGO_PROFILE_RELEASE_STRIP=symbols`. Those builder-owned settings are not a
-user-facing escape hatch; measurement scripts may override LTO and codegen units on
-direct Cargo commands for a controlled baseline comparison.
+`CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
+`-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
+before packaging so shipped archives stay native; that is not a symbol strip.
+Those builder-owned settings are not a user-facing escape hatch; measurement
+scripts may override LTO and codegen units on direct Cargo commands for a
+controlled baseline comparison.
 
 ```sh
 # Inexpensive regressions, including provenance JSON and archive bitcode checks:

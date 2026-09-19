@@ -28,10 +28,13 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - Build and validate an Apple artifact against the same deployment target. Objects compiled under
   `MACOSX_DEPLOYMENT_TARGET` / `IPHONEOS_DEPLOYMENT_TARGET` report exactly that minimum, and the validators fail on a
   minimum *newer* than expected, so validating against a lower number fails. macOS publishes at `15.0`.
-- Package Apple static libraries exactly as cargo produced them. Neither `xcframework.sh` nor `xcframework-macos.sh`
-  strips post-link: `marmotkit-release-profile.env` pins `strip=none` and `debug=0`, and the packagers publish that
-  profile as provenance, so a post-link strip would make the manifest describe an artifact that was not shipped.
-  Package unchanged archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
+- Package Apple static libraries as native objects. Apple Cargo invocations set target-scoped
+  `-C embed-bitcode=no` (iOS rustc defaults to embedding bitcode). After cargo writes each `.a`,
+  `release-profile-archive.py --sanitize` removes leftover `__LLVM` / `__bitcode` segments from every
+  member, including toolchain `compiler_builtins` objects; it does not skip names or accept raw LLVM
+  bitcode. This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none` and
+  `debug=0`, and the packagers publish that profile as provenance. Package the sanitized native
+  archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
   from the packaged source's `apple-privacy/` and publish it separately with a checksum; also include it in the
   existing provenance bundle. Never stage resource-bearing framework wrappers or another complete-package ZIP.
   Consumers must synchronize binary, Swift and privacy inputs and declare the privacy resource in their Swift target.

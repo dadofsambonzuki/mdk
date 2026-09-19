@@ -189,6 +189,15 @@ def host_library(target_dir: Path) -> Path:
     return target_dir / "release" / "libmarmot_uniffi.so"
 
 
+def apply_apple_native_archive_rustflags(env: dict, triple: str) -> dict:
+    """Match xcframework.sh: target-scoped -C embed-bitcode=no only."""
+    key = f"CARGO_TARGET_{triple.upper().replace('-', '_')}_RUSTFLAGS"
+    current = env.get(key, "")
+    if "embed-bitcode=no" not in current:
+        env[key] = f"{current} -C embed-bitcode=no".strip()
+    return env
+
+
 def rustc_has_target(triple: str) -> bool:
     listed = subprocess.run(
         ["rustup", "target", "list", "--installed"],
@@ -580,6 +589,7 @@ def main(argv=None) -> int:
             target_dir = work / f"apple-{variant}"
             env = profile_env(base_env, variant, "none")
             env["CARGO_TARGET_DIR"] = str(target_dir)
+            apply_apple_native_archive_rustflags(env, triple)
             duration, command = measure_library(
                 workspace,
                 env,

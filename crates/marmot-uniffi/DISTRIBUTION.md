@@ -112,7 +112,9 @@ toolchain versions, enabled features, iOS targets and deployment target, effecti
 of the binary and generated Swift artifacts. `rust_release_profile.lto` follows Cargo's boolean-or-string
 representation: JSON `false` for the historical untuned control, and the string `"thin"` for current production.
 Codegen units remain an integer. Host and Apple artifacts keep `strip` as `"none"`; Android JNI builds apply
-`symbols` only on those target invocations. The complete `marmotkit-ios-<identifier>.zip` retains the XCFramework,
+`symbols` only on those target invocations. Apple builders also pass `-C embed-bitcode=no` and sanitize leftover
+Mach-O `__LLVM` / `__bitcode` sections so packaged archives stay native; that is not recorded as a `strip`
+change. The complete `marmotkit-ios-<identifier>.zip` retains the XCFramework,
 matching Swift source, `PrivacyInfo.xcprivacy`, and the same manifest for consumers that prefer a single provenance bundle.
 
 ## macOS
@@ -174,7 +176,8 @@ For manual verification, compare the ZIP with its `.sha256` asset. The separatel
 `marmotkit-macos-<identifier>.manifest.json` records the full MDK source SHA, workspace version, `Cargo.lock` SHA-256,
 toolchain versions, enabled features, macOS targets and deployment target, effective Rust release profile, and hashes
 of the binary and shared generated Swift artifacts. `rust_release_profile.lto` is Cargo's boolean-or-string value
-(`false` or `"thin"`); codegen units remain an integer. The complete `marmotkit-macos-<identifier>.zip` retains the
+(`false` or `"thin"`); codegen units remain an integer. Apple builders pass `-C embed-bitcode=no` and sanitize leftover
+Mach-O `__LLVM` / `__bitcode` sections; that is not a `strip` change. The complete `marmotkit-macos-<identifier>.zip` retains the
 XCFramework, matching Swift source, `PrivacyInfo.xcprivacy`, and the same manifest for consumers that prefer a single provenance bundle.
 
 ## Android

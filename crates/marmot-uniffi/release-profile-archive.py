@@ -5,6 +5,12 @@ Walks every archive member, including duplicate names. Extraction that
 collapses names is not used. Byte-level bitcode magic is always checked.
 When Apple otool output is available, embedded __LLVM / __bitcode sections
 are rejected as well.
+
+Apple Cargo invocations must pass `-C embed-bitcode=no` because rustc
+defaults to embedding bitcode on Apple targets. The toolchain's
+compiler_builtins objects can still retain a leftover `__LLVM,__bitcode`
+section; `--sanitize` removes those Mach-O segments from every member
+without skipping names. Raw LLVM bitcode members still fail closed.
 """
 
 from __future__ import annotations
@@ -38,6 +44,34 @@ LITTLE_ENDIAN_ON_LE_DECODE = {
 }
 LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
+LC_SYMTAB = 0x02
+LC_DYSYMTAB = 0x0B
+LC_DYLD_INFO = 0x22
+LC_DYLD_INFO_ONLY = 0x80000022
+LC_CODE_SIGNATURE = 0x1D
+LC_SEGMENT_SPLIT_INFO = 0x1B
+LC_FUNCTION_STARTS = 0x26
+LC_DATA_IN_CODE = 0x29
+LC_DYLIB_CODE_SIGN_DRS = 0x2B
+LC_LINKER_OPTIMIZATION_HINT = 0x2E
+LC_DYLD_EXPORTS_TRIE = 0x33
+LC_DYLD_CHAINED_FIXUPS = 0x34
+LC_ATOM_INFO = 0x36
+LC_NOTE = 0x31
+LC_ENCRYPTION_INFO = 0x21
+LC_ENCRYPTION_INFO_64 = 0x2C
+EMBED_BITCODE_RUSTFLAG = "-C embed-bitcode=no"
+LINKEDIT_DATA_COMMANDS = {
+    LC_CODE_SIGNATURE,
+    LC_SEGMENT_SPLIT_INFO,
+    LC_FUNCTION_STARTS,
+    LC_DATA_IN_CODE,
+    LC_DYLIB_CODE_SIGN_DRS,
+    LC_LINKER_OPTIMIZATION_HINT,
+    LC_DYLD_EXPORTS_TRIE,
+    LC_DYLD_CHAINED_FIXUPS,
+    LC_ATOM_INFO,
+}
 
 
 class ArchiveError(ValueError):
@@ -176,14 +210,326 @@ def check_archive(path: Path, otool_output: str | None = None) -> int:
     return len(members)
 
 
+def apple_target_rustflags_key(triple: str) -> str:
+    return f"CARGO_TARGET_{triple.upper().replace('-', '_')}_RUSTFLAGS"
+
+
+def apply_apple_native_archive_rustflags(env: dict[str, str], triple: str) -> dict[str, str]:
+    """Keep Apple rustc from embedding bitcode; do not replace other target flags."""
+    updated = dict(env)
+    key = apple_target_rustflags_key(triple)
+    current = updated.get(key, "")
+    if "embed-bitcode=no" not in current:
+        updated[key] = f"{current} {EMBED_BITCODE_RUSTFLAG}".strip()
+    return updated
+
+
+def _u64(data: bytes, offset: int, little: bool) -> int:
+    fmt = "<Q" if little else ">Q"
+    return struct.unpack_from(fmt, data, offset)[0]
+
+
+def _pack32(value: int, little: bool) -> bytes:
+    return struct.pack("<I" if little else ">I", value)
+
+
+def _pack64(value: int, little: bool) -> bytes:
+    return struct.pack("<Q" if little else ">Q", value)
+
+
+def _adjust_offset(value: int, removed: list[tuple[int, int]], name: str) -> int:
+    delta = 0
+    for start, size in removed:
+        if size <= 0:
+            continue
+        if start <= value < start + size:
+            raise ArchiveError(f"{name} offset {value} lands inside removed bitcode")
+        if value >= start + size:
+            delta += size
+    return value - delta
+
+
+def _patch_u32(raw: bytearray, offset: int, little: bool, value: int) -> None:
+    raw[offset : offset + 4] = _pack32(value, little)
+
+
+def _patch_u64(raw: bytearray, offset: int, little: bool, value: int) -> None:
+    raw[offset : offset + 8] = _pack64(value, little)
+
+
+def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tuple[int, int]]) -> bytes:
+    patched = bytearray(raw)
+    if cmd in {LC_SEGMENT, LC_SEGMENT_64}:
+        is_64 = cmd == LC_SEGMENT_64
+        fileoff_at = 40 if is_64 else 32
+        filesize_at = 48 if is_64 else 36
+        if is_64:
+            fileoff = _u64(raw, fileoff_at, little)
+            _patch_u64(patched, fileoff_at, little, _adjust_offset(fileoff, removed, "segment"))
+        else:
+            fileoff = _u32(raw, fileoff_at, little)
+            _patch_u32(patched, fileoff_at, little, _adjust_offset(fileoff, removed, "segment"))
+            filesize = _u32(raw, filesize_at, little)
+            if filesize:
+                _ = filesize
+        section_size = 80 if is_64 else 68
+        nsects_off = 64 if is_64 else 48
+        nsects = _u32(raw, nsects_off, little)
+        sect = 72 if is_64 else 56
+        for _ in range(nsects):
+            if is_64:
+                offset = _u32(raw, sect + 48, little)
+                _patch_u32(patched, sect + 48, little, _adjust_offset(offset, removed, "section"))
+            else:
+                offset = _u32(raw, sect + 40, little)
+                _patch_u32(patched, sect + 40, little, _adjust_offset(offset, removed, "section"))
+            sect += section_size
+        return bytes(patched)
+    if cmd == LC_SYMTAB:
+        _patch_u32(patched, 8, little, _adjust_offset(_u32(raw, 8, little), removed, "symtab"))
+        _patch_u32(patched, 16, little, _adjust_offset(_u32(raw, 16, little), removed, "strtab"))
+        return bytes(patched)
+    if cmd == LC_DYSYMTAB:
+        for field_off, label in (
+            (12, "tocoff"),
+            (20, "modtaboff"),
+            (28, "extrefsymoff"),
+            (36, "indirectsymoff"),
+            (44, "extreloff"),
+            (52, "locreloff"),
+        ):
+            if field_off + 4 <= len(raw):
+                _patch_u32(
+                    patched,
+                    field_off,
+                    little,
+                    _adjust_offset(_u32(raw, field_off, little), removed, label),
+                )
+        return bytes(patched)
+    if cmd in {LC_DYLD_INFO, LC_DYLD_INFO_ONLY}:
+        for field_off, label in (
+            (8, "rebase_off"),
+            (16, "bind_off"),
+            (24, "weak_bind_off"),
+            (32, "lazy_bind_off"),
+            (40, "export_off"),
+        ):
+            if field_off + 4 <= len(raw):
+                _patch_u32(
+                    patched,
+                    field_off,
+                    little,
+                    _adjust_offset(_u32(raw, field_off, little), removed, label),
+                )
+        return bytes(patched)
+    if cmd in LINKEDIT_DATA_COMMANDS or cmd in {LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64}:
+        _patch_u32(patched, 8, little, _adjust_offset(_u32(raw, 8, little), removed, "linkedit"))
+        return bytes(patched)
+    if cmd == LC_NOTE:
+        _patch_u64(patched, 24, little, _adjust_offset(_u64(raw, 24, little), removed, "note"))
+        return bytes(patched)
+    if removed:
+        raise ArchiveError(f"unknown Mach-O load command {cmd:#x} after mid-file bitcode removal")
+    return raw
+
+
+def _strip_thin_macho(content: bytes) -> bytes:
+    magic_le = struct.unpack_from("<I", content, 0)[0]
+    little = magic_le in LITTLE_ENDIAN_ON_LE_DECODE
+    magic = _u32(content, 0, little)
+    is_64 = magic in {0xFEEDFACF, 0xCFFAEDFE}
+    header_size = 32 if is_64 else 28
+    if len(content) < header_size:
+        raise ArchiveError("truncated Mach-O header")
+    ncmds = _u32(content, 16, little)
+    sizeofcmds = _u32(content, 20, little)
+    if header_size + sizeofcmds > len(content):
+        raise ArchiveError("truncated Mach-O load commands")
+    kept: list[bytes] = []
+    removed_ranges: list[tuple[int, int]] = []
+    offset = header_size
+    for _ in range(ncmds):
+        if offset + 8 > header_size + sizeofcmds:
+            raise ArchiveError("truncated Mach-O load command")
+        cmd = _u32(content, offset, little)
+        cmdsize = _u32(content, offset + 4, little)
+        if cmdsize < 8 or offset + cmdsize > header_size + sizeofcmds:
+            raise ArchiveError("invalid Mach-O load command size")
+        raw = content[offset : offset + cmdsize]
+        if cmd in {LC_SEGMENT, LC_SEGMENT_64}:
+            segname = raw[8:24].split(b"\0", 1)[0]
+            section_size = 80 if cmd == LC_SEGMENT_64 else 68
+            nsects_off = 64 if cmd == LC_SEGMENT_64 else 48
+            nsects = _u32(raw, nsects_off, little) if nsects_off + 4 <= len(raw) else 0
+            sect = 72 if cmd == LC_SEGMENT_64 else 56
+            if segname == b"__LLVM":
+                if cmd == LC_SEGMENT_64:
+                    fileoff = _u64(raw, 40, little)
+                    filesize = _u64(raw, 48, little)
+                else:
+                    fileoff = _u32(raw, 32, little)
+                    filesize = _u32(raw, 36, little)
+                if filesize:
+                    removed_ranges.append((fileoff, filesize))
+                offset += cmdsize
+                continue
+            for _ in range(nsects):
+                if sect + 16 > len(raw):
+                    break
+                sectname = raw[sect : sect + 16].split(b"\0", 1)[0]
+                if sectname == b"__bitcode":
+                    raise ArchiveError(
+                        "embedded __bitcode section outside __LLVM cannot be sanitized"
+                    )
+                sect += section_size
+        kept.append(raw)
+        offset += cmdsize
+    new_cmds = b"".join(kept)
+    if len(new_cmds) > sizeofcmds:
+        raise ArchiveError("sanitized load commands overflow the original command region")
+    out = bytearray(content)
+    out[16:20] = _pack32(len(kept), little)
+    out[header_size : header_size + sizeofcmds] = new_cmds + bytes(sizeofcmds - len(new_cmds))
+    trailing_only = all(
+        size <= 0 or fileoff + size >= len(out) or fileoff + size == len(content)
+        for fileoff, size in removed_ranges
+    )
+    if removed_ranges and not trailing_only:
+        kept = [_adjust_known_command(raw, _u32(raw, 0, little), little, removed_ranges) for raw in kept]
+        new_cmds = b"".join(kept)
+        if len(new_cmds) > sizeofcmds:
+            raise ArchiveError("adjusted load commands overflow the original command region")
+        out[header_size : header_size + sizeofcmds] = new_cmds + bytes(sizeofcmds - len(new_cmds))
+        for fileoff, size in sorted(removed_ranges, reverse=True):
+            if size > 0:
+                del out[fileoff : fileoff + size]
+    else:
+        for fileoff, size in sorted(removed_ranges, reverse=True):
+            if size > 0 and fileoff + size <= len(out):
+                del out[fileoff : fileoff + size]
+    return bytes(out)
+
+
+def _strip_fat_macho(content: bytes) -> bytes:
+    magic = struct.unpack_from(">I", content, 0)[0]
+    little = False
+    if magic not in {0xCAFEBABE, 0xCAFEBABF}:
+        magic = struct.unpack_from("<I", content, 0)[0]
+        little = True
+        if magic not in {0xCAFEBABE, 0xCAFEBABF}:
+            raise ArchiveError("not a Mach-O FAT archive")
+    is_64 = magic == 0xCAFEBABF
+    nfat = _u32(content, 4, little)
+    header_size = 8
+    arch_size = 32 if is_64 else 20
+    slices = []
+    for index in range(nfat):
+        entry = header_size + index * arch_size
+        if is_64:
+            offset = _u64(content, entry + 8, little)
+            size = _u64(content, entry + 16, little)
+        else:
+            offset = _u32(content, entry + 8, little)
+            size = _u32(content, entry + 12, little)
+        slices.append((entry, content[offset : offset + size]))
+    rebuilt = [strip_macho_bitcode(blob) for _, blob in slices]
+    # Keep original alignment by rewriting each slice in place when it shrank
+    # only by trailing bitcode; fail if a slice grew.
+    out = bytearray(content)
+    for (entry, original), stripped in zip(slices, rebuilt):
+        if len(stripped) > len(original):
+            raise ArchiveError("sanitized FAT slice grew")
+        offset = _u64(content, entry + 8, little) if is_64 else _u32(content, entry + 8, little)
+        out[offset : offset + len(stripped)] = stripped
+        if len(stripped) < len(original):
+            out[offset + len(stripped) : offset + len(original)] = bytes(len(original) - len(stripped))
+            if is_64:
+                out[entry + 16 : entry + 24] = _pack64(len(stripped), little)
+            else:
+                out[entry + 12 : entry + 16] = _pack32(len(stripped), little)
+    return bytes(out)
+
+
+def strip_macho_bitcode(content: bytes) -> bytes:
+    if len(content) < 8:
+        raise ArchiveError("truncated object while removing bitcode")
+    magic = struct.unpack_from("<I", content, 0)[0]
+    if magic in {0xCAFEBABE, 0xBEBAFECA}:
+        return _strip_fat_macho(content)
+    be_magic = struct.unpack_from(">I", content, 0)[0]
+    if magic not in MACHO_MAGICS and be_magic not in MACHO_MAGICS:
+        raise ArchiveError("cannot strip bitcode from a non-Mach-O member")
+    return _strip_thin_macho(content)
+
+
+def sanitize_member(name: str, content: bytes) -> bytes:
+    if not member_has_bitcode(content):
+        return content
+    if content.startswith(LLVM_BITCODE_MAGIC) or content.startswith(LLVM_WRAPPER_MAGIC):
+        raise ArchiveError(
+            f"member {name} is raw LLVM bitcode, not a native Mach-O object"
+        )
+    stripped = strip_macho_bitcode(content)
+    if member_has_bitcode(stripped):
+        raise ArchiveError(f"member {name} still contains LLVM bitcode after sanitization")
+    return stripped
+
+
+def write_archive(path: Path, members: list[tuple[str, bytes]]) -> None:
+    blob = bytearray(AR_MAGIC)
+    for name, content in members:
+        encoded = name.encode("ascii")
+        if len(encoded) > 15:
+            stored = encoded + b"\0"
+            payload = stored + content
+            name_field = f"#1/{len(stored)}".encode().ljust(16)
+        else:
+            payload = content
+            name_field = encoded.ljust(16)
+        header = (
+            name_field
+            + b"0".ljust(12)
+            + b"0".ljust(6)
+            + b"0".ljust(6)
+            + b"644".ljust(8)
+            + f"{len(payload)}".encode().rjust(10)
+            + b"`\n"
+        )
+        blob.extend(header)
+        blob.extend(payload)
+        if len(payload) % 2 == 1:
+            blob.append(0)
+    path.write_bytes(blob)
+
+
+def sanitize_archive(path: Path) -> int:
+    members = [(name, content) for _, name, content in iter_ar_members(path.read_bytes())]
+    if not members:
+        raise ArchiveError(f"{path} contains no archive members")
+    sanitized = [(name, sanitize_member(name, content)) for name, content in members]
+    write_archive(path, sanitized)
+    return check_archive(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--otool-output", type=Path)
+    parser.add_argument(
+        "--sanitize",
+        action="store_true",
+        help="Remove leftover Mach-O __LLVM bitcode segments from every member",
+    )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     os.umask(0o077)
     extra = args.otool_output.read_text() if args.otool_output else None
     try:
+        if args.sanitize:
+            if extra is not None:
+                raise ArchiveError("--otool-output cannot be combined with --sanitize")
+            count = sanitize_archive(args.archive)
+            print(f"Sanitized {count} native archive member(s) in {args.archive}")
+            return 0
         count = check_archive(args.archive, extra)
     except ArchiveError as error:
         sys.stderr.write(f"error: {error}\n")

@@ -16,6 +16,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   archive helper classifies little-endian Mach-O magic correctly so embedded `__LLVM` / `__bitcode`
   members are rejected without otool, and the non-publishing profile workflow uploads logs, raw
   Criterion data, and toolchain versions even when a later step fails.
+- MarmotKit Apple archives no longer ship leftover LLVM bitcode. Apple Cargo invocations pass
+  `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments from every
+  archive member (including toolchain `compiler_builtins` objects) without skipping names or
+  weakening the native-archive validator. This is not a symbol strip.
 - OpenClaw Marmot channel readiness now includes configured welcomer-allowlist reconciliation: a failed
   managed sync reports `marmot_allowlist_sync_failed` and retries in-process, while an empty policy stays a
   no-op. The degraded status is diagnostic and does not fail-closed invitations or inbound dispatch. Failed
