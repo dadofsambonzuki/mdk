@@ -220,7 +220,9 @@ diff-gates the checked-in header.
 ## Selected chat-list presentation
 
 The additive `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields
-plus MDK-selected title/avatar descriptors. Existing struct layouts and functions are unchanged.
+plus MDK-selected title/avatar descriptors. The unreleased C3 additions extend
+`MarmotPresentedChatRow` with preview and action fields, changing its binary layout.
+Rebuild consumers with the matching generated header and native library; function signatures are unchanged.
 `marmot_open_presented_chat_list` returns an attached handle; take its `*_snapshot` once, then use `*_next` for
 whole-list replacements. The initial item has sequence zero. A repeated snapshot call returns CLOSED with NULL.
 
@@ -248,3 +250,7 @@ opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 
 `marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
 `marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions. Regenerate/recompile consumers against the
 matching header and library; the resolved chat/conversation records now contain an optional avatar metadata pointer.
+
+### Selected chat-list previews and actions (unreleased)
+
+`MarmotPresentedChatRow` now embeds `preview` and `actions`. The Draft preview owns its text; the parent row/snapshot free releases it. Message selection refers to the same row’s `last_message`. Rebuild with the matching header/library; see the [shared C3 integration contract](../marmot-uniffi/CHAT-LIST-ROWS.md).
