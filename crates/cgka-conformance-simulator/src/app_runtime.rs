@@ -2542,6 +2542,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidKeyPackageEvent(_)
         | AppError::InvalidDirectorySearch(_)
         | AppError::InvalidGroupProfile(_)
+        | AppError::InvalidAppComponent(_)
         | AppError::InvalidNostrRouting(_)
         | AppError::InvalidGroupAvatarUrl(_)
         | AppError::InvalidAgentTextStreamPolicy(_)
