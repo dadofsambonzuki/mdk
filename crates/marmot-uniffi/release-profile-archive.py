@@ -16,9 +16,10 @@ itself. `--sanitize` removes those Mach-O segments and section-level
 names. Offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`
 are left unchanged when leftover bitcode is removed from the middle
 of a member. A parent segment whose `fileoff` equals that leftover
-bitcode start is snapped to the remaining native data; pointers that
-land strictly inside removed bitcode still fail closed. Raw LLVM
-bitcode members still fail closed.
+bitcode start is snapped to the remaining native data. Empty native
+sections that reuse that same file offset are snapped the same way;
+non-empty pointers that land strictly inside removed bitcode still
+fail closed. Raw LLVM bitcode members still fail closed.
 """
 
 from __future__ import annotations
@@ -325,6 +326,36 @@ def _first_kept_offset(
     return snapped
 
 
+def _adjust_section_pointer(
+    value: int, extent: int, removed: list[tuple[int, int]], name: str
+) -> int:
+    """Relocate a section or reloc pointer after leftover bitcode is deleted.
+
+    rustc MH_OBJECT members often give empty `__const` / `__eh_frame` sections
+    the same file offset as the first payload. When that payload is leftover
+    `__LLVM,__bitcode`, the empty section does not own those bytes. Snap it
+    onto the remaining native data. A non-empty pointer that stays strictly
+    inside the removed range still fails closed.
+    """
+    if value == 0:
+        return 0
+    if extent > 0:
+        snapped = _first_kept_offset(value, extent, removed, name)
+        return _adjust_offset(snapped, removed, name)
+    snapped = value
+    moved = True
+    while moved:
+        moved = False
+        for start, size in removed:
+            if size <= 0:
+                continue
+            if start <= snapped < start + size:
+                snapped = start + size
+                moved = True
+                break
+    return _adjust_offset(snapped, removed, name)
+
+
 def _relocated_segment_file(
     fileoff: int, filesize: int, removed: list[tuple[int, int]]
 ) -> tuple[int, int]:
@@ -374,26 +405,58 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
         sect = 72 if is_64 else 56
         for _ in range(nsects):
             if is_64:
+                size = _u64(raw, sect + 40, little)
                 offset = _u32(raw, sect + 48, little)
                 reloff = _u32(raw, sect + 56, little)
+                nreloc = _u32(raw, sect + 60, little)
                 if offset:
                     _patch_u32(
-                        patched, sect + 48, little, _adjust_offset(offset, removed, "section")
+                        patched,
+                        sect + 48,
+                        little,
+                        _adjust_section_pointer(offset, size, removed, "section"),
                     )
+                if size:
+                    overlap = sum(
+                        _range_overlap(offset, offset + size, start, start + rsize)
+                        for start, rsize in removed
+                        if rsize > 0
+                    )
+                    if overlap:
+                        _patch_u64(patched, sect + 40, little, size - overlap)
                 if reloff:
                     _patch_u32(
-                        patched, sect + 56, little, _adjust_offset(reloff, removed, "reloc")
+                        patched,
+                        sect + 56,
+                        little,
+                        _adjust_section_pointer(reloff, nreloc * 8, removed, "reloc"),
                     )
             else:
+                size = _u32(raw, sect + 36, little)
                 offset = _u32(raw, sect + 40, little)
                 reloff = _u32(raw, sect + 48, little)
+                nreloc = _u32(raw, sect + 52, little)
                 if offset:
                     _patch_u32(
-                        patched, sect + 40, little, _adjust_offset(offset, removed, "section")
+                        patched,
+                        sect + 40,
+                        little,
+                        _adjust_section_pointer(offset, size, removed, "section"),
                     )
+                if size:
+                    overlap = sum(
+                        _range_overlap(offset, offset + size, start, start + rsize)
+                        for start, rsize in removed
+                        if rsize > 0
+                    )
+                    if overlap:
+                        _patch_u32(patched, sect + 36, little, size - overlap)
                 if reloff:
                     _patch_u32(
-                        patched, sect + 48, little, _adjust_offset(reloff, removed, "reloc")
+                        patched,
+                        sect + 48,
+                        little,
+                        _adjust_section_pointer(reloff, nreloc * 8, removed, "reloc"),
                     )
             sect += section_size
         return bytes(patched)

@@ -34,11 +34,15 @@ commands intact. Exact-head macOS CI on
 `9dfab7008e1748a46df9b9240bb678fb4124d46c` then failed sanitization with
 `segment offset 784 lands inside removed bitcode` because the parent
 `__TEXT` `fileoff` equals the leftover bitcode start. The sanitizer now
-snaps that segment onto the remaining native sections and still rejects
-pointers that land strictly inside removed bitcode. Profile-affecting
-MarmotKit sources and these dated bytes are unchanged except for that
-sanitizer repair. Fresh exact-head CI is required after publication; these
-dated numbers describe the pre-fix candidate.
+snaps that segment onto the remaining native sections. Exact-head macOS
+CI on `31c39233cba23f45c74353c0aa921823636d9928` then failed sanitization
+with `section offset 784 lands inside removed bitcode` because empty
+native sections reuse that first-payload offset. The sanitizer now snaps
+those empty section pointers as well and still rejects non-empty pointers
+that land strictly inside removed bitcode. Profile-affecting MarmotKit
+sources and these dated bytes are unchanged except for that sanitizer
+repair. Fresh exact-head CI is required after publication; these dated
+numbers describe the pre-fix candidate.
 
 | Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |

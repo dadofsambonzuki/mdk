@@ -299,6 +299,7 @@ def macho64_mh_object_bitcode_at_segment_fileoff(
     segment_fileoff: int = 784,
     extra_cmd: bytes | None = None,
     native_fileoff: int | None = None,
+    empty_native_sections: tuple[bytes, ...] = (),
 ) -> bytes:
     """MH_OBJECT whose parent __TEXT fileoff equals leftover bitcode.
 
@@ -306,9 +307,12 @@ def macho64_mh_object_bitcode_at_segment_fileoff(
     with `segment offset 784 lands inside removed bitcode` because rustc
     compiler_builtins members set the segment fileoff to the first section,
     which is leftover `__LLVM,__bitcode`, while native `__text` follows.
+    Later exact-head CI on 31c39233cba23f45c74353c0aa921823636d9928 failed
+    with `section offset 784` because empty native sections reuse that
+    first-payload offset.
     """
     header_size = 32
-    nsects = 2
+    nsects = 2 + len(empty_native_sections)
     segment_cmdsize = 72 + 80 * nsects
     version_cmdsize = 16
     extra = extra_cmd or b""
@@ -369,6 +373,9 @@ def macho64_mh_object_bitcode_at_segment_fileoff(
         + _pack("I", nsects, little=little)
         + _pack("I", 0, little=little)
         + section(b"__bitcode", b"__LLVM", 0, len(bitcode), bitcode_off)
+        + b"".join(
+            section(name, b"__TEXT", 0, 0, bitcode_off) for name in empty_native_sections
+        )
         + section(
             b"__text",
             b"__TEXT",
@@ -729,6 +736,39 @@ class ReleaseProfileTests(unittest.TestCase):
         reloff = struct.unpack_from("<I", stripped, 32 + 72 + 56)[0]
         self.assertEqual(text_off, 784)
         self.assertEqual(reloff, 784 + len(native))
+
+    def test_sanitize_snaps_empty_section_offset_off_leading_bitcode(self):
+        native = b"NATIVE784"
+        bitcode = b"\x66" * 0xE80
+        member = macho64_mh_object_bitcode_at_segment_fileoff(
+            True, native, bitcode, empty_native_sections=(b"__const", b"__eh_frame")
+        )
+        path = self.root / "empty-section-fileoff-784.a"
+        archive.write_archive(
+            path,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    member,
+                )
+            ],
+        )
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+        count = archive.sanitize_archive(path)
+        self.assertEqual(count, 1)
+        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
+        self.assertFalse(archive.member_has_bitcode(stripped))
+        self.assertIn(native, stripped)
+        self.assertNotIn(bitcode, stripped)
+        nsects = struct.unpack_from("<I", stripped, 32 + 64)[0]
+        self.assertEqual(nsects, 3)
+        const_off = struct.unpack_from("<I", stripped, 32 + 72 + 48)[0]
+        eh_off = struct.unpack_from("<I", stripped, 32 + 72 + 80 + 48)[0]
+        text_off = struct.unpack_from("<I", stripped, 32 + 72 + 160 + 48)[0]
+        self.assertEqual(const_off, 784)
+        self.assertEqual(eh_off, 784)
+        self.assertEqual(text_off, 784)
 
     def test_sanitize_still_rejects_section_offset_inside_removed_bitcode(self):
         native = b"NATIVE784"
