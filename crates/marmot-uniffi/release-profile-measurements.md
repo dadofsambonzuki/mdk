@@ -30,11 +30,15 @@ section-level leftovers; it still does not whitelist members. Exact-head macOS
 CI on `e9fb5a8f577d2c6352d12eebf76111afbe8d6e01` then failed sanitization with
 `unknown Mach-O load command 0x25 after mid-file bitcode removal`
 (`LC_VERSION_MIN_IPHONEOS`). The sanitizer now keeps those offset-free
-commands intact. This revision also merges origin/master
-`7d8bba365def75a66774f2b2036f839411010001`. Profile-affecting MarmotKit
-sources and these dated bytes are unchanged except for that sanitizer repair.
-Fresh exact-head CI is required after publication; these dated numbers
-describe the pre-fix candidate.
+commands intact. Exact-head macOS CI on
+`9dfab7008e1748a46df9b9240bb678fb4124d46c` then failed sanitization with
+`segment offset 784 lands inside removed bitcode` because the parent
+`__TEXT` `fileoff` equals the leftover bitcode start. The sanitizer now
+snaps that segment onto the remaining native sections and still rejects
+pointers that land strictly inside removed bitcode. Profile-affecting
+MarmotKit sources and these dated bytes are unchanged except for that
+sanitizer repair. Fresh exact-head CI is required after publication; these
+dated numbers describe the pre-fix candidate.
 
 | Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |

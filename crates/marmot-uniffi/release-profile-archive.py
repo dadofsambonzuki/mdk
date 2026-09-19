@@ -15,7 +15,10 @@ itself. `--sanitize` removes those Mach-O segments and section-level
 `__LLVM` / `__bitcode` leftovers from every member without skipping
 names. Offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`
 are left unchanged when leftover bitcode is removed from the middle
-of a member. Raw LLVM bitcode members still fail closed.
+of a member. A parent segment whose `fileoff` equals that leftover
+bitcode start is snapped to the remaining native data; pointers that
+land strictly inside removed bitcode still fail closed. Raw LLVM
+bitcode members still fail closed.
 """
 
 from __future__ import annotations
@@ -291,6 +294,54 @@ def _adjust_offset(value: int, removed: list[tuple[int, int]], name: str) -> int
     return value - delta
 
 
+def _first_kept_offset(
+    value: int, extent: int, removed: list[tuple[int, int]], name: str
+) -> int:
+    """Move a file offset forward out of removed bitcode when later bytes remain.
+
+    Relocatable MH_OBJECT members often set the parent segment `fileoff` to
+    the first section's file offset. When that first section is leftover
+    `__LLVM,__bitcode`, the segment still covers the following native
+    sections. After those bitcode bytes are deleted, the next kept data
+    slides to the original bitcode start.
+    """
+    if extent <= 0:
+        return 0
+    end = value + extent
+    snapped = value
+    moved = True
+    while moved:
+        moved = False
+        for start, size in removed:
+            if size <= 0:
+                continue
+            removed_end = start + size
+            if start <= snapped < removed_end:
+                if end > removed_end:
+                    snapped = removed_end
+                    moved = True
+                    break
+                raise ArchiveError(f"{name} offset {value} lands inside removed bitcode")
+    return snapped
+
+
+def _relocated_segment_file(
+    fileoff: int, filesize: int, removed: list[tuple[int, int]]
+) -> tuple[int, int]:
+    overlap = sum(
+        _range_overlap(fileoff, fileoff + filesize, start, start + size)
+        for start, size in removed
+        if size > 0
+    )
+    new_filesize = max(0, filesize - overlap)
+    if new_filesize == 0:
+        return 0, 0
+    if fileoff or filesize:
+        snapped = _first_kept_offset(fileoff, filesize, removed, "segment")
+        return _adjust_offset(snapped, removed, "segment"), new_filesize
+    return fileoff, new_filesize
+
+
 def _patch_u32(raw: bytearray, offset: int, little: bool, value: int) -> None:
     raw[offset : offset + 4] = _pack32(value, little)
 
@@ -308,29 +359,15 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
         if is_64:
             fileoff = _u64(raw, fileoff_at, little)
             filesize = _u64(raw, filesize_at, little)
-            new_off = fileoff
-            if fileoff or filesize:
-                new_off = _adjust_offset(fileoff, removed, "segment")
-            overlap = sum(
-                _range_overlap(fileoff, fileoff + filesize, start, start + size)
-                for start, size in removed
-                if size > 0
-            )
+            new_off, new_filesize = _relocated_segment_file(fileoff, filesize, removed)
             _patch_u64(patched, fileoff_at, little, new_off)
-            _patch_u64(patched, filesize_at, little, max(0, filesize - overlap))
+            _patch_u64(patched, filesize_at, little, new_filesize)
         else:
             fileoff = _u32(raw, fileoff_at, little)
             filesize = _u32(raw, filesize_at, little)
-            new_off = fileoff
-            if fileoff or filesize:
-                new_off = _adjust_offset(fileoff, removed, "segment")
-            overlap = sum(
-                _range_overlap(fileoff, fileoff + filesize, start, start + size)
-                for start, size in removed
-                if size > 0
-            )
+            new_off, new_filesize = _relocated_segment_file(fileoff, filesize, removed)
             _patch_u32(patched, fileoff_at, little, new_off)
-            _patch_u32(patched, filesize_at, little, max(0, filesize - overlap))
+            _patch_u32(patched, filesize_at, little, new_filesize)
         section_size = 80 if is_64 else 68
         nsects_off = 64 if is_64 else 48
         nsects = _u32(raw, nsects_off, little)
@@ -338,10 +375,26 @@ def _adjust_known_command(raw: bytes, cmd: int, little: bool, removed: list[tupl
         for _ in range(nsects):
             if is_64:
                 offset = _u32(raw, sect + 48, little)
-                _patch_u32(patched, sect + 48, little, _adjust_offset(offset, removed, "section"))
+                reloff = _u32(raw, sect + 56, little)
+                if offset:
+                    _patch_u32(
+                        patched, sect + 48, little, _adjust_offset(offset, removed, "section")
+                    )
+                if reloff:
+                    _patch_u32(
+                        patched, sect + 56, little, _adjust_offset(reloff, removed, "reloc")
+                    )
             else:
                 offset = _u32(raw, sect + 40, little)
-                _patch_u32(patched, sect + 40, little, _adjust_offset(offset, removed, "section"))
+                reloff = _u32(raw, sect + 48, little)
+                if offset:
+                    _patch_u32(
+                        patched, sect + 40, little, _adjust_offset(offset, removed, "section")
+                    )
+                if reloff:
+                    _patch_u32(
+                        patched, sect + 48, little, _adjust_offset(reloff, removed, "reloc")
+                    )
             sect += section_size
         return bytes(patched)
     if cmd == LC_SYMTAB:

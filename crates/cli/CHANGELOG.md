@@ -21,7 +21,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   MH_OBJECT section-level leftovers from every archive member (including toolchain
   `compiler_builtins` objects) without skipping names or weakening the native-archive
   validator. Mid-file leftover removal keeps offset-free load commands such as
-  `LC_VERSION_MIN_IPHONEOS` intact. This is not a symbol strip.
+  `LC_VERSION_MIN_IPHONEOS` intact and snaps a parent segment whose `fileoff`
+  equals the leftover bitcode start onto the remaining native data. This is not a
+  symbol strip.
 
 ### Changed
 

@@ -291,6 +291,105 @@ def macho64_mh_object_midfile_llvm_with_version_min(
     return header + segment + version + extra + leading + bitcode + trailing
 
 
+def macho64_mh_object_bitcode_at_segment_fileoff(
+    little: bool,
+    native: bytes,
+    bitcode: bytes,
+    *,
+    segment_fileoff: int = 784,
+    extra_cmd: bytes | None = None,
+    native_fileoff: int | None = None,
+) -> bytes:
+    """MH_OBJECT whose parent __TEXT fileoff equals leftover bitcode.
+
+    Exact-head macOS CI on 9dfab7008e1748a46df9b9240bb678fb4124d46c failed
+    with `segment offset 784 lands inside removed bitcode` because rustc
+    compiler_builtins members set the segment fileoff to the first section,
+    which is leftover `__LLVM,__bitcode`, while native `__text` follows.
+    """
+    header_size = 32
+    nsects = 2
+    segment_cmdsize = 72 + 80 * nsects
+    version_cmdsize = 16
+    extra = extra_cmd or b""
+    sizeofcmds = segment_cmdsize + version_cmdsize + len(extra)
+    ncmds = 2 + (1 if extra else 0)
+    commands_end = header_size + sizeofcmds
+    if segment_fileoff < commands_end:
+        raise ValueError("segment_fileoff overlaps load commands")
+    bitcode_off = segment_fileoff
+    text_off = native_fileoff if native_fileoff is not None else bitcode_off + len(bitcode)
+    reloc_off = text_off + len(native)
+    filesize = (text_off + len(native)) - segment_fileoff
+
+    def section(
+        sectname: bytes,
+        segname: bytes,
+        addr: int,
+        size: int,
+        offset: int,
+        reloff: int = 0,
+        nreloc: int = 0,
+    ) -> bytes:
+        return (
+            sectname.ljust(16, b"\0")
+            + segname.ljust(16, b"\0")
+            + _pack("Q", addr, little=little)
+            + _pack("Q", size, little=little)
+            + _pack("I", offset, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", reloff, little=little)
+            + _pack("I", nreloc, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+            + _pack("I", 0, little=little)
+        )
+
+    header = (
+        _pack("I", 0xFEEDFACF, little=little)
+        + _pack("i", 0x0100000C, little=little)
+        + _pack("i", 0, little=little)
+        + _pack("I", 1, little=little)
+        + _pack("I", ncmds, little=little)
+        + _pack("I", sizeofcmds, little=little)
+        + _pack("I", 0, little=little)
+        + _pack("I", 0, little=little)
+    )
+    segment = (
+        _pack("I", 0x19, little=little)
+        + _pack("I", segment_cmdsize, little=little)
+        + b"__TEXT".ljust(16, b"\0")
+        + _pack("Q", 0, little=little)
+        + _pack("Q", filesize, little=little)
+        + _pack("Q", segment_fileoff, little=little)
+        + _pack("Q", filesize, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("i", 7, little=little)
+        + _pack("I", nsects, little=little)
+        + _pack("I", 0, little=little)
+        + section(b"__bitcode", b"__LLVM", 0, len(bitcode), bitcode_off)
+        + section(
+            b"__text",
+            b"__TEXT",
+            len(bitcode),
+            len(native),
+            text_off,
+            reloff=reloc_off,
+            nreloc=1,
+        )
+    )
+    version = (
+        _pack("I", 0x25, little=little)
+        + _pack("I", version_cmdsize, little=little)
+        + _pack("I", 0x00120000, little=little)
+        + _pack("I", 0x00120000, little=little)
+    )
+    pad = bytes(segment_fileoff - commands_end)
+    reloc = _pack("I", 0, little=little) + _pack("I", 0, little=little)
+    return header + segment + version + extra + pad + bitcode + native + reloc
+
+
 def macho32(little: bool, segname: bytes) -> bytes:
     header = (
         _pack("I", 0xFEEDFACE, little=little)
@@ -597,6 +696,50 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn(struct.pack("<I", 0x25), stripped)
         self.assertIn(bytes(range(16)), stripped)
         self.assertLess(len(stripped), len(member))
+
+    def test_sanitize_snaps_segment_fileoff_off_leading_bitcode(self):
+        native = b"NATIVE784"
+        bitcode = b"\x44" * 0xE80
+        member = macho64_mh_object_bitcode_at_segment_fileoff(True, native, bitcode)
+        path = self.root / "segment-fileoff-784.a"
+        archive.write_archive(
+            path,
+            [
+                (
+                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
+                    member,
+                )
+            ],
+        )
+        with self.assertRaises(archive.ArchiveError):
+            archive.check_archive(path)
+        count = archive.sanitize_archive(path)
+        self.assertEqual(count, 1)
+        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
+        self.assertFalse(archive.member_has_bitcode(stripped))
+        self.assertIn(native, stripped)
+        self.assertNotIn(bitcode, stripped)
+        self.assertIn(struct.pack("<I", 0x25), stripped)
+        self.assertLess(len(stripped), len(member))
+        fileoff = struct.unpack_from("<Q", stripped, 32 + 40)[0]
+        filesize = struct.unpack_from("<Q", stripped, 32 + 48)[0]
+        self.assertEqual(fileoff, 784)
+        self.assertEqual(filesize, len(native))
+        text_off = struct.unpack_from("<I", stripped, 32 + 72 + 48)[0]
+        reloff = struct.unpack_from("<I", stripped, 32 + 72 + 56)[0]
+        self.assertEqual(text_off, 784)
+        self.assertEqual(reloff, 784 + len(native))
+
+    def test_sanitize_still_rejects_section_offset_inside_removed_bitcode(self):
+        native = b"NATIVE784"
+        bitcode = b"\x55" * 0xE80
+        member = macho64_mh_object_bitcode_at_segment_fileoff(
+            True, native, bitcode, native_fileoff=800
+        )
+        path = self.root / "section-inside-bitcode.a"
+        archive.write_archive(path, [("obj.o", member)])
+        with self.assertRaisesRegex(archive.ArchiveError, "section offset 800 lands inside removed bitcode"):
+            archive.sanitize_archive(path)
 
     def test_sanitize_still_rejects_unknown_midfile_load_command(self):
         unknown = struct.pack("<I", 0x99) + struct.pack("<I", 8)
