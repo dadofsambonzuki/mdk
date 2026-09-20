@@ -693,6 +693,7 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         client_token: None,
         has_reports: false,
         group_system: None,
+        poll: None,
         edit: None,
         message_id_hex: message_id_hex.to_owned(),
         source_message_id_hex: None,

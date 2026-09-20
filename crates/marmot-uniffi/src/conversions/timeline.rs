@@ -13,6 +13,72 @@ use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use super::media::{MediaAttachmentOutcomeFfi, timeline_media_outcomes_ffi};
 use crate::markdown::MarkdownDocumentFfi;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PollTypeFfi {
+    SingleChoice,
+    MultipleChoice,
+}
+
+impl From<marmot_app::PollType> for PollTypeFfi {
+    fn from(value: marmot_app::PollType) -> Self {
+        match value {
+            marmot_app::PollType::SingleChoice => Self::SingleChoice,
+            marmot_app::PollType::MultipleChoice => Self::MultipleChoice,
+        }
+    }
+}
+
+impl From<PollTypeFfi> for marmot_app::PollType {
+    fn from(value: PollTypeFfi) -> Self {
+        match value {
+            PollTypeFfi::SingleChoice => Self::SingleChoice,
+            PollTypeFfi::MultipleChoice => Self::MultipleChoice,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PollOptionResultFfi {
+    pub id: String,
+    pub label: String,
+    pub votes: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PollProjectionFfi {
+    pub question: String,
+    pub options: Vec<PollOptionResultFfi>,
+    pub poll_type: PollTypeFfi,
+    pub participants: u64,
+    pub local_selection: Vec<String>,
+    pub creator: String,
+    pub ends_at: Option<u64>,
+    pub open: bool,
+}
+
+impl From<marmot_app::PollProjection> for PollProjectionFfi {
+    fn from(value: marmot_app::PollProjection) -> Self {
+        Self {
+            question: value.question,
+            options: value
+                .options
+                .into_iter()
+                .map(|option| PollOptionResultFfi {
+                    id: option.id,
+                    label: option.label,
+                    votes: option.votes,
+                })
+                .collect(),
+            poll_type: value.poll_type.into(),
+            participants: value.participants,
+            local_selection: value.local_selection,
+            creator: value.creator,
+            ends_at: value.ends_at,
+            open: value.open,
+        }
+    }
+}
+
 /// Accepted deletion origin; consult only when `deleted` is true.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
 pub enum DeletionSourceFfi {
@@ -211,6 +277,8 @@ pub struct TimelineMessageRecordFfi {
     /// Opaque local submission token; absent for remote or legacy messages.
     pub client_token: Option<String>,
     pub has_reports: bool,
+    /// Structured kind-1068 poll projection; absent for non-polls or invalid polls.
+    pub poll: Option<PollProjectionFfi>,
     pub message_id_hex: String,
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
     /// commits and projects locally *before* it publishes, so a message that
@@ -289,6 +357,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         Self {
             client_token: value.client_token,
             has_reports: value.has_reports,
+            poll: value.poll.map(Into::into),
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
             source_epoch: value.source_epoch,
@@ -687,6 +756,7 @@ mod tests {
             client_token: None,
             has_reports: false,
             group_system: None,
+            poll: None,
             edit: None,
             message_id_hex: "msg".to_owned(),
             source_message_id_hex: None,

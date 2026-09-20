@@ -1,3 +1,4 @@
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -125,7 +126,12 @@ impl AppClient {
             self.app
                 .record_account_app_event(&self.state.label, &message_projection)?
         };
-        if advance_read_marker && event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+        if advance_read_marker
+            && matches!(
+                event.kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+            )
+        {
             let read_marker =
                 self.app
                     .mark_timeline_message_read(&self.state.label, &group_id_hex, &event.id);

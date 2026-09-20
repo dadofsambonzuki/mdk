@@ -103,6 +103,115 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64, emoji: &str) -> Store
     }
 }
 
+fn poll(id: &str, sender: &str, at: u64) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: "11".repeat(32),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: Some(1),
+        direction: "received".to_owned(),
+        sender: sender.to_owned(),
+        plaintext: "Drink?".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_POLL,
+        tags: cgka_traits::poll_tags(
+            at,
+            &["Tea".to_owned(), "Coffee".to_owned()],
+            cgka_traits::PollType::SingleChoice,
+            Some(at + 100),
+        )
+        .unwrap(),
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    }
+}
+
+fn poll_response(
+    id: &str,
+    sender: &str,
+    target: &str,
+    at: u64,
+    option: &str,
+    direction: &str,
+) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: "11".repeat(32),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: Some(1),
+        direction: direction.to_owned(),
+        sender: sender.to_owned(),
+        plaintext: String::new(),
+        kind: MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+        tags: cgka_traits::poll_response_tags(target, &[option.to_owned()]).unwrap(),
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+        moderation_grant: false,
+    }
+}
+
+#[test]
+fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let poll_id = "22".repeat(32);
+    let older = "33".repeat(32);
+    let newer = "44".repeat(32);
+    let local = "55".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &older, "bob", &poll_id, 150, "0", "received",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &newer, "bob", &poll_id, 150, "1", "received",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(&local, "alice", &poll_id, 160, "0", "sent"))
+        .unwrap();
+
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.participants, 2);
+    assert_eq!(projected.local_selection, ["0"]);
+    assert_eq!(
+        projected
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+
+    store
+        .record_app_event(&delete(&"66".repeat(32), "bob", &newer, 170))
+        .unwrap();
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(
+        projected
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [2, 0]
+    );
+}
+
 fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
     StoredAppEvent {
             group_id_hex: "11".repeat(32),

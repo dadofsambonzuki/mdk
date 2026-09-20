@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
@@ -4400,8 +4401,10 @@ impl AppClient {
                     .ok()
                     .flatten()
                     .is_some_and(|message| {
-                        message.kind == MARMOT_APP_EVENT_KIND_CHAT
-                            && !message.deleted
+                        matches!(
+                            message.kind,
+                            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+                        ) && !message.deleted
                             && !message.invalidated
                     })
             });
@@ -4592,11 +4595,26 @@ impl AppClient {
             );
         }
         let moderation_grant = message.authority.is_some_and(|a| a.moderation_grant);
+        // A sibling device authenticates as the same Marmot account. Preserve
+        // that account-wide authorship for poll selection even though this
+        // device observed the response on the inbound path.
+        let direction = if message.kind == cgka_traits::MARMOT_APP_EVENT_KIND_POLL_RESPONSE
+            && message.sender
+                == self
+                    .app
+                    .account_home()
+                    .account(&self.state.label)?
+                    .account_id_hex
+        {
+            "sent"
+        } else {
+            "received"
+        };
         let message_projection = AppMessageProjection {
             authority: message.authority,
             message_id_hex: message.message_id_hex.clone(),
             source_message_id_hex: Some(message.source_message_id_hex.clone()),
-            direction: "received".to_owned(),
+            direction: direction.to_owned(),
             group_id_hex: hex::encode(message.group_id.as_slice()),
             sender: message.sender.clone(),
             plaintext: message.plaintext.clone(),

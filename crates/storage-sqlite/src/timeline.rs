@@ -37,6 +37,10 @@ use cgka_traits::app_event::{
 };
 use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, MarmotAppEvent,
+    PollOptionResult, PollProjection, parse_poll, parse_poll_response, validate_poll_response,
+};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -228,6 +232,10 @@ pub struct TimelineMessageRecord {
     pub has_reports: bool,
     #[serde(default)]
     pub group_system: Option<crate::GroupSystemEventProjection>,
+    /// Parsed NIP-88 poll plus its deterministic latest-response projection.
+    /// `None` for non-polls and malformed or unsupported poll events.
+    #[serde(default)]
+    pub poll: Option<PollProjection>,
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
     pub source_epoch: Option<u64>,
@@ -2116,6 +2124,7 @@ fn project_single_message_timeline_tx(
         // their target and deletes tombstone it. Every other kind — including
         // app-defined custom kinds — projects a generic row.
         MARMOT_APP_EVENT_KIND_REACTION
+        | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
         | MARMOT_APP_EVENT_KIND_DELETE
         | MARMOT_APP_EVENT_KIND_EDIT
         | MARMOT_APP_EVENT_KIND_REPORT
@@ -2152,6 +2161,7 @@ fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> 
             | MARMOT_APP_EVENT_KIND_REPORT
             | MARMOT_APP_EVENT_KIND_REVIEW
             | MARMOT_APP_EVENT_KIND_REMOVE
+            | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
     ) {
         return Ok(());
     }
@@ -2930,6 +2940,9 @@ fn affected_timeline_message_ids_for_parts_with_options_tx(
         MARMOT_APP_EVENT_KIND_REACTION => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
+        MARMOT_APP_EVENT_KIND_POLL_RESPONSE => {
+            ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
+        }
         MARMOT_APP_EVENT_KIND_REPORT => {
             ids.extend(tag_values(tags, EVENT_REF_TAG).map(ToOwned::to_owned));
         }
@@ -3184,6 +3197,8 @@ fn timeline_trigger_for_event_row(
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY => TimelineUpdateTrigger::AgentActivity,
         MARMOT_APP_EVENT_KIND_AGENT_OPERATION => TimelineUpdateTrigger::AgentOperation,
         MARMOT_APP_EVENT_KIND_GROUP_SYSTEM => TimelineUpdateTrigger::GroupSystem,
+        MARMOT_APP_EVENT_KIND_POLL => TimelineUpdateTrigger::NewMessage,
+        MARMOT_APP_EVENT_KIND_POLL_RESPONSE => TimelineUpdateTrigger::MessageEditedOrReprojected,
         MARMOT_APP_EVENT_KIND_REACTION => TimelineUpdateTrigger::ReactionAdded,
         MARMOT_APP_EVENT_KIND_EDIT => TimelineUpdateTrigger::MessageEditedOrReprojected,
         MARMOT_APP_EVENT_KIND_DELETE => {
@@ -3266,7 +3281,9 @@ fn modifier_target_message_id_tx(
     };
     if !matches!(
         kind,
-        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_EDIT
+        MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_EDIT
+            | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
     ) {
         return Ok(None);
     }
@@ -3665,6 +3682,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             // Modifier kinds never get a row of their own. Every other kind —
             // including app-defined custom kinds — projects a generic row.
             MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_POLL_RESPONSE
             | MARMOT_APP_EVENT_KIND_DELETE
             | MARMOT_APP_EVENT_KIND_EDIT
             | MARMOT_APP_EVENT_KIND_REPORT
@@ -3965,6 +3983,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
             row.get("authenticated_group_system")?,
             row.get::<_, bool>(17)?,
         ),
+        poll: None,
         message_id_hex: row.get(0)?,
         source_message_id_hex: row.get(1)?,
         source_epoch: row
@@ -4032,12 +4051,214 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
     })
 }
 
+/// Bound retained replacement history considered for one voter. This keeps a
+/// member from making projection cost grow without limit while preserving
+/// deterministic fallback through ordinary response deletion/retention.
+const MAX_POLL_RESPONSES_PER_AUTHOR: usize = 64;
+
+fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> StorageResult<()> {
+    let mut definitions = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.kind != MARMOT_APP_EVENT_KIND_POLL
+            || message.deleted
+            || message.invalidation_status.is_some()
+        {
+            continue;
+        }
+        let event = MarmotAppEvent {
+            id: message.message_id_hex.clone(),
+            pubkey: message.sender.clone(),
+            created_at: message.timeline_at,
+            kind: message.kind,
+            tags: message.tags.clone(),
+            content: message.plaintext.clone(),
+        };
+        if let Ok(definition) = parse_poll(&event) {
+            definitions.insert(
+                (message.group_id_hex.clone(), message.message_id_hex.clone()),
+                (
+                    index,
+                    definition,
+                    message.sender.clone(),
+                    message.timeline_at,
+                ),
+            );
+        }
+    }
+    if definitions.is_empty() {
+        return Ok(());
+    }
+
+    let mut by_group = BTreeMap::<String, Vec<String>>::new();
+    for (group, poll_id) in definitions.keys() {
+        by_group
+            .entry(group.clone())
+            .or_default()
+            .push(poll_id.clone());
+    }
+    let mut responses = Vec::new();
+    for (group, poll_ids) in by_group {
+        for chunk in poll_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
+                        direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
+                        invalidated, invalidation_reason, moderation_grant
+                 FROM (
+                    SELECT app_events.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY edges.target_message_id_hex, app_events.sender
+                               ORDER BY app_events.recorded_at DESC, app_events.message_id_hex DESC
+                           ) AS voter_rank
+                    FROM message_modifier_edges AS edges
+                    JOIN app_events
+                      ON app_events.group_id_hex = edges.group_id_hex
+                     AND app_events.message_id_hex = edges.modifier_message_id_hex
+                    WHERE edges.group_id_hex = ?
+                      AND edges.kind = ?
+                      AND app_events.invalidated = 0
+                      AND edges.target_message_id_hex IN ({placeholders})
+                 )
+                 WHERE voter_rank <= ?"
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 3);
+            values.push(rusqlite::types::Value::Text(group.clone()));
+            values.push(rusqlite::types::Value::Integer(u64_to_i64(
+                MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+            )?));
+            values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            values.push(rusqlite::types::Value::Integer(
+                MAX_POLL_RESPONSES_PER_AUTHOR as i64,
+            ));
+            let mut stmt = conn.prepare_cached(&sql).storage()?;
+            responses.extend(
+                stmt.query_map(params_from_iter(values.iter()), raw_event_from_row)
+                    .storage()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .storage()?,
+            );
+        }
+    }
+
+    let mut deleted = HashSet::new();
+    let mut responses_by_group = HashMap::<String, Vec<RawAppEvent>>::new();
+    for response in responses {
+        responses_by_group
+            .entry(response.group_id_hex.clone())
+            .or_default()
+            .push(response);
+    }
+    for (group, group_responses) in &responses_by_group {
+        deleted.extend(deleted_reaction_ids_for_target_tx(
+            conn,
+            group,
+            group_responses,
+        )?);
+    }
+
+    let mut effective =
+        HashMap::<(String, String, String), (u64, String, String, Vec<String>)>::new();
+    for response in responses_by_group.into_values().flatten() {
+        if deleted.contains(&response.message_id_hex) {
+            continue;
+        }
+        let event = MarmotAppEvent {
+            id: response.message_id_hex.clone(),
+            pubkey: response.sender.clone(),
+            created_at: response.recorded_at,
+            kind: response.kind,
+            tags: response.tags.clone(),
+            content: response.plaintext.clone(),
+        };
+        let Ok((poll_id, selections)) = parse_poll_response(&event) else {
+            continue;
+        };
+        let Some((_, poll, _, poll_created_at)) =
+            definitions.get(&(response.group_id_hex.clone(), poll_id.clone()))
+        else {
+            continue;
+        };
+        if validate_poll_response(poll, *poll_created_at, response.recorded_at, &selections)
+            .is_err()
+        {
+            continue;
+        }
+        let key = (
+            response.group_id_hex.clone(),
+            poll_id,
+            response.sender.clone(),
+        );
+        let order = (response.recorded_at, response.message_id_hex.as_str());
+        let replace = effective
+            .get(&key)
+            .is_none_or(|current| order > (current.0, current.1.as_str()));
+        if replace {
+            effective.insert(
+                key,
+                (
+                    response.recorded_at,
+                    response.message_id_hex,
+                    response.direction,
+                    selections,
+                ),
+            );
+        }
+    }
+
+    let now = unix_now_seconds();
+    for ((group, poll_id), (index, definition, creator, _)) in definitions {
+        let mut counts = definition
+            .options
+            .iter()
+            .map(|option| (option.id.clone(), 0_u64))
+            .collect::<BTreeMap<_, _>>();
+        let mut local_selection = Vec::new();
+        let mut participants = 0_u64;
+        for ((vote_group, vote_poll, _), (_, _, direction, selections)) in &effective {
+            if vote_group != &group || vote_poll != &poll_id {
+                continue;
+            }
+            participants = participants.saturating_add(1);
+            for selection in selections {
+                if let Some(count) = counts.get_mut(selection) {
+                    *count = count.saturating_add(1);
+                }
+            }
+            if direction == "sent" {
+                local_selection = selections.clone();
+            }
+        }
+        messages[index].poll = Some(PollProjection {
+            question: definition.question,
+            options: definition
+                .options
+                .into_iter()
+                .map(|option| PollOptionResult {
+                    votes: counts.get(&option.id).copied().unwrap_or_default(),
+                    id: option.id,
+                    label: option.label,
+                })
+                .collect(),
+            poll_type: definition.poll_type,
+            participants,
+            local_selection,
+            creator,
+            ends_at: definition.ends_at,
+            open: definition.ends_at.is_none_or(|deadline| now <= deadline),
+        });
+    }
+    Ok(())
+}
+
 fn hydrate_timeline_presentation(
     conn: &Connection,
     messages: &mut [TimelineMessageRecord],
 ) -> StorageResult<()> {
     reports::hydrate(conn, messages)?;
     filter_blocked_reactions(conn, messages)?;
+    hydrate_polls(conn, messages)?;
     let targets = messages
         .iter()
         .filter_map(|message| {

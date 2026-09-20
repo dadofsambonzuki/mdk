@@ -20,7 +20,7 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{
-    EngineError, GroupId, MessageId, SecretBytes, TransportAdapter, TransportEndpoint,
+    EngineError, GroupId, MessageId, PollType, SecretBytes, TransportAdapter, TransportEndpoint,
     TransportGroupSync,
 };
 #[cfg(test)]
@@ -3618,6 +3618,8 @@ impl AppClient {
                 (Family::MessageAction, "unreact")
             }
             AppMessageIntent::Edit { .. } => (Family::MessageAction, "edit"),
+            AppMessageIntent::Poll { .. } => (Family::MessageAction, "poll"),
+            AppMessageIntent::PollResponse { .. } => (Family::MessageAction, "poll_response"),
             AppMessageIntent::Delete { .. } | AppMessageIntent::RemoveMessage { .. } => {
                 (Family::MessageAction, "delete")
             }
@@ -5018,6 +5020,48 @@ impl AppClient {
                     kind,
                     tags,
                     content,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    /// Create a bounded NIP-88 poll inside the encrypted group.
+    pub async fn create_poll(
+        &mut self,
+        group_id: &GroupId,
+        question: String,
+        options: Vec<String>,
+        poll_type: PollType,
+        ends_at: Option<u64>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::Poll {
+                    question,
+                    options,
+                    poll_type,
+                    ends_at,
+                },
+            )
+            .await?;
+        Ok(summary)
+    }
+
+    /// Cast a complete replacement selection for an existing poll.
+    pub async fn cast_poll_vote(
+        &mut self,
+        group_id: &GroupId,
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    ) -> Result<SendSummary, AppError> {
+        let (_event, summary) = self
+            .send_app_event(
+                group_id,
+                AppMessageIntent::PollResponse {
+                    poll_event_id,
+                    option_ids,
                 },
             )
             .await?;

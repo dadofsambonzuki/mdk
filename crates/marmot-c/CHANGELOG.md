@@ -7,6 +7,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
+  to `MarmotTimelineMessageRecord`; regenerate and recompile with the matching header and library.
+
 ## [0.10.4] - 2026-09-20
 
 ### Added

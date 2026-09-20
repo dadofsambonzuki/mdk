@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod maintenance;
 pub mod message;
 pub mod peeler;
+pub mod polls;
 pub mod storage;
 pub mod transport;
 pub mod transport_adapter;
@@ -99,6 +100,13 @@ pub use message::{
     StoredMessagePayload,
 };
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
+pub use polls::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, POLL_MAX_LIFETIME_SECONDS,
+    POLL_MAX_OPTION_BYTES, POLL_MAX_OPTIONS, POLL_MAX_QUESTION_BYTES, PollDefinition, PollError,
+    PollOptionDefinition, PollOptionResult, PollProjection, PollType, parse_poll,
+    parse_poll_response, poll_response_tags, poll_tags, validate_poll_input,
+    validate_poll_response,
+};
 pub use storage::{
     CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,
     DisbandFailureReason, DisbandRequest, DisbandRequestStatus, DisbandRequestStorage,

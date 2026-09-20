@@ -24,6 +24,7 @@ use serde::{
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
 use cgka_traits::app_event::{
     EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
@@ -1863,9 +1864,9 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
             Some(NotificationTrafficClass::AgentActivity)
         }
-        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION => {
-            Some(NotificationTrafficClass::Standard)
-        }
+        MARMOT_APP_EVENT_KIND_CHAT
+        | MARMOT_APP_EVENT_KIND_REACTION
+        | MARMOT_APP_EVENT_KIND_POLL => Some(NotificationTrafficClass::Standard),
         _ => None,
     }
 }
