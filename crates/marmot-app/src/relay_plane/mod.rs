@@ -18,14 +18,16 @@ use nostr_sdk::prelude::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrPublishOutcome, NostrReconciliationItem,
-    NostrReconciliationSummary, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrSubscription, NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
-    RelayRegistrationOutcome, SubscriptionAttempt,
+    NostrReconciliationSummary, NostrRelayClient, NostrRouteRegistrationSnapshot,
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
+    RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome, SubscriptionAttempt,
+    SubscriptionEndpointRegistrationState, SubscriptionRegistrationDetail,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -48,6 +50,10 @@ pub(crate) use directory::{
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::RelaySafetyPolicy;
+use safety::{
+    RelaySubscriptionAdmission, RelaySubscriptionEndpointDisposition,
+    RelaySubscriptionEndpointOutcome,
+};
 pub(crate) use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps
@@ -80,6 +86,7 @@ struct MarmotRelayPlaneInner {
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
     directory_subscription_sync: Mutex<()>,
+    transport_statuses: crate::runtime::AccountTransportStatusRegistry,
 }
 
 struct RelayPlaneTransport {
@@ -658,6 +665,7 @@ impl MarmotRelayPlane {
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
                 directory_subscription_sync: Mutex::new(()),
+                transport_statuses: crate::runtime::AccountTransportStatusRegistry::default(),
             }),
         };
         this.spawn_router();
@@ -743,6 +751,19 @@ impl MarmotRelayPlane {
         endpoints: Vec<String>,
     ) -> Vec<RelayEndpointClassification> {
         self.inner.relay_safety.classify_endpoints(endpoints)
+    }
+
+    pub(crate) fn account_transport_status(
+        &self,
+        account_id: &MemberId,
+    ) -> crate::AccountTransportStatusSnapshot {
+        self.inner.transport_statuses.snapshot(account_id)
+    }
+
+    pub(crate) fn account_transport_status_registry(
+        &self,
+    ) -> crate::runtime::AccountTransportStatusRegistry {
+        self.inner.transport_statuses.clone()
     }
 
     pub fn subscription_rebuild_since(
@@ -1784,7 +1805,485 @@ fn recover_relay_notification_forwarder(
     }
 }
 
+fn transport_route_ref(
+    role: crate::AccountTransportRouteRole,
+    group_id: Option<&cgka_traits::GroupId>,
+    transport_group_id: Option<&[u8]>,
+    outcomes: &[RelaySubscriptionEndpointOutcome],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update([match role {
+        crate::AccountTransportRouteRole::Inbox => 0,
+        crate::AccountTransportRouteRole::CurrentGroup => 1,
+        crate::AccountTransportRouteRole::HistoricalGroup => 2,
+    }]);
+    for value in [
+        group_id.map(cgka_traits::GroupId::as_slice),
+        transport_group_id,
+    ] {
+        let value = value.unwrap_or_default();
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    hasher.update((outcomes.len() as u64).to_be_bytes());
+    for outcome in outcomes {
+        let identity = outcome
+            .normalized_endpoint
+            .as_deref()
+            .unwrap_or(&outcome.requested_endpoint);
+        hasher.update((identity.len() as u64).to_be_bytes());
+        hasher.update(identity.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn endpoint_admission_outcome(
+    disposition: RelaySubscriptionEndpointDisposition,
+) -> crate::EndpointAdmissionOutcome {
+    match disposition {
+        RelaySubscriptionEndpointDisposition::Admitted => crate::EndpointAdmissionOutcome::Allowed,
+        RelaySubscriptionEndpointDisposition::Invalid => crate::EndpointAdmissionOutcome::Invalid,
+        RelaySubscriptionEndpointDisposition::Unsafe => crate::EndpointAdmissionOutcome::Unsafe,
+        RelaySubscriptionEndpointDisposition::Retired => crate::EndpointAdmissionOutcome::Retired,
+        RelaySubscriptionEndpointDisposition::Duplicate => {
+            crate::EndpointAdmissionOutcome::Duplicate
+        }
+        RelaySubscriptionEndpointDisposition::BeyondRouteLimit => {
+            crate::EndpointAdmissionOutcome::BeyondRouteLimit
+        }
+    }
+}
+
+fn pending_transport_route_status(
+    role: crate::AccountTransportRouteRole,
+    group_id: Option<&cgka_traits::GroupId>,
+    transport_group_id: Option<&[u8]>,
+    admission: &RelaySubscriptionAdmission,
+) -> crate::AccountTransportRouteStatus {
+    let blocked = admission.admitted_endpoints.is_empty();
+    crate::AccountTransportRouteStatus {
+        route_ref: transport_route_ref(
+            role,
+            group_id,
+            transport_group_id,
+            &admission.endpoint_outcomes,
+        ),
+        group_id_hex: group_id.map(|group_id| hex::encode(group_id.as_slice())),
+        transport_group_id_hex: transport_group_id.map(hex::encode),
+        role,
+        state: if blocked {
+            crate::AccountTransportRouteState::PolicyBlocked
+        } else {
+            crate::AccountTransportRouteState::Pending
+        },
+        requested_endpoint_count: u32::try_from(admission.requested_endpoints.len())
+            .unwrap_or(u32::MAX),
+        admitted_endpoint_count: u32::try_from(admission.admitted_endpoints.len())
+            .unwrap_or(u32::MAX),
+        registered_endpoint_count: Some(0),
+        registration_detail: crate::RegistrationDetailCompleteness::Exact,
+        endpoints: admission
+            .endpoint_outcomes
+            .iter()
+            .map(|outcome| crate::AccountTransportEndpointStatus {
+                requested_endpoint: outcome.requested_endpoint.clone(),
+                normalized_endpoint: outcome.normalized_endpoint.clone(),
+                admission: endpoint_admission_outcome(outcome.disposition),
+                registration: if outcome.disposition
+                    == RelaySubscriptionEndpointDisposition::Admitted
+                {
+                    crate::EndpointRegistrationOutcome::Pending
+                } else {
+                    crate::EndpointRegistrationOutcome::NotAttempted
+                },
+            })
+            .collect(),
+        pending_registration: !blocked,
+        pending_replay: true,
+        retry_delay_ms: None,
+    }
+}
+
+fn registration_matches_route(
+    registration: &NostrRouteRegistrationSnapshot,
+    route: &crate::AccountTransportRouteStatus,
+) -> bool {
+    match (&registration.subscription, route.role) {
+        (NostrSubscription::AccountInbox { .. }, crate::AccountTransportRouteRole::Inbox) => true,
+        (
+            NostrSubscription::Group {
+                group_id,
+                transport_group_id,
+                endpoints,
+                ..
+            },
+            crate::AccountTransportRouteRole::CurrentGroup
+            | crate::AccountTransportRouteRole::HistoricalGroup,
+        ) => {
+            let desired_endpoints = route
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.admission == crate::EndpointAdmissionOutcome::Allowed)
+                .filter_map(|endpoint| endpoint.normalized_endpoint.as_deref())
+                .collect::<Vec<_>>();
+            route.group_id_hex.as_deref() == Some(hex::encode(group_id.as_slice()).as_str())
+                && route.transport_group_id_hex.as_deref()
+                    == Some(hex::encode(transport_group_id).as_str())
+                && endpoints.len() == desired_endpoints.len()
+                && endpoints.iter().all(|endpoint| {
+                    desired_endpoints
+                        .iter()
+                        .any(|desired| *desired == endpoint.as_str())
+                })
+        }
+        _ => false,
+    }
+}
+
+fn apply_registration_to_route(
+    route: &mut crate::AccountTransportRouteStatus,
+    registrations: &[NostrRouteRegistrationSnapshot],
+) {
+    if route.state == crate::AccountTransportRouteState::PolicyBlocked {
+        return;
+    }
+    let Some(registration) = registrations
+        .iter()
+        .find(|registration| registration_matches_route(registration, route))
+    else {
+        route.state = crate::AccountTransportRouteState::Pending;
+        route.pending_registration = true;
+        return;
+    };
+    route.registration_detail = match registration.detail {
+        SubscriptionRegistrationDetail::Exact => crate::RegistrationDetailCompleteness::Exact,
+        SubscriptionRegistrationDetail::Unknown => crate::RegistrationDetailCompleteness::Unknown,
+    };
+    route.registered_endpoint_count = match registration.detail {
+        SubscriptionRegistrationDetail::Exact => Some(
+            u32::try_from(
+                registration
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| {
+                        endpoint.state == SubscriptionEndpointRegistrationState::Registered
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        ),
+        SubscriptionRegistrationDetail::Unknown => None,
+    };
+    let mut retry_pending = false;
+    for endpoint in &mut route.endpoints {
+        if endpoint.admission != crate::EndpointAdmissionOutcome::Allowed {
+            continue;
+        }
+        let Some(normalized) = endpoint.normalized_endpoint.as_deref() else {
+            continue;
+        };
+        endpoint.registration = match registration
+            .endpoints
+            .iter()
+            .find(|candidate| candidate.endpoint.as_str() == normalized)
+            .map(|candidate| candidate.state)
+        {
+            Some(SubscriptionEndpointRegistrationState::Registered) => {
+                crate::EndpointRegistrationOutcome::Registered
+            }
+            Some(SubscriptionEndpointRegistrationState::RetryPending) => {
+                retry_pending = true;
+                crate::EndpointRegistrationOutcome::Failed
+            }
+            Some(SubscriptionEndpointRegistrationState::Pending) => {
+                crate::EndpointRegistrationOutcome::Pending
+            }
+            Some(SubscriptionEndpointRegistrationState::Unknown) => {
+                crate::EndpointRegistrationOutcome::Unknown
+            }
+            None if registration.detail == SubscriptionRegistrationDetail::Unknown => {
+                crate::EndpointRegistrationOutcome::Unknown
+            }
+            None => crate::EndpointRegistrationOutcome::Pending,
+        };
+    }
+    route.pending_registration = registration.endpoints.iter().any(|endpoint| {
+        matches!(
+            endpoint.state,
+            SubscriptionEndpointRegistrationState::Pending
+                | SubscriptionEndpointRegistrationState::RetryPending
+        )
+    }) || !registration.registered;
+    route.state = if registration.registered {
+        crate::AccountTransportRouteState::Registered
+    } else if retry_pending
+        || registration
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.state == SubscriptionEndpointRegistrationState::RetryPending)
+    {
+        crate::AccountTransportRouteState::RetryPending
+    } else {
+        crate::AccountTransportRouteState::Pending
+    };
+}
+
+fn finalize_transport_snapshot(
+    mut snapshot: crate::AccountTransportStatusSnapshot,
+    registrations: &[NostrRouteRegistrationSnapshot],
+    retry_delay_ms: Option<u64>,
+) -> crate::AccountTransportStatusSnapshot {
+    if let Some(inbox) = &mut snapshot.inbox {
+        apply_registration_to_route(inbox, registrations);
+    }
+    for route in snapshot
+        .current_group_routes
+        .iter_mut()
+        .chain(snapshot.historical_group_routes.iter_mut())
+    {
+        apply_registration_to_route(route, registrations);
+    }
+    let routes = snapshot
+        .inbox
+        .iter()
+        .chain(snapshot.current_group_routes.iter())
+        .chain(snapshot.historical_group_routes.iter())
+        .collect::<Vec<_>>();
+    let registered = routes
+        .iter()
+        .filter(|route| route.state == crate::AccountTransportRouteState::Registered)
+        .count();
+    let completely_available = routes.iter().all(|route| {
+        route.state == crate::AccountTransportRouteState::Registered
+            && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
+            && route.requested_endpoint_count == route.admitted_endpoint_count
+            && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
+    });
+    snapshot.state = if registered == 0 {
+        crate::AccountTransportState::Unavailable
+    } else if completely_available {
+        crate::AccountTransportState::Available
+    } else {
+        crate::AccountTransportState::Degraded
+    };
+    for route in snapshot
+        .inbox
+        .iter_mut()
+        .chain(snapshot.current_group_routes.iter_mut())
+        .chain(snapshot.historical_group_routes.iter_mut())
+    {
+        route.retry_delay_ms = route
+            .pending_registration
+            .then_some(retry_delay_ms)
+            .flatten();
+    }
+    snapshot
+}
+
+fn canonicalize_transport_route_statuses(routes: &mut [crate::AccountTransportRouteStatus]) {
+    routes.sort_by(|left, right| {
+        left.group_id_hex
+            .cmp(&right.group_id_hex)
+            .then_with(|| {
+                left.transport_group_id_hex
+                    .cmp(&right.transport_group_id_hex)
+            })
+            .then_with(|| left.route_ref.cmp(&right.route_ref))
+    });
+}
+
+fn policy_exclusion_count<'a>(
+    routes: impl Iterator<Item = &'a crate::AccountTransportRouteStatus>,
+) -> usize {
+    routes
+        .flat_map(|route| &route.endpoints)
+        .filter(|endpoint| endpoint.admission != crate::EndpointAdmissionOutcome::Allowed)
+        .count()
+}
+
 impl MarmotRelayPlaneAccountAdapter {
+    pub(crate) fn mark_subscription_replay_complete(&self) {
+        self.relay_plane
+            .inner
+            .transport_statuses
+            .mark_replay_complete(&self.account_id);
+    }
+
+    /// Replay can complete only when every requested endpoint is admitted and
+    /// its registration is known to be complete. Adapter EOSE alone covers
+    /// only admitted endpoints and must not silently forgive policy-excluded
+    /// or compatibility-unknown coverage.
+    pub(crate) fn subscription_replay_coverage_complete(&self) -> bool {
+        let snapshot = self
+            .relay_plane
+            .inner
+            .transport_statuses
+            .snapshot(&self.account_id);
+        snapshot.state == crate::AccountTransportState::Available
+    }
+
+    fn admit_activation(
+        &self,
+        mut activation: TransportAccountActivation,
+    ) -> (
+        TransportAccountActivation,
+        crate::AccountTransportStatusSnapshot,
+    ) {
+        let inbox_admission = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .admit_subscription_endpoints(activation.inbox_endpoints);
+        activation.inbox_endpoints = inbox_admission.admitted_endpoints.clone();
+        let inbox = pending_transport_route_status(
+            crate::AccountTransportRouteRole::Inbox,
+            None,
+            None,
+            &inbox_admission,
+        );
+        let mut current_group_routes = Vec::new();
+        let mut historical_group_routes = Vec::new();
+        let mut seen_groups = HashSet::new();
+        for group in &mut activation.group_subscriptions {
+            let role = if seen_groups.insert(group.group_id.clone()) {
+                crate::AccountTransportRouteRole::CurrentGroup
+            } else {
+                crate::AccountTransportRouteRole::HistoricalGroup
+            };
+            let admission = self
+                .relay_plane
+                .inner
+                .relay_safety
+                .admit_subscription_endpoints(std::mem::take(&mut group.endpoints));
+            group.endpoints = admission.admitted_endpoints.clone();
+            let status = pending_transport_route_status(
+                role,
+                Some(&group.group_id),
+                Some(&group.transport_group_id),
+                &admission,
+            );
+            match role {
+                crate::AccountTransportRouteRole::CurrentGroup => current_group_routes.push(status),
+                crate::AccountTransportRouteRole::HistoricalGroup => {
+                    historical_group_routes.push(status)
+                }
+                crate::AccountTransportRouteRole::Inbox => unreachable!(),
+            }
+        }
+        canonicalize_transport_route_statuses(&mut current_group_routes);
+        canonicalize_transport_route_statuses(&mut historical_group_routes);
+        (
+            activation,
+            crate::AccountTransportStatusSnapshot {
+                revision: 0,
+                state: crate::AccountTransportState::Unavailable,
+                inbox: Some(inbox),
+                current_group_routes,
+                historical_group_routes,
+            },
+        )
+    }
+
+    fn admit_group_sync(
+        &self,
+        mut sync: TransportGroupSync,
+    ) -> (TransportGroupSync, crate::AccountTransportStatusSnapshot) {
+        let mut snapshot = self
+            .relay_plane
+            .inner
+            .transport_statuses
+            .snapshot(&self.account_id);
+        if let Some(inbox) = &mut snapshot.inbox {
+            inbox.pending_replay = true;
+        }
+        snapshot.current_group_routes.clear();
+        snapshot.historical_group_routes.clear();
+        let mut seen_groups = HashSet::new();
+        for group in &mut sync.group_subscriptions {
+            let role = if seen_groups.insert(group.group_id.clone()) {
+                crate::AccountTransportRouteRole::CurrentGroup
+            } else {
+                crate::AccountTransportRouteRole::HistoricalGroup
+            };
+            let admission = self
+                .relay_plane
+                .inner
+                .relay_safety
+                .admit_subscription_endpoints(std::mem::take(&mut group.endpoints));
+            group.endpoints = admission.admitted_endpoints.clone();
+            let status = pending_transport_route_status(
+                role,
+                Some(&group.group_id),
+                Some(&group.transport_group_id),
+                &admission,
+            );
+            match role {
+                crate::AccountTransportRouteRole::CurrentGroup => {
+                    snapshot.current_group_routes.push(status)
+                }
+                crate::AccountTransportRouteRole::HistoricalGroup => {
+                    snapshot.historical_group_routes.push(status)
+                }
+                crate::AccountTransportRouteRole::Inbox => unreachable!(),
+            }
+        }
+        canonicalize_transport_route_statuses(&mut snapshot.current_group_routes);
+        canonicalize_transport_route_statuses(&mut snapshot.historical_group_routes);
+        snapshot.state = crate::AccountTransportState::Unavailable;
+        (sync, snapshot)
+    }
+
+    async fn publish_registration_snapshot(&self, retry_delay_ms: Option<u64>) -> bool {
+        let registrations = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_registration_snapshot(&self.account_id)
+            .await;
+        let desired = self
+            .relay_plane
+            .inner
+            .transport_statuses
+            .snapshot(&self.account_id);
+        let snapshot = finalize_transport_snapshot(desired, &registrations, retry_delay_ms);
+        let pending = snapshot
+            .inbox
+            .iter()
+            .chain(snapshot.current_group_routes.iter())
+            .chain(snapshot.historical_group_routes.iter())
+            .any(|route| route.pending_registration);
+        self.relay_plane
+            .inner
+            .transport_statuses
+            .publish(&self.account_id, snapshot);
+        pending
+    }
+
+    pub(crate) async fn reconcile_pending_registrations(&self, retry_delay: Duration) -> bool {
+        let outcome = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .reconcile_pending_registrations_for_account(&self.account_id)
+            .await;
+        let next_delay_ms = u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX);
+        let pending = self
+            .publish_registration_snapshot((outcome.still_pending > 0).then_some(next_delay_ms))
+            .await;
+        pending || outcome.still_pending > 0
+    }
+
+    pub(crate) async fn has_pending_registrations(&self) -> bool {
+        self.publish_registration_snapshot(None).await
+    }
+
+    pub(crate) async fn note_registration_retry_scheduled(&self, delay: Duration) {
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.publish_registration_snapshot(Some(delay_ms)).await;
+    }
+
     /// Explicit catch-up must reissue even settled, matching subscriptions.
     /// Cancellation leaves reuse disabled until an activation succeeds.
     pub(crate) async fn require_fresh_activation(&self) {
@@ -1811,22 +2310,21 @@ impl MarmotRelayPlaneAccountAdapter {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
         };
-        let activation = self
+        let admission = self
             .relay_plane
             .inner
             .relay_safety
-            .sanitize_activation(TransportAccountActivation {
-                account_id: self.account_id.clone(),
-                inbox_endpoints: endpoints,
-                group_subscriptions: Vec::new(),
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
+            .admit_subscription_endpoints(endpoints);
+        if admission.admitted_endpoints.is_empty() {
+            return Err(TransportAdapterError::Subscription(
+                "inbox history route has no admitted endpoint".to_owned(),
+            ));
+        }
         let result = client
             .reconcile_subscription(
                 NostrSubscription::AccountInbox {
                     account_id: self.account_id.clone(),
-                    endpoints: activation.inbox_endpoints,
+                    endpoints: admission.admitted_endpoints,
                     since: None,
                     // A one-shot reconciliation REQ is not owned by an account
                     // activation and never feeds the replay-coverage gate.
@@ -1871,21 +2369,20 @@ impl MarmotRelayPlaneAccountAdapter {
         let Some(client) = &self.relay_plane.inner.transport.sdk_relay_client else {
             return Ok(None);
         };
-        let sync = self
+        let admission = self
             .relay_plane
             .inner
             .relay_safety
-            .sanitize_group_sync(TransportGroupSync {
-                account_id: self.account_id.clone(),
-                group_subscriptions: vec![group],
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
-            TransportAdapterError::Subscription(
-                "reconciliation group subscription was empty".to_owned(),
-            )
-        })?;
+            .admit_subscription_endpoints(group.endpoints.clone());
+        if admission.admitted_endpoints.is_empty() {
+            return Err(TransportAdapterError::Subscription(
+                "group history route has no admitted endpoint".to_owned(),
+            ));
+        }
+        let group = TransportGroupSubscription {
+            endpoints: admission.admitted_endpoints,
+            ..group
+        };
         let result = client
             .reconcile_subscription(
                 NostrSubscription::Group {
@@ -1930,21 +2427,20 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
-        let sync = self
+        let admission = self
             .relay_plane
             .inner
             .relay_safety
-            .sanitize_group_sync(TransportGroupSync {
-                account_id: self.account_id.clone(),
-                group_subscriptions: vec![group],
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
-            TransportAdapterError::Subscription(
-                "maintenance group subscription was empty".to_owned(),
-            )
-        })?;
+            .admit_subscription_endpoints(group.endpoints.clone());
+        if admission.admitted_endpoints.is_empty() {
+            return Err(TransportAdapterError::Subscription(
+                "maintenance group subscription has no admitted endpoint".to_owned(),
+            ));
+        }
+        let group = TransportGroupSubscription {
+            endpoints: admission.admitted_endpoints,
+            ..group
+        };
         self.relay_plane
             .inner
             .transport
@@ -2030,30 +2526,23 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: &TransportGroupSubscription,
     ) -> Result<(), TransportAdapterError> {
-        let sync = self
+        let admission = self
             .relay_plane
             .inner
             .relay_safety
-            .sanitize_group_sync(TransportGroupSync {
-                account_id: self.account_id.clone(),
-                group_subscriptions: vec![group.clone()],
-                since: None,
-            })
-            .map_err(TransportAdapterError::Subscription)?;
-        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
-            TransportAdapterError::Subscription(
-                "maintenance group subscription was empty".to_owned(),
-            )
-        })?;
+            .admit_subscription_endpoints(group.endpoints.clone());
+        if admission.admitted_endpoints.is_empty() {
+            return Ok(());
+        }
         self.relay_plane
             .inner
             .transport
             .adapter
             .remove_group_maintenance_subscription(NostrSubscription::GroupMaintenance {
                 account_id: self.account_id.clone(),
-                group_id: group.group_id,
-                transport_group_id: group.transport_group_id,
-                endpoints: group.endpoints,
+                group_id: group.group_id.clone(),
+                transport_group_id: group.transport_group_id.clone(),
+                endpoints: admission.admitted_endpoints,
             })
             .await
     }
@@ -2070,12 +2559,24 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
                 activation.account_id,
             ));
         }
-        let activation = self
-            .relay_plane
+        let (activation, desired_status) = self.admit_activation(activation);
+        let policy_exclusions = policy_exclusion_count(
+            desired_status
+                .inbox
+                .iter()
+                .chain(desired_status.current_group_routes.iter())
+                .chain(desired_status.historical_group_routes.iter()),
+        );
+        self.relay_plane
             .inner
-            .relay_safety
-            .sanitize_activation(activation)
-            .map_err(TransportAdapterError::Subscription)?;
+            .transport_statuses
+            .publish(&self.account_id, desired_status);
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .record_subscription_policy_exclusions(policy_exclusions)
+            .await;
         let incremental = activation.since.map(|since| IncrementalActivation {
             inbox_endpoints: activation.inbox_endpoints.clone(),
             since,
@@ -2088,19 +2589,22 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         // unconditional orphan-REQ cleanup. None always requests full history.
         *previous = None;
         let adapter = &self.relay_plane.inner.transport.adapter;
-        if reuse {
+        let result = if reuse {
             adapter
                 .sync_account_groups(TransportGroupSync {
                     account_id: activation.account_id,
                     group_subscriptions: activation.group_subscriptions,
                     since: activation.since,
                 })
-                .await?;
+                .await
         } else {
-            adapter.activate_account(activation).await?;
+            adapter.activate_account(activation).await
+        };
+        self.publish_registration_snapshot(None).await;
+        if result.is_ok() {
+            *previous = incremental;
         }
-        *previous = incremental;
-        Ok(())
+        result
     }
 
     async fn sync_account_groups(
@@ -2110,18 +2614,32 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         if sync.account_id != self.account_id {
             return Err(TransportAdapterError::AccountNotActive(sync.account_id));
         }
-        let sync = self
-            .relay_plane
+        let (sync, desired_status) = self.admit_group_sync(sync);
+        let policy_exclusions = policy_exclusion_count(
+            desired_status
+                .current_group_routes
+                .iter()
+                .chain(desired_status.historical_group_routes.iter()),
+        );
+        self.relay_plane
             .inner
-            .relay_safety
-            .sanitize_group_sync(sync)
-            .map_err(TransportAdapterError::Subscription)?;
+            .transport_statuses
+            .publish(&self.account_id, desired_status);
         self.relay_plane
             .inner
             .transport
             .adapter
+            .record_subscription_policy_exclusions(policy_exclusions)
+            .await;
+        let result = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
             .sync_account_groups(sync)
-            .await
+            .await;
+        self.publish_registration_snapshot(None).await;
+        result
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
@@ -2137,7 +2655,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             .transport
             .adapter
             .deactivate_account(account_id)
-            .await
+            .await?;
+        self.relay_plane
+            .inner
+            .transport_statuses
+            .mark_inactive(account_id);
+        Ok(())
     }
 
     async fn publish(

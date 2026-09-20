@@ -54,6 +54,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | Main Chats/Unread/Archived/Left screens | `openChatListWindow` | `presentedChatList` / `openPresentedChatList` for a full selected list; `chatList` / `subscribeChatList` for raw rows and custom filters. Do not filter a loaded page to implement full-account search. |
 | One chat row | `presentedChatListRow` | `chatListRow` when raw fields are specifically required. Avoid account-wide reads for one row. |
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
+| Account transport coverage | `accountTransportStatus` for a point-in-time read; `subscribeAccountTransportStatus` for live complete replacements | `relayHealth` is device-wide aggregate connection health and cannot identify whether one account's inbox or group routes are usable. Runtime events do not carry this status. |
 | Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
@@ -78,7 +79,7 @@ All methods, including less common management/diagnostic operations, are listed 
 | Screens, read state and drafts | Prepared bounded lists/conversations, account attention, read markers, manual unread, pins, mutes and revisioned composers. MDK owns persistent projection state; the host owns viewport/layout. |
 | Media and avatars | Sending/uploading media is separate from discovery, receiving, retained-byte access and decoding. Use original source slots and current opaque references; preserve rejected attachment positions. |
 | Notifications and push | Notification preferences, native registration, bounded wake/catch-up and notification subscriptions. The host owns OS tokens, permission prompts, background budgets and notification presentation. |
-| Relays and maintenance | Relay safety/classification, account/user relay lists, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
+| Relays and maintenance | Relay safety/classification, account/user relay lists, account transport coverage, health, connectivity restoration, KeyPackage rotation and periodic group updates. Loopback development policy is explicit; connectivity recovery is not permission to reset user settings. |
 | Agent streams | Start/watch live text previews or use a publisher handle to append then finish a durable transcript. Preview transport and durable message delivery have different outcomes; ephemeral handles do not provide restart persistence. |
 | Diagnostics | Fixed performance milestones/snapshots, consent-gated product events, relay telemetry, audit recording/files/uploads. Keep each configuration and consent boundary explicit; do not dump secrets or DTOs into logs. |
 
@@ -108,6 +109,26 @@ storage/closed/stopping/not-ready errors separately from successful empty result
 or task cancellation, a durable mutation may already be queued; refresh authoritative state
 before retrying. Do not translate every error into an empty list, restart the entire runtime on
 every subscription update, or delete lock/database files to recover ownership.
+
+### Account transport coverage
+
+`accountTransportStatus(accountRef)` is a read-only process-local view of the account's
+inbox, current group routes and retained historical routes. It never activates the account
+or performs network I/O. A known account with no desired live transport session returns
+`Inactive`; an unknown account remains an error. Registration means only that the local
+relay client installed a subscription. It does not prove connectivity, complete history or
+recipient delivery.
+
+`subscribeAccountTransportStatus(accountRef)` returns one initial snapshot followed by
+complete semantic replacements. The stream is bounded and coalescing, so revisions may jump;
+replace the rendered state instead of replaying intermediate transitions. Retry delay is the
+selected delay, not a countdown, and time passing alone emits no update. `registeredEndpointCount`
+is absent when `registrationDetail` is `Unknown`; never interpret that case as zero registrations.
+The subscription closes on runtime shutdown.
+
+Route references are opaque. Group ids and endpoint strings are caller-owned diagnostic data
+that may be used in a repair UI, but must not be copied into logs, metrics labels or generic error
+messages. Filtering affects local operational routing only and does not rewrite signed routing bytes.
 
 ### Screen snapshots, paging and ownership
 

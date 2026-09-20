@@ -32,6 +32,7 @@ mod query_work_test_support;
 mod recovery_health;
 mod shared;
 mod storage;
+mod subscription_replay;
 mod timeline;
 mod user_blocks;
 pub use user_blocks::{BlockListSnapshot, BlockedUser, PendingBlockPublication, StoredBlockList};
@@ -107,6 +108,11 @@ pub use shared::{
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use storage::messages::StorageFormatBenchSizes;
+pub use subscription_replay::{
+    SubscriptionReplayClearResult, SubscriptionReplayGeneration, SubscriptionReplayGroupRole,
+    SubscriptionReplayObligation, SubscriptionReplayPreparation, SubscriptionReplayReplacement,
+    SubscriptionReplayRoute,
+};
 pub use timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,

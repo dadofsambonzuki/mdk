@@ -2297,4 +2297,32 @@ mod tests {
         assert_eq!(runtime.reconcile_invocation_count().await, 0);
         runtime.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn transport_status_reads_do_not_start_or_reconcile_workers() {
+        use super::super::MarmotAppRuntime;
+        use crate::AccountTransportState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let account = marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+            dir.path(),
+            "wss://relay.example",
+        ));
+
+        let snapshot = runtime.account_transport_status(&account.label).unwrap();
+        assert_eq!(snapshot.state, AccountTransportState::Inactive);
+        let mut subscription = runtime
+            .subscribe_account_transport_status(&account.label)
+            .unwrap();
+        assert_eq!(subscription.snapshot.state, AccountTransportState::Inactive);
+        assert!(runtime.account_transport_status("missing-account").is_err());
+        assert_eq!(runtime.reconcile_invocation_count().await, 0);
+        assert!(runtime.accounts().workers.lock().await.is_empty());
+
+        runtime.shutdown().await;
+        assert!(subscription.recv().await.is_none());
+    }
 }

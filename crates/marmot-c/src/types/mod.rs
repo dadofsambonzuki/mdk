@@ -25,6 +25,7 @@ pub mod push;
 pub mod relay;
 pub mod telemetry;
 pub mod timeline;
+pub mod transport_status;
 
 pub mod onboarding;
 

@@ -1115,6 +1115,11 @@ impl TransportAdapterError {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait TransportAdapter: Send + Sync {
     /// Activate inbox and group subscriptions for an account.
+    ///
+    /// Implementations may retain desired routing and retry state when some
+    /// routes fail. A usable partial activation returns success; an activation
+    /// with no usable route returns a subscription error without implying that
+    /// retained recovery work was discarded.
     async fn activate_account(
         &self,
         activation: TransportAccountActivation,
@@ -1122,11 +1127,10 @@ pub trait TransportAdapter: Send + Sync {
 
     /// Refresh only the group subscription plane for an active account.
     ///
-    /// Subscribe failures for added groups fail fast and leave adapter state
-    /// untouched. Unsubscribe failures for removed groups are absorbed: the
-    /// removal takes effect in the adapter's routing state immediately, the
-    /// relay-side unsubscribe is retried on subsequent syncs, and such
-    /// failures never fail the call.
+    /// Implementations may retain failed additions for background
+    /// reconciliation while preserving independently usable routes. Removals
+    /// take effect in routing state independently of relay-side teardown;
+    /// transient unsubscribe cleanup may be retried later.
     async fn sync_account_groups(
         &self,
         sync: TransportGroupSync,

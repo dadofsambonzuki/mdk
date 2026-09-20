@@ -1,16 +1,13 @@
 use std::net::IpAddr;
 
 use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
-use cgka_traits::{
-    TransportAccountActivation, TransportEndpoint, TransportGroupSync, TransportPublishRequest,
-    TransportPublishTarget,
-};
+use cgka_traits::{TransportEndpoint, TransportPublishRequest, TransportPublishTarget};
 use nostr_sdk::prelude::RelayUrl;
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
-const RETIRED_RELAY_HOSTS: &[&str] = &["relay.damus.io", "relay.nostr.band"];
+const RETIRED_RELAY_HOSTS: &[&str] = &["relay.nostr.band"];
 
 /// The policy decision for one caller-supplied Nostr relay endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +29,36 @@ pub struct RelayEndpointClassification {
     /// unsafe endpoints. Invalid inputs have no normalized representation.
     pub normalized_endpoint: Option<String>,
     pub policy: RelayEndpointPolicy,
+}
+
+/// Subscription-only disposition for one requested endpoint.
+///
+/// Unlike [`RelayEndpointPolicy`], this also records route-level decisions
+/// such as deduplication and the bounded endpoint cap. It is kept separate so
+/// configuration and publish validation remain strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelaySubscriptionEndpointDisposition {
+    Admitted,
+    Invalid,
+    Unsafe,
+    Retired,
+    Duplicate,
+    BeyondRouteLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelaySubscriptionEndpointOutcome {
+    pub requested_endpoint: String,
+    pub normalized_endpoint: Option<String>,
+    pub disposition: RelaySubscriptionEndpointDisposition,
+}
+
+/// Local admission result for one inbox or group subscription route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelaySubscriptionAdmission {
+    pub requested_endpoints: Vec<TransportEndpoint>,
+    pub admitted_endpoints: Vec<TransportEndpoint>,
+    pub endpoint_outcomes: Vec<RelaySubscriptionEndpointOutcome>,
 }
 
 /// Hostnames that the relay plane will never dial or adopt.
@@ -100,26 +127,70 @@ impl RelaySafetyPolicy {
         }
     }
 
-    pub(crate) fn sanitize_activation(
+    /// Admit subscription endpoints independently in source order.
+    ///
+    /// This is intentionally narrower than [`Self::sanitize_endpoints`]:
+    /// signed/discovered subscription routes are untrusted input, so one bad
+    /// endpoint degrades that route rather than rejecting every route in the
+    /// account. Configuration setters and publish validation continue to use
+    /// the strict all-or-nothing path.
+    pub(crate) fn admit_subscription_endpoints(
         &self,
-        mut activation: TransportAccountActivation,
-    ) -> Result<TransportAccountActivation, String> {
-        activation.inbox_endpoints =
-            self.sanitize_endpoints(activation.inbox_endpoints, "account inbox")?;
-        for group in &mut activation.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
-        }
-        Ok(activation)
-    }
+        endpoints: Vec<TransportEndpoint>,
+    ) -> RelaySubscriptionAdmission {
+        let requested_endpoints = endpoints.clone();
+        let mut admitted_endpoints =
+            Vec::with_capacity(endpoints.len().min(self.max_endpoints_per_route));
+        let mut endpoint_outcomes = Vec::with_capacity(endpoints.len());
 
-    pub(crate) fn sanitize_group_sync(
-        &self,
-        mut sync: TransportGroupSync,
-    ) -> Result<TransportGroupSync, String> {
-        for group in &mut sync.group_subscriptions {
-            group.endpoints = self.sanitize_endpoints(group.endpoints.clone(), "group route")?;
+        for endpoint in endpoints {
+            let requested_endpoint = endpoint.0;
+            let raw = requested_endpoint.trim();
+            let Ok(relay_url) = RelayUrl::parse(raw) else {
+                endpoint_outcomes.push(RelaySubscriptionEndpointOutcome {
+                    requested_endpoint,
+                    normalized_endpoint: None,
+                    disposition: RelaySubscriptionEndpointDisposition::Invalid,
+                });
+                continue;
+            };
+            let normalized_endpoint = relay_url.to_string();
+            let disposition = match evaluate_relay_url(&relay_url, self.allow_loopback) {
+                Err(RelayEndpointRejection::Retired) => {
+                    RelaySubscriptionEndpointDisposition::Retired
+                }
+                Err(RelayEndpointRejection::Invalid) => {
+                    RelaySubscriptionEndpointDisposition::Invalid
+                }
+                Err(
+                    RelayEndpointRejection::PlaintextPublic
+                    | RelayEndpointRejection::NonPublicAddress
+                    | RelayEndpointRejection::Localhost,
+                ) => RelaySubscriptionEndpointDisposition::Unsafe,
+                Ok(()) => {
+                    let normalized = TransportEndpoint(normalized_endpoint.clone());
+                    if admitted_endpoints.contains(&normalized) {
+                        RelaySubscriptionEndpointDisposition::Duplicate
+                    } else if admitted_endpoints.len() >= self.max_endpoints_per_route {
+                        RelaySubscriptionEndpointDisposition::BeyondRouteLimit
+                    } else {
+                        admitted_endpoints.push(normalized);
+                        RelaySubscriptionEndpointDisposition::Admitted
+                    }
+                }
+            };
+            endpoint_outcomes.push(RelaySubscriptionEndpointOutcome {
+                requested_endpoint,
+                normalized_endpoint: Some(normalized_endpoint),
+                disposition,
+            });
         }
-        Ok(sync)
+
+        RelaySubscriptionAdmission {
+            requested_endpoints,
+            admitted_endpoints,
+            endpoint_outcomes,
+        }
     }
 
     pub(crate) fn sanitize_publish_request(
@@ -351,12 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn retired_relay_hosts_are_rejected_at_the_relay_plane_boundary() {
+    fn nostr_band_is_rejected_at_the_relay_plane_boundary() {
         let policy = RelaySafetyPolicy::default();
         for endpoint in [
-            "wss://relay.damus.io",
             "wss://relay.nostr.band",
-            "wss://RELAY.DAMUS.IO./path",
+            "wss://RELAY.NOSTR.BAND./path",
+            "wss://relay.nostr.band:443/alternate",
         ] {
             let offered = endpoints(&[endpoint, "wss://good.example"]);
             assert!(
@@ -372,11 +443,35 @@ mod tests {
     }
 
     #[test]
+    fn damus_is_eligible_under_the_normal_dial_policy() {
+        let policy = RelaySafetyPolicy::default();
+        for endpoint in ["wss://relay.damus.io", "wss://RELAY.DAMUS.IO./path"] {
+            assert_eq!(
+                policy
+                    .sanitize_endpoints(endpoints(&[endpoint]), "test")
+                    .expect("Damus should pass the normal TLS and host-safety policy")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                policy.classify_endpoints(vec![endpoint.to_owned()])[0].policy,
+                RelayEndpointPolicy::Allowed
+            );
+        }
+        assert_eq!(
+            policy.classify_endpoints(vec!["ws://relay.damus.io".to_owned()])[0].policy,
+            RelayEndpointPolicy::Unsafe,
+            "public plaintext WebSockets stay forbidden"
+        );
+    }
+
+    #[test]
     fn relay_endpoint_classifier_uses_the_dial_policy() {
         let policy = RelaySafetyPolicy::default();
         let classified = policy.classify_endpoints(vec![
             " wss://relay.example ".to_owned(),
             "wss://RELAY.DAMUS.IO./path".to_owned(),
+            "wss://RELAY.NOSTR.BAND./path".to_owned(),
             "not a relay".to_owned(),
             "ws://relay.example".to_owned(),
             "wss://127.0.0.1".to_owned(),
@@ -389,6 +484,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 RelayEndpointPolicy::Allowed,
+                RelayEndpointPolicy::Allowed,
                 RelayEndpointPolicy::Retired,
                 RelayEndpointPolicy::Invalid,
                 RelayEndpointPolicy::Unsafe,
@@ -398,7 +494,8 @@ mod tests {
         assert_eq!(classified[0].endpoint, " wss://relay.example ");
         assert!(classified[0].normalized_endpoint.is_some());
         assert!(classified[1].normalized_endpoint.is_some());
-        assert_eq!(classified[2].normalized_endpoint, None);
+        assert!(classified[2].normalized_endpoint.is_some());
+        assert_eq!(classified[3].normalized_endpoint, None);
     }
 
     #[test]
@@ -411,10 +508,7 @@ mod tests {
 
     #[test]
     fn retired_relay_host_list_is_stable_and_scheme_free() {
-        assert_eq!(
-            retired_relay_hosts(),
-            vec!["relay.damus.io", "relay.nostr.band"]
-        );
+        assert_eq!(retired_relay_hosts(), vec!["relay.nostr.band"]);
     }
 
     /// A published list of only unsafe hosts yields nothing, rather than
@@ -511,5 +605,71 @@ mod tests {
         let many: Vec<String> = (0..20).map(|i| format!("wss://relay{i}.example")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(policy.sanitize_endpoints(endpoints(&refs), "test").is_err());
+    }
+
+    #[test]
+    fn subscription_admission_isolates_rejections_and_preserves_source_order() {
+        let policy = RelaySafetyPolicy::default();
+        let admission = policy.admit_subscription_endpoints(endpoints(&[
+            "wss://one.example",
+            "not a relay",
+            "wss://relay.nostr.band",
+            "ws://relay.example",
+            "wss://one.example",
+            "wss://two.example",
+        ]));
+
+        assert_eq!(
+            admission.admitted_endpoints,
+            endpoints(&["wss://one.example", "wss://two.example"])
+        );
+        assert_eq!(
+            admission
+                .endpoint_outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>(),
+            vec![
+                RelaySubscriptionEndpointDisposition::Admitted,
+                RelaySubscriptionEndpointDisposition::Invalid,
+                RelaySubscriptionEndpointDisposition::Retired,
+                RelaySubscriptionEndpointDisposition::Unsafe,
+                RelaySubscriptionEndpointDisposition::Duplicate,
+                RelaySubscriptionEndpointDisposition::Admitted,
+            ]
+        );
+    }
+
+    #[test]
+    fn subscription_admission_caps_allowed_distinct_endpoints_without_failing_route() {
+        let policy = RelaySafetyPolicy::default();
+        let requested = (0..18)
+            .map(|index| TransportEndpoint(format!("wss://relay{index}.example")))
+            .collect::<Vec<_>>();
+        let admission = policy.admit_subscription_endpoints(requested);
+
+        assert_eq!(admission.admitted_endpoints.len(), 16);
+        assert_eq!(
+            admission
+                .endpoint_outcomes
+                .iter()
+                .filter(|outcome| {
+                    outcome.disposition == RelaySubscriptionEndpointDisposition::BeyondRouteLimit
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn subscription_admission_can_report_an_entirely_blocked_route() {
+        let admission = RelaySafetyPolicy::default().admit_subscription_endpoints(endpoints(&[
+            "not a relay",
+            "wss://relay.nostr.band",
+            "ws://10.0.0.1",
+        ]));
+
+        assert!(admission.admitted_endpoints.is_empty());
+        assert_eq!(admission.endpoint_outcomes.len(), 3);
     }
 }

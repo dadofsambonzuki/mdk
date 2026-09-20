@@ -1,7 +1,7 @@
 ---
 title: "Nostr Account Transport Notes"
 created: 2026-05-11
-updated: 2026-07-22
+updated: 2026-09-20
 tags: [marmot, overview, nostr, transport, accounts]
 status: working-note
 ---
@@ -117,6 +117,44 @@ The policy should be explicit and testable:
 
 Filtering runtime connections must not rewrite signed MLS group state. A client may decide not to connect to a relay
 from a group component, but that decision is local policy.
+
+Subscription admission is deliberately different from configuration and publish validation. A loaded inbox or signed
+group route classifies each endpoint independently, preserves source order, admits at most sixteen safe distinct
+endpoints, and records invalid, unsafe, retired, duplicate, and over-limit exclusions in local typed status. A route
+with no admitted endpoint remains desired and policy-blocked; it never produces an empty SDK subscription. Strict
+configuration setters and publish/quorum paths remain fail-closed.
+
+The centralized retired-host list currently contains only `relay.nostr.band`. `relay.damus.io` is eligible under the
+ordinary URL, TLS, host, and address-safety rules; this eligibility neither adds it to defaults nor rewrites published
+or signed relay lists.
+
+## Independent Registration and Replay Recovery
+
+Desired inbox and group routes are installed locally before relay REQs are issued so immediate stored events remain
+routable. Registration results are committed per route and, for the SDK client, per endpoint. A failure therefore
+leaves unrelated routes live. Missing endpoint registrations retain their original subscription identity and replay
+scope, and the account worker retries them through its single coalesced exponential scheduler (1, 2, 4, 8, 16, 32,
+then 60 seconds), with at most eight route attempts and a five-second reconciliation budget per round.
+Aggregate adapter telemetry distinguishes complete registration, degraded registration, zero-registration failure,
+policy exclusions, and reconciliation retries. These are local operation counters: they do not imply remote event
+acceptance, complete history, or recipient delivery, and they never carry account, route, relay, or endpoint labels.
+Legacy lifecycle success continues to mean that the callable returned success; the registration breakdown is the
+authoritative signal for successful-but-degraded coverage.
+
+Every desired route is also represented by an account-private SQLCipher replay obligation before its subscription can
+change or a newer account cursor can commit. Identity distinguishes inbox from group routes and, for groups, includes
+the variable-length MLS group id, the 32-byte Nostr routing handle, current/historical role, and original normalized
+endpoint scope. Repeated preparation keeps the earliest floor; an unfloored obligation dominates. Replacements
+transfer unfinished floors before retiring superseded generations.
+
+Registration alone never clears this durable work. The runtime freezes the obligation generations associated with a
+full activation and clears only that frozen set after endpoint-complete EOSE and a durable delivery checkpoint. A
+stale activation, route replacement, delivery-overflow marker, or missing endpoint coverage therefore leaves repair
+incomplete. A crash after checkpointing but before clear can replay duplicates, but cannot skip the protected gap.
+
+Rust and native bindings expose read-only account transport snapshots with separate inbox/current/historical routes,
+typed admission and registration outcomes, pending replay, and coalescing process-local revisions. Reading or
+subscribing to this status never starts an account worker or dials a relay.
 
 ## Boundary Sketch
 

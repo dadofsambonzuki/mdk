@@ -88,6 +88,7 @@ use crate::types::telemetry::{
 use crate::types::timeline::{
     MarmotTimelineMessageQuery, MarmotTimelineMessageRecord, MarmotTimelinePage,
 };
+use crate::types::transport_status::MarmotAccountTransportStatusSnapshot;
 use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
 
@@ -520,6 +521,10 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Latest complete account transport coverage. This read does not activate or dial.
+    /// Free with `marmot_account_transport_status_snapshot_free`.
+    sync fn marmot_account_transport_status(account_ref: str) -> rec(MarmotAccountTransportStatusSnapshot) = account_transport_status;
+
     /// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
     /// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
     /// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.

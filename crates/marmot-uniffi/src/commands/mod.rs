@@ -25,6 +25,7 @@ mod relay;
 mod subscription;
 mod telemetry;
 mod timeline;
+mod transport_status;
 
 pub use group::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, MemberKeyPackagePrewarmSummaryFfi,

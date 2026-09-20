@@ -32,15 +32,15 @@ for reconnect/backoff and relay status mechanics.
 - Keep Nostr event DTO conversion delegated to `transport-nostr-peeler`.
 - Keep `TransportDeliverySource` metadata diagnostic only; do not feed it into consensus decisions.
 - Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
-- Keep account-inbox and group subscription ids scoped to the activation attempt that issued them
+- Keep account-inbox and group subscription ids scoped to the route generation that issued them
   (`SubscriptionAttempt`). A relay reports end-of-stored-events by subscription id and nothing else, so a shared id
-  would let a superseded attempt's in-flight EOSE satisfy the replay-coverage gate the next activation just reset. Ids
-  stay derived from account/group/endpoint state plus the attempt, never from `since`, which is not recorded with the
-  routes and so could not be reconstructed at eviction time.
-- Keep the attempt ordinal in `AdapterState::activation_attempt_high_water` and never clear it — not on
-  `deactivate_account`, not on the failed-activation rollback. Both drop the account's routes without closing the relay
-  sockets the superseded attempt's REQs still stream on, so an ordinal recovered from the routes would re-issue ids that
-  are still live. `AccountRoutes.attempt` holds only the live copy that `account_subscription_ids` reconstructs from.
+  would let a superseded route's in-flight EOSE satisfy replacement coverage. Full activation routes may share a fresh
+  generation; group additions receive fresh generations while unchanged routes and endpoint-subset retries preserve
+  theirs. Ids stay derived from account/group/endpoint state plus generation, never from `since`.
+- Keep the generation ordinal in `AdapterState::activation_attempt_high_water` and never clear it. Relay teardown and
+  callbacks can outlive local removal, so an ordinal recovered only from live routes could re-issue an id that is still
+  active. `AccountRoutes` retains the inbox generation and each live group route's generation so subscription ids can
+  be reconstructed exactly.
 - Keep `activate_account`'s opening `unsubscribe_account` unconditional. Attempt-scoped ids removed the relay-side
   REQ-replace backstop, and a rolled-back activation can leave `accounts` empty while the relay client still holds this
   account's subscriptions; an orphaned REQ double-delivers because routing is content-keyed.

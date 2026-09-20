@@ -694,6 +694,155 @@ impl NostrRelayClient for RecordingRelayClient {
     }
 }
 
+#[tokio::test]
+async fn mixed_inbox_admission_keeps_damus_and_reports_exclusions() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD4; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![
+                TransportEndpoint::from("wss://relay.damus.io"),
+                TransportEndpoint::from("wss://relay.nostr.band"),
+                TransportEndpoint::from("ws://relay.damus.io"),
+                TransportEndpoint::from("wss://good.example"),
+            ],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    {
+        let subscriptions = relay.subscriptions.lock().unwrap();
+        let NostrSubscription::AccountInbox { endpoints, .. } = &subscriptions[0] else {
+            panic!("expected inbox subscription")
+        };
+        assert_eq!(
+            endpoints,
+            &[
+                TransportEndpoint::from("wss://relay.damus.io"),
+                TransportEndpoint::from("wss://good.example"),
+            ],
+            "Damus must reach the injected relay client while retired/unsafe peers are isolated"
+        );
+    }
+
+    let status = relay_plane.account_transport_status(&account_id);
+    assert_eq!(status.state, crate::AccountTransportState::Degraded);
+    assert!(
+        !adapter.subscription_replay_coverage_complete(),
+        "admitted-endpoint EOSE must not make excluded requested coverage complete"
+    );
+    let inbox = status.inbox.unwrap();
+    assert_eq!(inbox.requested_endpoint_count, 4);
+    assert_eq!(inbox.admitted_endpoint_count, 2);
+    assert_eq!(inbox.registered_endpoint_count, None);
+    assert_eq!(
+        inbox
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.admission)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::EndpointAdmissionOutcome::Allowed,
+            crate::EndpointAdmissionOutcome::Retired,
+            crate::EndpointAdmissionOutcome::Unsafe,
+            crate::EndpointAdmissionOutcome::Allowed,
+        ]
+    );
+    assert_eq!(
+        relay_plane
+            .relay_telemetry()
+            .await
+            .metrics
+            .subscription_policy_exclusions,
+        2
+    );
+}
+
+#[tokio::test]
+async fn status_matches_reused_group_registration_after_endpoint_reordering() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD5; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay);
+    let group_id = GroupId::new(vec![0x31; 7]);
+    let transport_group_id = vec![0x41; 32];
+    let first = TransportEndpoint::from("wss://first.example");
+    let second = TransportEndpoint::from("wss://second.example");
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![first.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![first.clone(), second.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .unwrap();
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id,
+                transport_group_id,
+                endpoints: vec![second, first],
+            }],
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    let status = relay_plane.account_transport_status(&account_id);
+    assert_eq!(status.current_group_routes.len(), 1);
+    assert_eq!(
+        status.current_group_routes[0].state,
+        crate::AccountTransportRouteState::Registered,
+        "status matching must use the same order-insensitive route identity as adapter reuse"
+    );
+}
+
+#[tokio::test]
+async fn entirely_blocked_activation_retains_unavailable_status_without_empty_req() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xB0; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+
+    let result = adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint::from("wss://relay.nostr.band")],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(TransportAdapterError::Subscription(_))
+    ));
+    assert!(relay.subscriptions.lock().unwrap().is_empty());
+
+    let status = relay_plane.account_transport_status(&account_id);
+    assert_eq!(status.state, crate::AccountTransportState::Unavailable);
+    assert!(!adapter.subscription_replay_coverage_complete());
+    let inbox = status.inbox.unwrap();
+    assert_eq!(
+        inbox.state,
+        crate::AccountTransportRouteState::PolicyBlocked
+    );
+    assert!(!inbox.pending_registration);
+    assert!(inbox.pending_replay);
+}
+
 struct BlockingDirectoryFetcher {
     fetch_count: AtomicUsize,
     started: Notify,
@@ -782,8 +931,17 @@ async fn relay_plane_rejects_invalid_relay_endpoints_before_subscribing() {
         .await
         .expect_err("invalid relay endpoint should be rejected");
 
-    assert!(err.to_string().contains("invalid relay endpoint"));
+    assert!(matches!(err, TransportAdapterError::Subscription(_)));
     assert!(relay.subscriptions.lock().unwrap().is_empty());
+    let status = relay_plane.account_transport_status(&MemberId::new(vec![0xA1; 32]));
+    assert_eq!(status.state, crate::AccountTransportState::Unavailable);
+    let inbox = status.inbox.expect("blocked inbox status");
+    assert_eq!(inbox.requested_endpoint_count, 1);
+    assert_eq!(inbox.admitted_endpoint_count, 0);
+    assert_eq!(
+        inbox.endpoints[0].admission,
+        crate::EndpointAdmissionOutcome::Invalid
+    );
 }
 
 #[test]
@@ -1313,7 +1471,7 @@ async fn directory_fetches_reject_retired_relays_before_fetching() {
     let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
     let query = DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12);
 
-    for endpoint in ["wss://relay.damus.io", "wss://relay.nostr.band"] {
+    for endpoint in ["wss://relay.nostr.band", "wss://RELAY.NOSTR.BAND./path"] {
         let err = relay_plane
             .fetch_directory_events(
                 vec![TransportEndpoint(endpoint.into())],

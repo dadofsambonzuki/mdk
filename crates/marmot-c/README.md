@@ -193,6 +193,29 @@ it never reinterprets an old device name as a hardware model. Both setters use t
   callback invocation (clear/free do not wait for a running callback).
 - Free every subscription handle before the client that created it.
 
+## Account transport coverage
+
+`marmot_account_transport_status` reads one account's latest complete route-coverage
+snapshot without activating it or dialing the network. A known inactive account is a successful
+snapshot with `MARMOT_ACCOUNT_TRANSPORT_STATE_INACTIVE`; an unknown account remains an error.
+Free the result only with `marmot_account_transport_status_snapshot_free`, which releases the
+optional inbox route, both group-route arrays and every nested endpoint string.
+
+`marmot_subscribe_account_transport_status` provides a take-once initial snapshot, blocking
+`*_next`, and the standard callback pump. Updates are complete replacements on semantic changes;
+the size-one stream may coalesce intermediate revisions and does not emit countdown ticks.
+Blocking results are owned and must be deep-freed. Callback item pointers and everything nested
+under them are borrowed only for the callback duration: do not retain or free them. Do not mix
+blocking reads and callbacks on one handle, and remember that callback clear/free does not wait
+for an already-running callback before returning.
+
+The optional registered-endpoint count is valid only when its `has_` field is nonzero. `Unknown`
+registration detail means the compatibility relay client did not provide endpoint-level coverage;
+it is not evidence of zero registrations. Registration itself is not proof of connectivity,
+complete history or recipient delivery. Route/group/endpoint values may support a local repair UI,
+but must not be emitted in logs or metric labels. Rebuild against the matching generated header and
+library when adopting this additive record/enum surface.
+
 ## Host-driven agent publishing
 
 `marmot_agent_publisher_new` anchors a stream and returns an opaque handle.

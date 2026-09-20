@@ -146,6 +146,12 @@ pub use runtime::{
     default_directory_discovery_relays,
 };
 pub use runtime::{
+    AccountTransportEndpointStatus, AccountTransportRouteRole, AccountTransportRouteState,
+    AccountTransportRouteStatus, AccountTransportState, AccountTransportStatusSnapshot,
+    EndpointAdmissionOutcome, EndpointRegistrationOutcome, RegistrationDetailCompleteness,
+    RuntimeAccountTransportStatusSubscription,
+};
+pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
     ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
     ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
@@ -1742,6 +1748,9 @@ impl MarmotApp {
                 .config
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
+            pending_transport_registration_retry: false,
+            transport_subscription_connectivity_wake_used: false,
+            subscription_replay_snapshot: Vec::new(),
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
@@ -6457,15 +6466,36 @@ impl AppTransportRouting {
 
 fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
     for route in routes.iter_mut() {
-        route.endpoints.sort();
-        route.endpoints.dedup();
+        // Endpoint order is routing intent: subscription admission keeps the
+        // first sixteen allowed distinct endpoints. Deduplicate without
+        // sorting so a later canonicalization step cannot change which relay
+        // falls beyond that bound.
+        let mut seen = HashSet::new();
+        route
+            .endpoints
+            .retain(|endpoint| seen.insert(endpoint.clone()));
     }
-    routes.sort_by(|left, right| {
-        left.transport_group_id
-            .cmp(&right.transport_group_id)
-            .then_with(|| left.endpoints.cmp(&right.endpoints))
-    });
-    routes.dedup();
+    // `AppGroupRecord::transport_subscriptions` deliberately emits the
+    // authenticated current route first and retained historical routes after
+    // it. Keep that role boundary intact while canonicalizing the historical
+    // tail: the adapter assigns a floored replay to the first route and an
+    // unfloored replay to later incarnations. Sorting the whole vector could
+    // silently promote a historical route to current.
+    if routes.len() > 1 {
+        routes[1..].sort_by(|left, right| {
+            left.transport_group_id
+                .cmp(&right.transport_group_id)
+                .then_with(|| left.endpoints.cmp(&right.endpoints))
+        });
+    }
+    let mut index = 1;
+    while index < routes.len() {
+        if routes[..index].contains(&routes[index]) {
+            routes.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 impl TransportRoutingPolicy for AppTransportRouting {

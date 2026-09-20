@@ -45,3 +45,5 @@ A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_WEDGE_REARM_INTERVAL
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_RUN_CONTINUATION_WINDOW_MS
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD
 A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_CLOCK_SKEW_ALLOWANCE_MS
+A11|crates/transport-nostr-adapter/src/lib.rs|MAX_CONCURRENT_REGISTRATIONS
+A11|crates/transport-nostr-adapter/src/lib.rs|REGISTRATION_RECONCILIATION_BUDGET

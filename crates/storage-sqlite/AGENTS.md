@@ -29,6 +29,7 @@ not "fix" it into the per-account database.
 | `src/timeline.rs` | Materialized message-timeline aggregation. |
 | `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |
 | `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
+| `src/subscription_replay.rs` | Durable per-route replay obligations, generation fencing, conservative replacement transfer and conditional completion. |
 | `src/shared/error.rs` | Shared-store redacting SQLite error mapper and result extension. |
 | `src/shared/migrations.rs`, `src/shared/v1.sql`, `src/shared/legacy.sql` | Independent `shared_schema_migrations` runner, frozen v1 schema and recognized retired columns. |
 | `src/shared/migration_tests.rs`, `src/shared/assurance_tests.rs`, `src/shared/fixtures/` | Shared migration contract, populated historical upgrades and bounded interrupted-transaction recovery. |

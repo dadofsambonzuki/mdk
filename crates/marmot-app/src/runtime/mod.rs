@@ -15,7 +15,7 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
-use cgka_traits::{GroupId, SecretBytes, TransportAdapterError, TransportEndpoint};
+use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, TransportEndpoint};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
     NostrAccountImport,
@@ -63,7 +63,9 @@ use crate::{
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 
+mod account_transport_status;
 pub(crate) mod account_worker;
+pub(crate) use account_transport_status::AccountTransportStatusRegistry;
 mod agent_publisher;
 mod agent_stream_watch;
 pub use agent_publisher::{
@@ -74,6 +76,12 @@ mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
+};
+pub use account_transport_status::{
+    AccountTransportEndpointStatus, AccountTransportRouteRole, AccountTransportRouteState,
+    AccountTransportRouteStatus, AccountTransportState, AccountTransportStatusSnapshot,
+    EndpointAdmissionOutcome, EndpointRegistrationOutcome, RegistrationDetailCompleteness,
+    RuntimeAccountTransportStatusSubscription,
 };
 mod chat_list_window;
 mod conversation_window;
@@ -1329,6 +1337,36 @@ impl MarmotAppRuntime {
             events: self.events.subscribe(),
             stopping: self.shared.lifecycle().subscribe_shutdown(),
         }
+    }
+
+    /// Read the latest process-local transport coverage without activating the
+    /// account or performing network I/O.
+    pub fn account_transport_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<AccountTransportStatusSnapshot, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let account_id = MemberId::new(hex::decode(account.account_id_hex)?);
+        Ok(self
+            .shared
+            .relay_plane
+            .account_transport_status(&account_id))
+    }
+
+    /// Subscribe to complete, coalescing transport coverage snapshots. The
+    /// initial snapshot is attached before this method returns, so a transition
+    /// cannot be lost between the initial read and the first `recv`.
+    pub fn subscribe_account_transport_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<RuntimeAccountTransportStatusSubscription, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let account_id = MemberId::new(hex::decode(account.account_id_hex)?);
+        Ok(RuntimeAccountTransportStatusSubscription::new(
+            &self.shared.relay_plane.account_transport_status_registry(),
+            &account_id,
+            self.shared.lifecycle().subscribe_shutdown(),
+        ))
     }
 
     pub fn display_name_for_account_id(&self, account_id_hex: &str) -> Option<String> {
@@ -5900,6 +5938,11 @@ impl AccountManager {
             if let Some(worker) = worker {
                 worker.shutdown().await;
             }
+            let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+            self.shared
+                .relay_plane
+                .account_transport_status_registry()
+                .mark_inactive(&account_id);
             self.app.drop_account_caches(&account.label);
             Ok(())
         }

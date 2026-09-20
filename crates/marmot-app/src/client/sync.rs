@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cgka_traits::GroupId;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
+use cgka_traits::{GroupId, TransportEndpoint};
 use storage_sqlite::{
+    SubscriptionReplayGeneration, SubscriptionReplayGroupRole, SubscriptionReplayObligation,
+    SubscriptionReplayPreparation, SubscriptionReplayReplacement, SubscriptionReplayRoute,
     TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
 };
 use tokio::time::timeout;
@@ -301,6 +303,10 @@ enum DrainVerdict {
     /// end-of-stored-events: the subscriptions were registered but never
     /// served.
     NoRelayEose,
+    /// Every admitted endpoint reached EOSE, but requested coverage was
+    /// excluded, still pending, failed, or only known through a compatibility
+    /// client with non-exact registration detail.
+    CoverageIncomplete,
     /// The account-worker quantum ended after at least one novel delivery was
     /// durably retained. The prefix is checkpointed and recovery resumes in a
     /// later quantum without spending the no-progress retry ordinal.
@@ -325,6 +331,7 @@ impl DrainVerdict {
             Self::Complete => None,
             Self::EoseTimeout => Some("backfill_drain_eose_timeout"),
             Self::NoRelayEose => Some("backfill_drain_no_relay_eose"),
+            Self::CoverageIncomplete => Some("subscription_coverage_incomplete"),
             Self::NovelProgressQuantumYield => Some("backfill_drain_novel_progress_quantum_yield"),
             Self::NoProgressQuantumYield => Some("backfill_drain_no_progress_quantum_yield"),
             Self::Overflow => Some("account_delivery_queue_overflow"),
@@ -339,6 +346,7 @@ impl DrainVerdict {
             Self::Complete => Some(EpochBackfillCompletionKind::EndOfStoredEvents),
             Self::EoseTimeout
             | Self::NoRelayEose
+            | Self::CoverageIncomplete
             | Self::Overflow
             | Self::NovelProgressQuantumYield
             | Self::NoProgressQuantumYield
@@ -356,7 +364,10 @@ impl DrainVerdict {
     }
 
     fn spends_eose_attempt(self) -> bool {
-        matches!(self, Self::EoseTimeout | Self::NoRelayEose)
+        matches!(
+            self,
+            Self::EoseTimeout | Self::NoRelayEose | Self::CoverageIncomplete
+        )
     }
 
     fn made_novel_progress(self) -> bool {
@@ -545,7 +556,189 @@ impl StagedSyncError {
     }
 }
 
+fn subscription_replay_endpoint_scope(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoint> {
+    let mut seen = HashSet::new();
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let raw = endpoint.as_str().trim();
+            let normalized = nostr::RelayUrl::parse(raw)
+                .map(|url| url.to_string())
+                // Invalid input is still part of desired coverage identity.
+                // Preserve it verbatim; use a non-network sentinel only for
+                // the otherwise unrepresentable empty string.
+                .unwrap_or_else(|_| {
+                    if endpoint.as_str().is_empty() {
+                        "<invalid-empty-endpoint>".to_owned()
+                    } else {
+                        endpoint.as_str().to_owned()
+                    }
+                });
+            seen.insert(normalized.clone())
+                .then_some(TransportEndpoint(normalized))
+        })
+        .collect()
+}
+
+fn subscription_replay_lineage_matches(
+    existing: &SubscriptionReplayRoute,
+    desired: &SubscriptionReplayRoute,
+) -> bool {
+    match (existing, desired) {
+        (SubscriptionReplayRoute::Inbox { .. }, SubscriptionReplayRoute::Inbox { .. }) => true,
+        (
+            SubscriptionReplayRoute::Group {
+                group_id: existing_group,
+                role: existing_role,
+                ..
+            },
+            SubscriptionReplayRoute::Group {
+                group_id: desired_group,
+                role: desired_role,
+                ..
+            },
+        ) => existing_group == desired_group && existing_role == desired_role,
+        _ => false,
+    }
+}
+
+fn active_subscription_replay_floor(
+    obligations: &[SubscriptionReplayObligation],
+) -> Option<cgka_traits::transport::Timestamp> {
+    let active = obligations
+        .iter()
+        .filter(|obligation| {
+            matches!(
+                obligation.route,
+                SubscriptionReplayRoute::Inbox { .. }
+                    | SubscriptionReplayRoute::Group {
+                        role: SubscriptionReplayGroupRole::Current,
+                        ..
+                    }
+            )
+        })
+        .collect::<Vec<_>>();
+    if active
+        .iter()
+        .any(|obligation| obligation.replay_floor.is_none())
+    {
+        return None;
+    }
+    active
+        .into_iter()
+        .filter_map(|obligation| obligation.replay_floor)
+        .min_by_key(|floor| floor.0)
+}
+
 impl AppClient {
+    /// Persist the exact desired subscription coverage before any REQ can be
+    /// issued, and return the oldest still-required floor for inbox/current
+    /// routes. Historical routes remain independently unfloored in the adapter.
+    ///
+    /// Replacement and removal are one transaction: a changed route inherits
+    /// its predecessor's unfinished floor before the predecessor generation is
+    /// retired. A storage failure therefore prevents the corresponding network
+    /// mutation from starting.
+    pub(super) fn prepare_subscription_replay_obligations(
+        &self,
+        requested_floor: Option<cgka_traits::transport::Timestamp>,
+    ) -> Result<Option<cgka_traits::transport::Timestamp>, AppError> {
+        let routing = self.routing.snapshot();
+        let mut preparations = Vec::with_capacity(1 + routing.group_routes.len());
+        preparations.push(SubscriptionReplayPreparation {
+            route: SubscriptionReplayRoute::Inbox {
+                normalized_endpoints: subscription_replay_endpoint_scope(
+                    &routing.local_inbox_endpoints,
+                ),
+            },
+            replay_floor: requested_floor,
+        });
+
+        let mut seen_groups = HashSet::new();
+        for group in routing.group_routes {
+            let role = if seen_groups.insert(group.group_id.clone()) {
+                SubscriptionReplayGroupRole::Current
+            } else {
+                SubscriptionReplayGroupRole::Historical
+            };
+            preparations.push(SubscriptionReplayPreparation {
+                route: SubscriptionReplayRoute::Group {
+                    group_id: group.group_id,
+                    transport_group_id: group.transport_group_id,
+                    role,
+                    normalized_endpoints: subscription_replay_endpoint_scope(&group.endpoints),
+                },
+                replay_floor: match role {
+                    SubscriptionReplayGroupRole::Current => requested_floor,
+                    SubscriptionReplayGroupRole::Historical => None,
+                },
+            });
+        }
+
+        let storage = self.app.account_storage(&self.state.label)?;
+        let existing = storage.subscription_replay_obligations()?;
+        let stale = existing
+            .iter()
+            .filter(|obligation| {
+                !preparations
+                    .iter()
+                    .any(|preparation| preparation.route == obligation.route)
+            })
+            .collect::<Vec<_>>();
+        let retire = stale
+            .iter()
+            .map(|obligation| obligation.generation)
+            .collect::<Vec<_>>();
+        let mut inherited = HashSet::<SubscriptionReplayGeneration>::new();
+        let replacements = preparations
+            .into_iter()
+            .map(|preparation| {
+                let inherit_from = stale
+                    .iter()
+                    .filter(|obligation| {
+                        subscription_replay_lineage_matches(&obligation.route, &preparation.route)
+                            && inherited.insert(obligation.generation)
+                    })
+                    .map(|obligation| obligation.generation)
+                    .collect();
+                SubscriptionReplayReplacement {
+                    preparation,
+                    inherit_from,
+                }
+            })
+            .collect::<Vec<_>>();
+        let prepared = storage.replace_subscription_replay_obligations(&replacements, &retire)?;
+        Ok(active_subscription_replay_floor(&prepared))
+    }
+
+    pub(super) fn freeze_subscription_replay_snapshot(&mut self) -> Result<(), AppError> {
+        self.subscription_replay_snapshot = self
+            .app
+            .account_storage(&self.state.label)?
+            .subscription_replay_obligations()?
+            .into_iter()
+            .map(|obligation| obligation.generation)
+            .collect();
+        Ok(())
+    }
+
+    /// Clear only after the delivered prefix is durable and the adapter's
+    /// frozen activation snapshot has endpoint-complete EOSE. A crash between
+    /// checkpoint and this compare-and-clear merely causes duplicate replay.
+    fn clear_completed_subscription_replay_obligations(&mut self) -> Result<bool, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let generations = self.subscription_replay_snapshot.clone();
+        if generations.is_empty() {
+            return Ok(false);
+        }
+        let cleared = matches!(
+            storage.clear_subscription_replay_obligations(&self.state.label, &generations)?,
+            storage_sqlite::SubscriptionReplayClearResult::Cleared { .. }
+        );
+        self.subscription_replay_snapshot.clear();
+        Ok(cleared)
+    }
+
     /// Persist a host connectivity-restored edge into every exact fanout whose
     /// prior attempt was proven unavailable, then schedule its group for an
     /// immediate worker pass. Ambiguous fanouts keep their original clocks.
@@ -837,7 +1030,14 @@ impl AppClient {
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
-        self.runtime.sync_transport_groups(rebuild_since).await?;
+        let protected_since = self.prepare_subscription_replay_obligations(rebuild_since)?;
+        self.runtime.sync_transport_groups(protected_since).await?;
+        self.pending_transport_registration_retry = self.adapter.has_pending_registrations().await;
+        if self.pending_transport_registration_retry {
+            self.adapter
+                .note_registration_retry_scheduled(Duration::from_secs(1))
+                .await;
+        }
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
     }
@@ -1013,7 +1213,7 @@ impl AppClient {
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
-        self.pending_runtime_group_subscription_refresh
+        self.pending_runtime_group_subscription_refresh || self.pending_transport_registration_retry
     }
 
     /// Retry an ordinary group-subscription rebuild that was deliberately
@@ -1023,6 +1223,51 @@ impl AppClient {
     pub(crate) async fn retry_pending_runtime_group_subscription_refresh(
         &mut self,
     ) -> Result<bool, AppError> {
+        self.retry_pending_runtime_group_subscription_refresh_with_delay(Duration::from_secs(1))
+            .await
+    }
+
+    /// Bring pending registration work forward once for a burst of host
+    /// connectivity-restored notifications. The next scheduled backoff pass
+    /// re-arms this edge if work is still pending.
+    pub(crate) async fn retry_transport_subscriptions_after_connectivity_restored(
+        &mut self,
+    ) -> Result<bool, AppError> {
+        if self.transport_subscription_connectivity_wake_used {
+            return Ok(self.has_pending_runtime_group_subscription_refresh());
+        }
+        self.transport_subscription_connectivity_wake_used = true;
+        let pending = self
+            .retry_pending_runtime_group_subscription_refresh_inner(Duration::from_secs(1))
+            .await?;
+        if !pending {
+            self.transport_subscription_connectivity_wake_used = false;
+        }
+        Ok(pending)
+    }
+
+    pub(crate) async fn retry_pending_runtime_group_subscription_refresh_with_delay(
+        &mut self,
+        next_retry_delay: Duration,
+    ) -> Result<bool, AppError> {
+        self.transport_subscription_connectivity_wake_used = false;
+        self.retry_pending_runtime_group_subscription_refresh_inner(next_retry_delay)
+            .await
+    }
+
+    async fn retry_pending_runtime_group_subscription_refresh_inner(
+        &mut self,
+        next_retry_delay: Duration,
+    ) -> Result<bool, AppError> {
+        if self.pending_transport_registration_retry {
+            self.pending_transport_registration_retry = self
+                .adapter
+                .reconcile_pending_registrations(next_retry_delay)
+                .await;
+            if self.pending_transport_registration_retry {
+                return Ok(true);
+            }
+        }
         if !self.pending_runtime_group_subscription_refresh {
             return Ok(false);
         }
@@ -1039,7 +1284,12 @@ impl AppClient {
             }
         }
         self.pending_runtime_group_subscription_refresh = false;
-        Ok(false)
+        if self.pending_transport_registration_retry {
+            self.adapter
+                .note_registration_retry_scheduled(next_retry_delay)
+                .await;
+        }
+        Ok(self.pending_transport_registration_retry)
     }
 
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
@@ -1068,7 +1318,12 @@ impl AppClient {
             .set_transport_signer(self.transport_signer.clone())
             .await;
         let rebuild_since = self.subscription_rebuild_since();
-        let activation = self.runtime.activate_transport(rebuild_since).await;
+        let protected_since = self
+            .prepare_subscription_replay_obligations(rebuild_since)
+            .map_err(|error| (SyncFailureStage::StatePersist, error))?;
+        self.freeze_subscription_replay_snapshot()
+            .map_err(|error| (SyncFailureStage::StatePersist, error))?;
+        let activation = self.runtime.activate_transport(protected_since).await;
         if let Some(telemetry) = telemetry {
             telemetry.record(
                 AppPerformanceOperation::AccountTransportActivation,
@@ -1645,13 +1900,16 @@ impl AppClient {
             self.remember_seen_event(event_id);
         }
         let routes_dirty = ingested.routes_dirty;
+        let refresh = self.refresh_group_routes()?;
+        if routes_dirty || refresh.routing_changed {
+            self.prepare_subscription_replay_obligations(self.subscription_rebuild_since())?;
+        }
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
         if routes_dirty {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
-        let refresh = self.refresh_group_routes()?;
         // The routes-dirty save above already persisted this delivery's app
         // projection; save again only when that first save did not run, or
         // when route retirement just mutated persisted group state. The
@@ -1820,7 +2078,24 @@ impl AppClient {
         self.relay_plane
             .set_transport_signer(self.transport_signer.clone())
             .await;
-        if let Err(source) = self.runtime.activate_transport(None).await {
+        let protected_since =
+            self.prepare_subscription_replay_obligations(None)
+                .map_err(|source| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        source,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+        self.freeze_subscription_replay_snapshot()
+            .map_err(|source| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    source,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
+        if let Err(source) = self.runtime.activate_transport(protected_since).await {
             self.adapter.fail_delivery_overflow_recovery();
             return Err(ClassifiedSyncFailure::at_stage(
                 SyncSummary::default(),
@@ -2040,7 +2315,11 @@ impl AppClient {
     /// How an epoch-gap backfill drain that stops now should be read, from the
     /// account's current end-of-stored-events progress.
     async fn backfill_drain_verdict(&self) -> DrainVerdict {
-        backfill_drain_verdict(self.adapter.account_subscription_eose().await)
+        if !self.adapter.subscription_replay_coverage_complete() {
+            DrainVerdict::CoverageIncomplete
+        } else {
+            backfill_drain_verdict(self.adapter.account_subscription_eose().await)
+        }
     }
 
     /// Whether the end-of-stored-events gate is already satisfied, polled from
@@ -2291,6 +2570,23 @@ impl AppClient {
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
             summary.merge(delivery_summary);
+            if ingested.routes_dirty {
+                self.refresh_group_routes().map_err(|error| {
+                    ClassifiedSyncFailure::at_stage(
+                        summary.clone(),
+                        error,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+                self.prepare_subscription_replay_obligations(self.subscription_rebuild_since())
+                    .map_err(|error| {
+                        ClassifiedSyncFailure::at_stage(
+                            summary.clone(),
+                            error,
+                            SyncFailureStage::StatePersist,
+                        )
+                    })?;
+            }
             routes_dirty |= ingested.routes_dirty;
             // A cancelled drain cannot replay an already-applied commit's
             // group effects. Save them before waiting for another delivery.
@@ -2351,6 +2647,24 @@ impl AppClient {
                 cursor_after_secs,
             );
             return Err(ClassifiedSyncFailure::at_stage(summary, source, stage));
+        }
+        if self.adapter.account_subscription_eose().await.complete()
+            && self.adapter.subscription_replay_coverage_complete()
+        {
+            match self.clear_completed_subscription_replay_obligations() {
+                Ok(true) => self.adapter.mark_subscription_replay_complete(),
+                Ok(false) => {}
+                Err(source) => {
+                    // The checkpoint already committed, while the obligation
+                    // did not. Restart will replay a duplicate prefix rather
+                    // than skipping history.
+                    return Err(ClassifiedSyncFailure::at_stage(
+                        summary,
+                        source,
+                        SyncFailureStage::StatePersist,
+                    ));
+                }
+            }
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -2447,6 +2761,10 @@ impl AppClient {
         } else {
             false
         };
+        if routes_dirty || routes_changed {
+            self.prepare_subscription_replay_obligations(self.subscription_rebuild_since())
+                .map_err(SyncCheckpointError::BeforePersistence)?;
+        }
         let checkpointed_before = self.checkpointed_transport_timestamp;
         if self.adapter.pending_delivery_overflow().is_none() {
             self.checkpointed_transport_timestamp = self.state.last_transport_timestamp;
@@ -3979,11 +4297,37 @@ impl AppClient {
             return Err(error);
         }
 
-        match self.runtime.activate_transport(None).await {
+        let protected_since = match self.prepare_subscription_replay_obligations(None) {
+            Ok(protected_since) => protected_since,
+            Err(error) => {
+                let terminal_error = error.privacy_safe_kind().to_string();
+                self.finish_epoch_backfill_execution(
+                    execution,
+                    EpochBackfillActivationOutcome::Failed,
+                    Some(terminal_error),
+                    None,
+                    DrainCounts::default(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.freeze_subscription_replay_snapshot() {
+            let terminal_error = error.privacy_safe_kind().to_string();
+            self.finish_epoch_backfill_execution(
+                execution,
+                EpochBackfillActivationOutcome::Failed,
+                Some(terminal_error),
+                None,
+                DrainCounts::default(),
+                false,
+            );
+            return Err(error);
+        }
+        match self.runtime.activate_transport(protected_since).await {
             Ok(()) => {
                 self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
-                if let Err(err) = self.runtime.sync_transport_groups(None).await {
-                    let err: AppError = err.into();
+                if let Err(err) = self.sync_runtime_groups_since(None).await {
                     let terminal_error = err.privacy_safe_kind().to_string();
                     self.finish_epoch_backfill_execution(
                         execution,
@@ -4262,8 +4606,25 @@ impl AppClient {
             };
             return self.finish_full_history_repair(summary, verdict).await;
         }
+        let protected_since =
+            self.prepare_subscription_replay_obligations(None)
+                .map_err(|source| {
+                    ClassifiedSyncFailure::at_stage(
+                        SyncSummary::default(),
+                        source,
+                        SyncFailureStage::StatePersist,
+                    )
+                })?;
+        self.freeze_subscription_replay_snapshot()
+            .map_err(|source| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    source,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
         self.runtime
-            .activate_transport(None)
+            .activate_transport(protected_since)
             .await
             .map_err(|source| {
                 ClassifiedSyncFailure::at_stage(
@@ -4278,13 +4639,12 @@ impl AppClient {
         // events can remain invisible even though the account-wide transport
         // activation above was correctly unfloored.
         self.warm_encrypted_media_epoch_secrets("pre_subscription_sync");
-        self.runtime
-            .sync_transport_groups(None)
+        self.sync_runtime_groups_since(None)
             .await
             .map_err(|error| {
                 ClassifiedSyncFailure::at_stage(
                     SyncSummary::default(),
-                    error.into(),
+                    error,
                     SyncFailureStage::GroupSubscriptionSync,
                 )
             })?;
@@ -4320,7 +4680,7 @@ impl AppClient {
     async fn finish_full_history_repair(
         &mut self,
         mut summary: SyncSummary,
-        verdict: DrainVerdict,
+        mut verdict: DrainVerdict,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let drained = match self.drain_pending_session_events().await {
             Ok(drained) => drained,
@@ -4334,6 +4694,11 @@ impl AppClient {
             }
         };
         summary.merge(drained);
+        if verdict == DrainVerdict::Complete
+            && !self.adapter.subscription_replay_coverage_complete()
+        {
+            verdict = DrainVerdict::CoverageIncomplete;
+        }
         if verdict == DrainVerdict::Complete {
             Ok(summary)
         } else {
@@ -5317,13 +5682,13 @@ mod membership_change_tests {
 mod runtime_group_subscription_refresh_tests {
     use std::sync::Arc;
 
-    use super::{SyncCheckpointError, SyncSummary};
+    use super::SyncSummary;
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AppPerformanceTelemetry, MarmotApp};
     use marmot_account::AccountHome;
 
     #[tokio::test]
-    async fn catch_up_checkpoint_arms_refresh_after_durable_subscription_failure() {
+    async fn catch_up_checkpoint_preserves_progress_and_arms_failed_registration_retry() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -5346,13 +5711,30 @@ mod runtime_group_subscription_refresh_tests {
 
         relay.fail_next_subscribe();
         let mut summary = SyncSummary::default();
-        let error = client
-            .checkpoint_sync_prefix(&mut summary, true, 0)
-            .await
-            .expect_err("the injected post-checkpoint subscription rebuild must fail");
-        assert!(matches!(error, SyncCheckpointError::AfterPersistence(_)));
+        assert!(
+            client
+                .checkpoint_sync_prefix(&mut summary, true, 0)
+                .await
+                .is_ok(),
+            "a failed route registration must not roll back durable healthy progress"
+        );
         assert!(client.has_pending_runtime_group_subscription_refresh());
 
+        relay.fail_next_subscribe();
+        assert!(
+            client
+                .retry_transport_subscriptions_after_connectivity_restored()
+                .await
+                .unwrap(),
+            "the first connectivity edge may bring the still-failing route forward"
+        );
+        assert!(
+            client
+                .retry_transport_subscriptions_after_connectivity_restored()
+                .await
+                .unwrap(),
+            "a repeated connectivity edge must coalesce instead of bypassing backoff"
+        );
         assert!(
             !client
                 .retry_pending_runtime_group_subscription_refresh()
@@ -5365,7 +5747,7 @@ mod runtime_group_subscription_refresh_tests {
     /// The drained seam's subscription rebuild owes the same retry edge.
     ///
     /// Both edges that could re-fire the rebuild are spent by the pass that
-    /// failed: `drain()` empties the engine's in-memory event buffer one-shot,
+    /// observed the isolated registration failure: `drain()` empties the engine's in-memory event buffer one-shot,
     /// so the `routes_dirty` event is gone, and `refresh_group_routes` reports
     /// `routing_changed` only while the in-memory routing table is actually
     /// mutating. Without an explicit arm the account's ordinary group
@@ -5373,7 +5755,7 @@ mod runtime_group_subscription_refresh_tests {
     /// the routes again — and a stale group subscription is exactly what stops
     /// those deliveries from arriving.
     #[tokio::test]
-    async fn drained_epilogue_arms_refresh_after_failed_subscription_rebuild() {
+    async fn drained_epilogue_preserves_progress_and_arms_failed_registration_retry() {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -5387,8 +5769,8 @@ mod runtime_group_subscription_refresh_tests {
         // The managed-runtime create, which defers the relay-side subscription
         // install to a later refresh (the worker performs it after replying).
         // The second group is that outstanding install: the drained disband
-        // below dirties the routes, and the rebuild it triggers is the one the
-        // relay refuses.
+        // below dirties the routes, and the rebuild it triggers retains retry
+        // work when the relay refuses it.
         let created = client
             .create_group_with_options_and_telemetry(
                 "drained retry intent",
@@ -5424,7 +5806,7 @@ mod runtime_group_subscription_refresh_tests {
         client
             .observe_drained_session_events(&effects)
             .await
-            .expect_err("the injected group subscription rebuild must fail the drain");
+            .expect("the drain must preserve progress when one registration fails");
         assert!(client.has_pending_runtime_group_subscription_refresh());
 
         // Nothing is left to re-derive the intent from: the drained batch that
@@ -6948,6 +7330,7 @@ mod tests {
         for verdict in [
             DrainVerdict::NoRelayEose,
             DrainVerdict::EoseTimeout,
+            DrainVerdict::CoverageIncomplete,
             DrainVerdict::NovelProgressQuantumYield,
             DrainVerdict::NoProgressQuantumYield,
             DrainVerdict::Overflow,

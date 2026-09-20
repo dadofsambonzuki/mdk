@@ -74,6 +74,8 @@ pub use commands::{
     PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
 };
 pub use conversions::{
+    AccountTransportEndpointStatusFfi, AccountTransportRouteRoleFfi, AccountTransportRouteStateFfi,
+    AccountTransportRouteStatusFfi, AccountTransportStateFfi, AccountTransportStatusSnapshotFfi,
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
     AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, AuditLogDeleteResultFfi,
     AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
@@ -83,17 +85,17 @@ pub use conversions::{
     ChatListMessagePreviewFfi, ChatListRowFfi, ChatListSubscriptionUpdateFfi,
     ChatListUpdateTriggerFfi, ChatNotificationSettingsFfi, ChatPinStateFfi, CreatedGroupFfi,
     CursorPersistenceFfi, DiagnosticsExporterStatusFfi, DurationHistogramBucketFfi,
-    DurationHistogramSnapshotFfi, EncryptedMediaVersionFfi, ExistingDirectConversationFfi,
-    GroupEvolutionStatusFfi, GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi,
-    HostPerformanceOperationFfi, HostPerformanceOutcomeFfi, KeyPackageMaintenanceStatusFfi,
-    LocalPushRegistrationDebugFfi, MaintenanceObligationFfi, MaintenancePhaseFfi,
-    MaintenanceTriggerFfi, MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi,
-    MediaAttachmentRejectionFfi, MediaAttachmentRejectionKindFfi, MediaDownloadResultFfi,
-    MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
-    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
-    MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
-    MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
+    DurationHistogramSnapshotFfi, EncryptedMediaVersionFfi, EndpointAdmissionOutcomeFfi,
+    EndpointRegistrationOutcomeFfi, ExistingDirectConversationFfi, GroupEvolutionStatusFfi,
+    GroupMaintenanceStatusFfi, GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi,
+    GroupSystemEventFfi, GroupSystemEventProvenanceFfi, HostPerformanceOperationFfi,
+    HostPerformanceOutcomeFfi, KeyPackageMaintenanceStatusFfi, LocalPushRegistrationDebugFfi,
+    MaintenanceObligationFfi, MaintenancePhaseFfi, MaintenanceTriggerFfi,
+    MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi, MediaAttachmentRejectionFfi,
+    MediaAttachmentRejectionKindFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
+    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
+    MediaUploadResultFfi, MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi,
+    MessageDraftFfi, MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
     NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
     NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, OnboardingActionFfi,
     OnboardingDeviceDiscoveryFfi, OnboardingDevicePackageFfi, OnboardingFindingFfi,
@@ -104,15 +106,15 @@ pub use conversions::{
     ProductEventModeFfi, ProductEventPropertyFfi, ProductEventSchemaFfi, ProductPropertyKindFfi,
     ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi, PushRegistrationFfi,
     PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
-    RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
-    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
-    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
-    TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi, UsageDiagnosticsSettingsFfi,
-    UsageDiagnosticsStatusFfi,
+    RegistrationDetailCompletenessFfi, RelayEndpointClassificationFfi, RelayEndpointPolicyFfi,
+    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+    RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
+    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
+    UsageDiagnosticsSettingsFfi, UsageDiagnosticsStatusFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -484,7 +486,9 @@ pub use conversions::{
     AccountAttentionTotalFfi, AccountAttentionUnavailableFfi, ChatListAnchorOutcomeFfi,
     ChatListPageDirectionFfi, ChatListViewFfi, ChatListWindowSnapshotFfi,
 };
-pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};
+pub use subscriptions::{
+    AccountAttentionSubscription, AccountTransportStatusSubscription, ChatListWindowSubscription,
+};
 
 pub use commands::moderation::*;
 

@@ -29,7 +29,8 @@ use nostr_sdk::prelude::{
 use storage_sqlite::StoredRelayTelemetrySettings;
 use transport_nostr_adapter::{
     NostrEventPublishRequest, NostrPublishOutcome, NostrRelayClient, NostrRelayEvent,
-    NostrSubscription,
+    NostrSubscription, NostrSubscriptionRegistration, NostrSubscriptionRegistrationRequest,
+    SubscriptionAttempt, SubscriptionEndpointRegistration, SubscriptionRegistrationDetail,
 };
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 use transport_quic_broker::BrokerServerTrust;
@@ -498,11 +499,15 @@ pub(crate) struct ScriptedPushRelayClient {
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
+    block_all_subscribes: std::sync::atomic::AtomicBool,
     block_subscribe_count: std::sync::atomic::AtomicUsize,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
     group_subscribe_attempts: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
+    fail_all_subscribes: std::sync::atomic::AtomicBool,
+    fail_next_activation: std::sync::atomic::AtomicBool,
+    failed_activation: std::sync::Mutex<Option<(cgka_traits::MemberId, SubscriptionAttempt)>>,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_count: std::sync::atomic::AtomicUsize,
@@ -743,13 +748,23 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    fn set_block_all_subscribes(&self, block: bool) {
+        self.block_all_subscribes
+            .store(block, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn block_next_subscribes(&self, count: usize) {
         self.block_subscribe_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn block_and_fail_next_subscribe(&self) {
+        self.failed_activation.lock().unwrap().take();
         self.fail_blocked_subscribe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.fail_all_subscribes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.fail_next_activation
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.block_next_subscribe();
     }
@@ -762,8 +777,23 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub(crate) fn set_fail_all_subscribes(&self, fail: bool) {
+        self.fail_all_subscribes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.lock().unwrap().len()
+    }
+
+    fn subscription_attempt_count(&self) -> usize {
+        self.subscription_attempts.lock().unwrap().len()
+    }
+
+    async fn wait_for_subscription_attempt_count(&self, expected: usize) {
+        while self.subscription_attempt_count() < expected {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Every subscription this relay has accepted so far.
@@ -800,7 +830,14 @@ impl ScriptedPushRelayClient {
     }
 
     fn release_subscribe(&self) {
+        let clears_activation_failure = self
+            .fail_blocked_subscribe
+            .load(std::sync::atomic::Ordering::SeqCst);
         self.subscribe_release.notify_waiters();
+        if clears_activation_failure {
+            self.fail_all_subscribes
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn block_next_unsubscribe(&self) {
@@ -976,6 +1013,22 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 "injected subscribe failure".to_owned(),
             ));
         }
+        let fail_activation = {
+            let mut failed_activation = self.failed_activation.lock().unwrap();
+            if failed_activation.is_none()
+                && self
+                    .fail_next_activation
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                *failed_activation =
+                    Some((subscription.account_id().clone(), subscription.attempt()));
+            }
+            failed_activation
+                .as_ref()
+                .is_some_and(|(account_id, attempt)| {
+                    account_id == subscription.account_id() && *attempt == subscription.attempt()
+                })
+        };
         let block_for_account = {
             let mut blocked_account = self.block_account_subscribe.lock().unwrap();
             if matches!(&subscription, NostrSubscription::AccountInbox { .. })
@@ -998,7 +1051,10 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 false
             }
         };
-        let blocked = block_for_account
+        let blocked = self
+            .block_all_subscribes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || block_for_account
             || block_for_account_group
             || self
                 .block_next_subscribe
@@ -1025,8 +1081,39 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 ));
             }
         }
+        if fail_activation {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected activation failure".to_owned(),
+            ));
+        }
+        if self
+            .fail_all_subscribes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".to_owned(),
+            ));
+        }
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
+    }
+
+    async fn subscribe_detailed(
+        &self,
+        request: NostrSubscriptionRegistrationRequest,
+    ) -> Result<NostrSubscriptionRegistration, cgka_traits::TransportAdapterError> {
+        let endpoints = request.registration_endpoints.clone();
+        self.subscribe(request.subscription).await?;
+        Ok(NostrSubscriptionRegistration {
+            detail: SubscriptionRegistrationDetail::Exact,
+            endpoints: endpoints
+                .into_iter()
+                .map(|endpoint| SubscriptionEndpointRegistration {
+                    endpoint,
+                    registered: true,
+                })
+                .collect(),
+        })
     }
 
     async fn unsubscribe(
@@ -1611,13 +1698,14 @@ fn failed_epoch_backfill_activation_retains_one_correlated_retry() {
             marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
         );
 
-        relay.fail_next_subscribe();
+        relay.set_fail_all_subscribes(true);
         client
             .run_pending_epoch_backfill(
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
             .await
             .expect_err("injected activation failure must surface");
+        relay.set_fail_all_subscribes(false);
         assert!(
             client.has_pending_epoch_backfill(),
             "failed activation must retain pending recovery"
@@ -3376,11 +3464,12 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
             "the refused ingest must arm an epoch-gap replay",
         );
 
-        relay.fail_next_subscribe();
+        relay.set_fail_all_subscribes(true);
         client
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect_err("the injected activation failure must surface");
+        relay.set_fail_all_subscribes(false);
         assert!(
             client.has_pending_epoch_backfill(),
             "a failed execution must retain its intent",
@@ -5071,7 +5160,7 @@ fn concurrent_invites_keep_both_accounts_readable_during_catch_up() {
 }
 
 #[test]
-fn local_ready_send_remains_pending_when_transport_activation_fails() {
+fn local_ready_send_publishes_while_subscription_recovery_is_pending() {
     run_composed_app_runtime_test(
         "local-ready-send-pending-on-activation-failure",
         local_ready_send_pending_on_activation_failure_body,
@@ -5079,7 +5168,7 @@ fn local_ready_send_remains_pending_when_transport_activation_fails() {
 }
 
 #[test]
-fn local_ready_queued_sends_publish_once_in_order_after_activation_recovers() {
+fn local_ready_sends_publish_once_in_order_while_subscription_recovery_is_pending() {
     run_composed_app_runtime_test(
         "local-ready-queued-send-ordering",
         local_ready_queued_send_ordering_body,
@@ -5087,7 +5176,7 @@ fn local_ready_queued_sends_publish_once_in_order_after_activation_recovers() {
 }
 
 #[test]
-fn locally_queued_send_survives_runtime_restart_and_failed_reactivation() {
+fn locally_published_send_is_not_duplicated_by_failed_restart_reactivation() {
     run_composed_app_runtime_test(
         "local-ready-queued-send-restart",
         locally_queued_send_restart_body,
@@ -5979,6 +6068,7 @@ async fn local_ready_send_pending_on_activation_failure_body() {
         .unwrap();
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
+    let initial_activation_attempts = relay.subscription_attempt_count() + 2;
 
     relay.block_and_fail_next_subscribe();
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -5995,6 +6085,12 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     )
     .await
     .expect("transport activation should continue after local readiness");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_subscription_attempt_count(initial_activation_attempts),
+    )
+    .await
+    .expect("every route in the failing activation should be attempted");
 
     let send_runtime = runtime.clone();
     let send_group_id = group_id.clone();
@@ -6016,7 +6112,7 @@ async fn local_ready_send_pending_on_activation_failure_body() {
 
     // Hold the reconnect activation too, so the test can observe the accepted
     // local row before background convergence publishes it.
-    relay.block_next_subscribe();
+    relay.set_block_all_subscribes(true);
     relay.release_subscribe();
     let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), send)
         .await
@@ -6055,8 +6151,8 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     );
     assert_eq!(
         last_message.delivery_state,
-        ChatListMessageDeliveryState::Pending,
-        "the app-facing projection must stay pending while activation recovers; \
+        ChatListMessageDeliveryState::Delivered,
+        "subscription registration failure must not disable outbound publication; \
          invalidation: {:?}; send result: {send_result:?}",
         timeline.messages[0].invalidation_status
     );
@@ -6069,6 +6165,8 @@ async fn local_ready_send_pending_on_activation_failure_body() {
         "transport lifecycle state must not become a terminal send error: {send_result:?}"
     );
 
+    let published_while_recovery_pending = relay.published_event_ids().len();
+    relay.set_block_all_subscribes(false);
     relay.release_subscribe();
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         loop {
@@ -6103,8 +6201,9 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     assert_eq!(
         published_ids.len() - publishes_before_runtime,
         1,
-        "recovery must publish exactly one transport event"
+        "subscription recovery must not republish an already delivered event"
     );
+    assert_eq!(published_ids.len(), published_while_recovery_pending);
     assert_eq!(
         recovered_timeline.messages[0]
             .source_message_id_hex
@@ -6131,6 +6230,7 @@ async fn local_ready_queued_send_ordering_body() {
         .unwrap();
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
+    let initial_activation_attempts = relay.subscription_attempt_count() + 2;
 
     relay.block_and_fail_next_subscribe();
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -6141,6 +6241,12 @@ async fn local_ready_queued_send_ordering_body() {
     )
     .await
     .expect("initial activation should be in flight");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_subscription_attempt_count(initial_activation_attempts),
+    )
+    .await
+    .expect("every route in the failing activation should be attempted");
 
     let first_runtime = runtime.clone();
     let first_group = group_id.clone();
@@ -6158,7 +6264,7 @@ async fn local_ready_queued_send_ordering_body() {
             .await
     });
 
-    relay.block_next_subscribe();
+    relay.set_block_all_subscribes(true);
     relay.release_subscribe();
     assert!(first.await.unwrap().is_ok());
     assert!(second.await.unwrap().is_ok());
@@ -6170,7 +6276,7 @@ async fn local_ready_queued_send_ordering_body() {
     .expect("background transport reactivation should be attempted");
 
     let group_id_hex = hex::encode(group_id.as_slice());
-    let pending = app
+    let delivered_while_recovery_pending = app
         .timeline_messages_with_query(
             "alice",
             TimelineMessageQuery {
@@ -6179,16 +6285,17 @@ async fn local_ready_queued_send_ordering_body() {
             },
         )
         .unwrap();
-    assert_eq!(pending.messages.len(), 2);
+    assert_eq!(delivered_while_recovery_pending.messages.len(), 2);
     assert!(
-        pending
+        delivered_while_recovery_pending
             .messages
             .iter()
-            .all(|message| message.source_message_id_hex.is_none()
+            .all(|message| message.source_message_id_hex.is_some()
                 && message.invalidation_status.is_none()),
-        "both accepted sends must remain pending before activation recovers"
+        "subscription recovery must not disable independent outbound publication"
     );
 
+    relay.set_block_all_subscribes(false);
     relay.release_subscribe();
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         loop {
@@ -6260,11 +6367,18 @@ async fn locally_queued_send_restart_body() {
         .await
         .unwrap();
     drop(setup_client);
+    let first_activation_attempts = relay.subscription_attempt_count() + 2;
 
     relay.block_and_fail_next_subscribe();
     let first_runtime = MarmotAppRuntime::new(app.clone());
     first_runtime.reconcile_accounts().await.unwrap();
     relay.wait_for_blocked_subscribe().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_subscription_attempt_count(first_activation_attempts),
+    )
+    .await
+    .expect("every route in the first failing activation should be attempted");
     let send_runtime = first_runtime.clone();
     let send_group = group_id.clone();
     let send = tokio::spawn(async move {
@@ -6277,7 +6391,7 @@ async fn locally_queued_send_restart_body() {
     first_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
-    let pending = app
+    let delivered = app
         .timeline_messages_with_query(
             "alice",
             TimelineMessageQuery {
@@ -6286,18 +6400,24 @@ async fn locally_queued_send_restart_body() {
             },
         )
         .unwrap();
-    assert_eq!(pending.messages.len(), 1);
-    assert!(pending.messages[0].source_message_id_hex.is_none());
-    assert!(pending.messages[0].invalidation_status.is_none());
+    assert_eq!(delivered.messages.len(), 1);
+    assert!(delivered.messages[0].source_message_id_hex.is_some());
+    assert!(delivered.messages[0].invalidation_status.is_none());
     let publishes_before_restart = relay.published_event_ids().len();
 
-    // Fail the restarted worker's first activation too. Hydration must still
-    // wake the durable queue, and its convergence timer must reactivate the
-    // account without any new user command or inbound event.
+    // Fail the restarted worker's first activation too. Subscription recovery
+    // must not republish the message that succeeded before shutdown.
+    let restarted_activation_attempts = relay.subscription_attempt_count() + 2;
     relay.block_and_fail_next_subscribe();
     let restarted_runtime = MarmotAppRuntime::new(app.clone());
     restarted_runtime.reconcile_accounts().await.unwrap();
     relay.wait_for_blocked_subscribe().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_subscription_attempt_count(restarted_activation_attempts),
+    )
+    .await
+    .expect("every route in the restarted failing activation should be attempted");
     relay.release_subscribe();
 
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
@@ -6319,11 +6439,11 @@ async fn locally_queued_send_restart_body() {
         }
     })
     .await
-    .expect("hydrated queue should publish after background reactivation");
+    .expect("the delivered message remains projected across restart");
     assert_eq!(
         relay.published_event_ids().len() - publishes_before_restart,
-        1,
-        "restart recovery must publish the logical message exactly once"
+        0,
+        "subscription recovery must not duplicate the already-published message"
     );
 
     restarted_runtime.shutdown().await;
@@ -16151,9 +16271,11 @@ fn transport_group_route_replacement_installs_current_and_prior_routes() {
         .iter()
         .filter(|route| route.group_id == group_id)
         .collect();
-    assert_eq!(routes.len(), 2);
-    assert!(routes.contains(&&sub_x));
-    assert!(routes.contains(&&sub_y));
+    assert_eq!(routes, vec![&sub_y, &sub_x]);
+    assert_eq!(
+        routes[0], &sub_y,
+        "normalization must not promote a historical route ahead of the current route"
+    );
 }
 
 #[test]
@@ -16830,7 +16952,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
 }
 
 #[tokio::test]
-async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
+async fn local_delete_compensation_preserves_primary_error_and_restores_local_route() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -16854,7 +16976,6 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     .await
     .unwrap();
     app.close_storage().unwrap();
-    relay.fail_next_subscribe();
     relay.release_unsubscribe();
 
     let (result, routes_after) = delete.await.unwrap();
@@ -16864,12 +16985,6 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
         "the original storage-delete failure must win over compensation failures: {error}"
     );
     assert_eq!(routes_after, routes_before);
-    assert!(
-        !relay
-            .fail_next_subscribe
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "runtime route restoration must still be attempted after storage compensation fails"
-    );
 }
 
 #[tokio::test]
@@ -17374,8 +17489,9 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     );
     // ...and a later fallible step in that same pass errors, so the summary the
     // pass was building never reaches a caller.
-    relay.fail_next_subscribe();
+    relay.set_fail_all_subscribes(true);
     let failed = client.sync().await;
+    relay.set_fail_all_subscribes(false);
     assert!(
         failed.is_err(),
         "the injected transport failure must fail this sync pass"

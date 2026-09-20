@@ -40,6 +40,7 @@ mod push;
 mod relay;
 mod telemetry;
 mod timeline;
+mod transport_status;
 
 pub(super) fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -63,6 +64,7 @@ pub use push::*;
 pub use relay::*;
 pub use telemetry::*;
 pub use timeline::*;
+pub use transport_status::*;
 
 #[cfg(test)]
 mod tests {

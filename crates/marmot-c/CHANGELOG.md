@@ -7,6 +7,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Account-scoped transport coverage through `marmot_account_transport_status` and
+  `marmot_subscribe_account_transport_status`, including typed inbox/current/historical
+  route state, endpoint admission and registration outcomes, pending replay/retry state,
+  and bounded coalescing snapshots. Returned snapshots own nested route and endpoint
+  allocations and require `marmot_account_transport_status_snapshot_free`; callback items
+  remain borrowed. Regenerate the header and use it with the matching library.
+
 ## [0.10.4] - 2026-09-20
 
 ### Added

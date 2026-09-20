@@ -9,7 +9,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 inventory_path="docs/marmot-architecture/convergence-constant-inventory.txt"
 plan_path="docs/marmot-architecture/convergence-reliability-plan.md"
-expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10)
+expected_ids=(P1 P2 P3 P4 P5 P6 P7 P8 P9 P10 E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 A1 A2 A3 A4 A5 A6 A7 A8 A9 A10 A11)
 inventory_pairs=("__inventory_sentinel__")
 inventory_ids=()
 fail=0
@@ -126,6 +126,9 @@ discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A
 discover_constants \
     "crates/marmot-app/src/lib.rs" \
     "(APP_RUNTIME_RELAY_REBUILD_LOOKBACK|TRANSPORT_CURSOR_MAX_FUTURE_SKEW)"
+discover_constants \
+    "crates/transport-nostr-adapter/src/lib.rs" \
+    "(MAX_CONCURRENT_REGISTRATIONS|REGISTRATION_RECONCILIATION_BUDGET)"
 
 if [[ "$fail" -ne 0 ]]; then
     exit 1

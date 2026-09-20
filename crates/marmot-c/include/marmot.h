@@ -222,6 +222,48 @@ typedef enum MarmotMediaAttachmentRejectionKind {
   MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
 } MarmotMediaAttachmentRejectionKind;
 
+typedef enum MarmotAccountTransportState {
+  MARMOT_ACCOUNT_TRANSPORT_STATE_INACTIVE,
+  MARMOT_ACCOUNT_TRANSPORT_STATE_AVAILABLE,
+  MARMOT_ACCOUNT_TRANSPORT_STATE_DEGRADED,
+  MARMOT_ACCOUNT_TRANSPORT_STATE_UNAVAILABLE,
+} MarmotAccountTransportState;
+
+typedef enum MarmotAccountTransportRouteRole {
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_ROLE_INBOX,
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_ROLE_CURRENT_GROUP,
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_ROLE_HISTORICAL_GROUP,
+} MarmotAccountTransportRouteRole;
+
+typedef enum MarmotAccountTransportRouteState {
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_STATE_PENDING,
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_STATE_REGISTERED,
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_STATE_RETRY_PENDING,
+  MARMOT_ACCOUNT_TRANSPORT_ROUTE_STATE_POLICY_BLOCKED,
+} MarmotAccountTransportRouteState;
+
+typedef enum MarmotRegistrationDetailCompleteness {
+  MARMOT_REGISTRATION_DETAIL_COMPLETENESS_EXACT,
+  MARMOT_REGISTRATION_DETAIL_COMPLETENESS_UNKNOWN,
+} MarmotRegistrationDetailCompleteness;
+
+typedef enum MarmotEndpointAdmissionOutcome {
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_ALLOWED,
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_INVALID,
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_UNSAFE,
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_RETIRED,
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_DUPLICATE,
+  MARMOT_ENDPOINT_ADMISSION_OUTCOME_BEYOND_ROUTE_LIMIT,
+} MarmotEndpointAdmissionOutcome;
+
+typedef enum MarmotEndpointRegistrationOutcome {
+  MARMOT_ENDPOINT_REGISTRATION_OUTCOME_NOT_ATTEMPTED,
+  MARMOT_ENDPOINT_REGISTRATION_OUTCOME_PENDING,
+  MARMOT_ENDPOINT_REGISTRATION_OUTCOME_REGISTERED,
+  MARMOT_ENDPOINT_REGISTRATION_OUTCOME_FAILED,
+  MARMOT_ENDPOINT_REGISTRATION_OUTCOME_UNKNOWN,
+} MarmotEndpointRegistrationOutcome;
+
 typedef enum MarmotAvatarAvailability {
   MARMOT_AVATAR_AVAILABILITY_MISSING,
   MARMOT_AVATAR_AVAILABILITY_READY,
@@ -1022,6 +1064,11 @@ typedef enum MarmotHostPerformanceOutcome {
 typedef struct MarmotAccountAttentionSubscription MarmotAccountAttentionSubscription;
 
 /**
+ * One account's complete transport coverage. Free before its client.
+ */
+typedef struct MarmotAccountTransportStatusSubscription MarmotAccountTransportStatusSubscription;
+
+/**
  * Single live stream. Free before its creating `MarmotClient`; never free
  * concurrently with an in-flight call on this handle.
  */
@@ -1388,6 +1435,57 @@ typedef struct MarmotAttachmentPageRead {
     MarmotAttachmentPageRead_Page_Body PAGE;
   };
 } MarmotAttachmentPageRead;
+
+/**
+ * One requested endpoint's local admission and registration result.
+ */
+typedef struct MarmotAccountTransportEndpointStatus {
+  char *requested_endpoint;
+  char *normalized_endpoint;
+  enum MarmotEndpointAdmissionOutcome admission;
+  enum MarmotEndpointRegistrationOutcome registration;
+} MarmotAccountTransportEndpointStatus;
+
+/**
+ * One desired inbox or group route. Owned by its enclosing snapshot.
+ */
+typedef struct MarmotAccountTransportRouteStatus {
+  char *route_ref;
+  char *group_id_hex;
+  char *transport_group_id_hex;
+  enum MarmotAccountTransportRouteRole role;
+  enum MarmotAccountTransportRouteState state;
+  uint32_t requested_endpoint_count;
+  uint32_t admitted_endpoint_count;
+  bool has_registered_endpoint_count;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t registered_endpoint_count;
+  enum MarmotRegistrationDetailCompleteness registration_detail;
+  struct MarmotAccountTransportEndpointStatus *endpoints;
+  uintptr_t endpoints_len;
+  bool pending_registration;
+  bool pending_replay;
+  bool has_retry_delay_ms;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retry_delay_ms;
+} MarmotAccountTransportRouteStatus;
+
+/**
+ * Complete replacement for one account. Free only through this root.
+ */
+typedef struct MarmotAccountTransportStatusSnapshot {
+  uint64_t revision;
+  enum MarmotAccountTransportState state;
+  struct MarmotAccountTransportRouteStatus *inbox;
+  struct MarmotAccountTransportRouteStatus *current_group_routes;
+  uintptr_t current_group_routes_len;
+  struct MarmotAccountTransportRouteStatus *historical_group_routes;
+  uintptr_t historical_group_routes_len;
+} MarmotAccountTransportStatusSnapshot;
 
 typedef struct MarmotAvatarAsset {
   char *target;
@@ -4946,6 +5044,13 @@ typedef struct MarmotAccountAttentionSnapshot {
   uintptr_t accounts_len;
 } MarmotAccountAttentionSnapshot;
 
+/**
+ * Callback invoked with each item (borrowed; valid only during
+ * the call) and finally with NULL when the stream closes.
+ */
+typedef void (*MarmotAccountTransportStatusCallback)(const struct MarmotAccountTransportStatusSnapshot *item,
+                                                     void *user_data);
+
 typedef struct MarmotConversationWindowRevision {
   char *generation;
   uint64_t sequence;
@@ -5412,6 +5517,20 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Latest complete account transport coverage. This read does not activate or dial.
+ * Free with `marmot_account_transport_status_snapshot_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_transport_status(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             struct MarmotAccountTransportStatusSnapshot **out);
 
 /**
  * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
@@ -9763,6 +9882,76 @@ MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct Mar
                                                                 struct MarmotChatListWindowSnapshot **out);
 
 /**
+ *Block until the next item, the timeout, or stream close. `timeout_ms == 0` waits indefinitely. Returns `MARMOT_STATUS_OK` (out set; free with `marmot_account_transport_status_snapshot_free`), `MARMOT_STATUS_TIMEOUT`, or `MARMOT_STATUS_CLOSED` (out NULL for both).
+ *
+ * # Safety
+ * `sub` must be a live handle; `out` must be a valid pointer.
+ */
+MarmotStatus marmot_account_transport_status_subscription_next(const struct MarmotAccountTransportStatusSubscription *sub,
+                                                               uint32_t timeout_ms,
+                                                               struct MarmotAccountTransportStatusSnapshot **out);
+
+/**
+ * Install a callback pump for this subscription. `callback` runs
+ * on a runtime worker thread with a borrowed item pointer (valid
+ * only during the call; do not store or free it) and a final
+ * NULL item on close. `callback` and `user_data` access must be
+ * thread-safe. Fails if a callback is already installed.
+ *
+ * # Safety
+ * `sub` must be a live handle; `callback` a valid function
+ * pointer. `user_data` must outlive every callback invocation —
+ * clear/free only *request* cancellation without waiting (see
+ * the module docs).
+ */
+MarmotStatus marmot_account_transport_status_subscription_set_callback(const struct MarmotAccountTransportStatusSubscription *sub,
+                                                                       MarmotAccountTransportStatusCallback callback,
+                                                                       void *user_data);
+
+/**
+ * Request cancellation of this subscription's callback pump, if
+ * any. Non-blocking: a callback already running keeps executing
+ * after this returns (see the module docs).
+ *
+ * # Safety
+ * `sub` must be a live handle.
+ */
+MarmotStatus marmot_account_transport_status_subscription_clear_callback(const struct MarmotAccountTransportStatusSubscription *sub);
+
+/**
+ * Free the subscription handle. Requests callback-pump
+ * cancellation without waiting (a callback may still be running
+ * after this returns — do not free `user_data` on that basis).
+ * NULL is a no-op. Free every handle before the client that
+ * created it.
+ *
+ * # Safety
+ * `sub` must be NULL or an unfreed handle pointer.
+ */
+void marmot_account_transport_status_subscription_free(struct MarmotAccountTransportStatusSubscription *sub);
+
+/**
+ * Subscribe without activating or dialing. Take the initial snapshot once, then
+ * drive `next` or install a callback; do not mix the two receive modes.
+ *
+ * # Safety
+ * `client` and `account_ref` must be valid; `out_sub` must be writable.
+ */
+MarmotStatus marmot_subscribe_account_transport_status(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       struct MarmotAccountTransportStatusSubscription **out_sub);
+
+/**
+ * Take the initial complete snapshot once. A second call returns CLOSED and NULL.
+ * Free the result with `marmot_account_transport_status_snapshot_free`.
+ *
+ * # Safety
+ * `sub` must remain live and `out` must be writable.
+ */
+MarmotStatus marmot_account_transport_status_subscription_snapshot(const struct MarmotAccountTransportStatusSubscription *sub,
+                                                                   struct MarmotAccountTransportStatusSnapshot **out);
+
+/**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
  * # Safety
  * sub must be live and out writable.
@@ -10812,6 +11001,16 @@ void marmot_timeline_subscription_update_free(struct MarmotTimelineSubscriptionU
  * this library.
  */
 void marmot_timeline_edit_history_page_free(struct MarmotTimelineEditHistoryPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_account_transport_status_snapshot_free(struct MarmotAccountTransportStatusSnapshot *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

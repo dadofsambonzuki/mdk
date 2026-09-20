@@ -411,6 +411,17 @@ pub struct AppClient {
     /// background retry instead of turning the already-applied ingest into an
     /// apparent receive failure.
     pub(crate) pending_runtime_group_subscription_refresh: bool,
+    /// Missing endpoint registrations retained by the Nostr adapter. This is
+    /// scheduled by the same coalesced worker timer as route refreshes, but is
+    /// reconciled without rebuilding already-healthy subscriptions.
+    pub(crate) pending_transport_registration_retry: bool,
+    /// Coalesces a burst of host connectivity-restored notifications into one
+    /// early transport-registration reconciliation per backoff interval.
+    pub(crate) transport_subscription_connectivity_wake_used: bool,
+    /// Storage generations frozen by the most recent full account activation.
+    /// Group-only replacement cannot expand this set, so stale EOSE from the
+    /// older activation cannot clear a newly prepared route obligation.
+    pub(crate) subscription_replay_snapshot: Vec<storage_sqlite::SubscriptionReplayGeneration>,
     /// Last transport cursor promoted by a completed drain checkpoint. Live
     /// one-at-a-time worker ingests may advance `state` for diagnostics, but
     /// they persist this older safe floor until a drain has observed any
@@ -741,7 +752,9 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        let protected_since = self.prepare_subscription_replay_obligations(None)?;
+        self.freeze_subscription_replay_snapshot()?;
+        self.runtime.activate_transport(protected_since).await?;
         self.publish_key_package_from_lifecycle().await
     }
 
@@ -1239,7 +1252,9 @@ impl AppClient {
             .ensure_local_account_relay_lists(&self.state.label)
             .await?;
         self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
+        let protected_since = self.prepare_subscription_replay_obligations(None)?;
+        self.freeze_subscription_replay_snapshot()?;
+        self.runtime.activate_transport(protected_since).await?;
         // SQLCipher lifecycle state is authoritative. On first rollout the
         // publisher imports only the legacy JSON `d` slot, then performs the
         // recorded upgrade replacement under that same slot.

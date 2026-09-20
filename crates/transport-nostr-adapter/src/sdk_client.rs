@@ -22,7 +22,9 @@ use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 
 use crate::{
     NostrEventPublishRequest, NostrPublishBatch, NostrPublishOutcome, NostrRelayClient,
-    NostrRelayEvent, NostrSubscription, NostrTransportAdapter,
+    NostrRelayEvent, NostrSubscription, NostrSubscriptionRegistration,
+    NostrSubscriptionRegistrationRequest, NostrTransportAdapter, SubscriptionEndpointRegistration,
+    SubscriptionRegistrationDetail,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -1322,15 +1324,72 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
-        let plan = Self::plan_subscription(&subscription)?;
+        let registration_endpoints = subscription.endpoints().to_vec();
+        let registration = self
+            .subscribe_detailed(NostrSubscriptionRegistrationRequest {
+                subscription,
+                registration_endpoints,
+            })
+            .await?;
+        if registration
+            .endpoints
+            .iter()
+            .any(|outcome| outcome.registered)
+        {
+            Ok(())
+        } else {
+            Err(TransportAdapterError::Subscription(format!(
+                "subscribe registered on 0 of {} relays",
+                registration.endpoints.len()
+            )))
+        }
+    }
+
+    async fn subscribe_detailed(
+        &self,
+        request: NostrSubscriptionRegistrationRequest,
+    ) -> Result<NostrSubscriptionRegistration, TransportAdapterError> {
+        let plan = Self::plan_subscription(&request.subscription)?;
+        let registration_endpoints =
+            parse_endpoints(&request.registration_endpoints, "subscription registration")?;
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
-            method = "subscribe",
-            endpoint_count = plan.endpoints.len(),
+            method = "subscribe_detailed",
+            endpoint_count = registration_endpoints.len(),
             "subscribing SDK relay plan"
         );
-        for endpoint in &plan.endpoints {
-            self.add_subscription_relay(endpoint.clone()).await?;
+
+        // Establish cleanup ownership before the first network await. A
+        // cancelled or uncertain registration can then be removed by the
+        // account lifecycle instead of leaving an untracked REQ.
+        self.account_subscriptions
+            .write()
+            .await
+            .entry(plan.account_id.clone())
+            .or_default()
+            .push_unique(plan.subscription_id.clone());
+
+        let mut attempted = Vec::with_capacity(registration_endpoints.len());
+        let mut target_endpoints = Vec::with_capacity(registration_endpoints.len());
+        for endpoint in registration_endpoints {
+            if let Ok(()) = self.add_subscription_relay(endpoint.clone()).await {
+                target_endpoints.push(endpoint.clone());
+            }
+            attempted.push(endpoint);
+        }
+
+        if target_endpoints.is_empty() {
+            let outcomes = attempted
+                .into_iter()
+                .map(|endpoint| SubscriptionEndpointRegistration {
+                    endpoint: TransportEndpoint(endpoint.to_string()),
+                    registered: false,
+                })
+                .collect();
+            return Ok(NostrSubscriptionRegistration {
+                detail: SubscriptionRegistrationDetail::Exact,
+                endpoints: outcomes,
+            });
         }
 
         // Let nostr-sdk own connection lifecycle for subscriptions. `connect()`
@@ -1343,20 +1402,15 @@ impl NostrRelayClient for NostrSdkRelayClient {
         let output = self
             .client
             .subscribe_with_id_to(
-                plan.endpoints.clone(),
+                target_endpoints,
+                // Retry only the missing endpoints while retaining the
+                // original plan's subscription id and filter.
                 plan.subscription_id.clone(),
                 plan.filter,
                 None,
             )
             .await
             .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
-
-        if output.success.is_empty() {
-            return Err(TransportAdapterError::Subscription(format!(
-                "subscribe registered on 0 of {} relays",
-                plan.endpoints.len()
-            )));
-        }
 
         if !output.failed.is_empty() {
             tracing::warn!(
@@ -1371,17 +1425,16 @@ impl NostrRelayClient for NostrSdkRelayClient {
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "subscribe",
-            endpoint_count = plan.endpoints.len(),
+            endpoint_count = attempted.len(),
             registered_count = output.success.len(),
             "SDK relay subscription registered"
         );
 
         // Record which of the requested endpoints acknowledged the registration
         // so the app can surface it in the `subscription_rebuild` audit row.
-        // Only reached on the success path (>=1 relay registered): a total
-        // failure returned above, aborting activation before any audit row.
-        let outcomes = plan
-            .endpoints
+        // Exact zero-registration outcomes are retained too; diagnostics must
+        // not silently omit the route that needs recovery.
+        let outcomes = attempted
             .iter()
             .map(|endpoint| (endpoint.clone(), output.success.contains(endpoint)));
         merge_registration_log(
@@ -1393,13 +1446,16 @@ impl NostrRelayClient for NostrSdkRelayClient {
             outcomes,
         );
 
-        self.account_subscriptions
-            .write()
-            .await
-            .entry(plan.account_id)
-            .or_default()
-            .push_unique(plan.subscription_id);
-        Ok(())
+        Ok(NostrSubscriptionRegistration {
+            detail: SubscriptionRegistrationDetail::Exact,
+            endpoints: attempted
+                .into_iter()
+                .map(|endpoint| SubscriptionEndpointRegistration {
+                    registered: output.success.contains(&endpoint),
+                    endpoint: TransportEndpoint(endpoint.to_string()),
+                })
+                .collect(),
+        })
     }
 
     async fn unsubscribe(
@@ -2491,6 +2547,50 @@ mod tests {
                 .await
                 .is_empty(),
             "sign-out must drop the account's undrained registrations"
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_subscription_reports_exact_endpoint_and_tracks_ownership() {
+        let relay = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let account = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let subscription = NostrSubscription::AccountInbox {
+            account_id: account.clone(),
+            endpoints: vec![endpoint.clone()],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let subscription_id = SubscriptionId::new(subscription.subscription_id());
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            sdk.subscribe_detailed(NostrSubscriptionRegistrationRequest {
+                subscription,
+                registration_endpoints: vec![endpoint.clone()],
+            }),
+        )
+        .await
+        .expect("registration completes")
+        .expect("relay accepts registration");
+
+        assert_eq!(outcome.detail, SubscriptionRegistrationDetail::Exact);
+        assert_eq!(
+            outcome.endpoints,
+            vec![SubscriptionEndpointRegistration {
+                endpoint,
+                registered: true,
+            }]
+        );
+        assert_eq!(
+            sdk.account_subscriptions
+                .read()
+                .await
+                .get(&account)
+                .cloned()
+                .unwrap_or_default(),
+            vec![subscription_id]
         );
     }
 

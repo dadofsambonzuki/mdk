@@ -450,6 +450,7 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<bool>,
     },
     RetryRuntimeGroupSubscriptions {
+        next_retry_delay: Duration,
         respond: oneshot::Sender<bool>,
     },
     DeleteAuditLog {
@@ -2083,7 +2084,7 @@ async fn handle_account_worker_catch_up(
                     // an arbitrarily slow relay drain.
                     let _ = respond.send(Err(AppError::AccountWorkerBusy));
                 }
-                AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+                AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond, .. } => {
                     // This is worker-owned maintenance, not caller work. Keep
                     // its retry armed without placing it in the deferred FIFO;
                     // otherwise it would unnecessarily force later snapshot
@@ -3100,7 +3101,7 @@ where
             AccountWorkerCommand::CatchUp { .. } => {
                 follow_up.push_back(command);
             }
-            AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
+            AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond, .. } => {
                 let _ = respond.send(true);
             }
             command => deferred.push_back(command),
@@ -3188,7 +3189,13 @@ fn account_worker_command_future<'a>(
     let storage_permit = shared.product_analytics.permit();
     match command {
         AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
-            let result = client.note_connectivity_restored().map(|_| ());
+            let mut result = client.note_connectivity_restored().map(|_| ());
+            if result.is_ok() && client.has_pending_runtime_group_subscription_refresh() {
+                result = client
+                    .retry_transport_subscriptions_after_connectivity_restored()
+                    .await
+                    .map(|_| ());
+            }
             scheduled_convergence.wake_after_connectivity_restored();
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -3205,9 +3212,12 @@ fn account_worker_command_future<'a>(
             let _ = respond.send(());
             true
         }),
-        AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => Box::pin(async move {
+        AccountWorkerCommand::RetryRuntimeGroupSubscriptions {
+            next_retry_delay,
+            respond,
+        } => Box::pin(async move {
             let pending = match client
-                .retry_pending_runtime_group_subscription_refresh()
+                .retry_pending_runtime_group_subscription_refresh_with_delay(next_retry_delay)
                 .await
             {
                 Ok(pending) => pending,
@@ -4999,7 +5009,12 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
                 sleep(runtime_group_subscription_retry_delay(attempt)).await;
                 let (respond, response) = oneshot::channel();
                 if commands
-                    .send(AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond })
+                    .send(AccountWorkerCommand::RetryRuntimeGroupSubscriptions {
+                        next_retry_delay: runtime_group_subscription_retry_delay(
+                            attempt.saturating_add(1),
+                        ),
+                        respond,
+                    })
                     .await
                     .is_err()
                 {
@@ -6969,7 +6984,7 @@ mod tests {
 
         let (events, mut subscriber) = broadcast::channel(4);
         let shared = RuntimeSharedServices::default();
-        relay.fail_next_subscribe();
+        relay.set_fail_all_subscribes(true);
         let error = run_pending_epoch_backfill_reporting_arm(
             &mut client,
             &events,
@@ -6980,6 +6995,7 @@ mod tests {
         )
         .await
         .expect_err("failed replay activation must be returned");
+        relay.set_fail_all_subscribes(false);
 
         assert_eq!(
             error.to_string(),
@@ -7614,15 +7630,25 @@ mod tests {
         assert!(scheduled.is_armed());
 
         let first = received_commands.recv().await.unwrap();
-        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } = first else {
+        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions {
+            next_retry_delay,
+            respond,
+        } = first
+        else {
             panic!("timer must enqueue an internal group-subscription retry")
         };
+        assert_eq!(next_retry_delay, runtime_group_subscription_retry_delay(2));
         respond.send(true).unwrap();
 
         let second = received_commands.recv().await.unwrap();
-        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } = second else {
+        let AccountWorkerCommand::RetryRuntimeGroupSubscriptions {
+            next_retry_delay,
+            respond,
+        } = second
+        else {
             panic!("pending refresh must enqueue a backed-off retry")
         };
+        assert_eq!(next_retry_delay, runtime_group_subscription_retry_delay(3));
         respond.send(false).unwrap();
         scheduled.observe_pending(false, &commands);
         assert!(!scheduled.is_armed());
