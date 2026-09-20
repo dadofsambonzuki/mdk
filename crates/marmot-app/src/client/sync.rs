@@ -364,10 +364,7 @@ impl DrainVerdict {
     }
 
     fn spends_eose_attempt(self) -> bool {
-        matches!(
-            self,
-            Self::EoseTimeout | Self::NoRelayEose | Self::CoverageIncomplete
-        )
+        matches!(self, Self::EoseTimeout | Self::NoRelayEose)
     }
 
     fn made_novel_progress(self) -> bool {
@@ -7349,6 +7346,13 @@ mod tests {
                 "the caller must be able to distinguish why the repair stayed incomplete",
             );
         }
+    }
+
+    #[test]
+    fn coverage_exclusions_do_not_spend_relay_eose_attempts() {
+        assert!(DrainVerdict::EoseTimeout.spends_eose_attempt());
+        assert!(DrainVerdict::NoRelayEose.spends_eose_attempt());
+        assert!(!DrainVerdict::CoverageIncomplete.spends_eose_attempt());
     }
 
     #[tokio::test]

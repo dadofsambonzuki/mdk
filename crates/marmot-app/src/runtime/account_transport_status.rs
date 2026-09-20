@@ -184,7 +184,12 @@ impl AccountTransportStatusRegistry {
     }
 
     pub(crate) fn snapshot(&self, account_id: &MemberId) -> AccountTransportStatusSnapshot {
-        self.sender(account_id).borrow().clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(account_id)
+            .map(|sender| sender.borrow().clone())
+            .unwrap_or_else(AccountTransportStatusSnapshot::inactive)
     }
 
     pub(crate) fn publish(
@@ -373,5 +378,23 @@ mod tests {
         let recreated = registry.snapshot(&account_id);
         assert_eq!(recreated.state, AccountTransportState::Inactive);
         assert_eq!(recreated.revision, 0);
+    }
+
+    #[test]
+    fn snapshot_of_unknown_account_does_not_allocate_a_registry_entry() {
+        let registry = AccountTransportStatusRegistry::default();
+        let account_id = MemberId::new(vec![0xCC; 32]);
+
+        assert_eq!(
+            registry.snapshot(&account_id).state,
+            AccountTransportState::Inactive
+        );
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
     }
 }

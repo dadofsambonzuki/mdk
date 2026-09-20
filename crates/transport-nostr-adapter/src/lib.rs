@@ -901,36 +901,39 @@ impl NostrTransportAdapter {
         NostrSubscriptionRegistrationRequest,
         Result<NostrSubscriptionRegistration, TransportAdapterError>,
     )> {
+        let mut pending = requests.iter().cloned().enumerate();
+        let mut tasks = JoinSet::new();
+        for (sub_index, request) in pending.by_ref().take(MAX_CONCURRENT_REGISTRATIONS) {
+            let relay_client = self.relay_client.clone();
+            tasks.spawn(async move {
+                let outcome = relay_client.subscribe_detailed(request.clone()).await;
+                (sub_index, request, outcome)
+            });
+        }
         let mut outcomes = Vec::with_capacity(requests.len());
-        for chunk in requests.chunks(MAX_CONCURRENT_REGISTRATIONS) {
-            let mut tasks = JoinSet::new();
-            for (sub_index, request) in chunk.iter().cloned().enumerate() {
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(_error) => tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = caller,
+                    error_kind = "registration_task_failed",
+                    "transport registration task failed"
+                ),
+            }
+            if let Some((sub_index, request)) = pending.next() {
                 let relay_client = self.relay_client.clone();
                 tasks.spawn(async move {
                     let outcome = relay_client.subscribe_detailed(request.clone()).await;
                     (sub_index, request, outcome)
                 });
             }
-            let mut chunk_outcomes = Vec::with_capacity(chunk.len());
-            while let Some(result) = tasks.join_next().await {
-                match result {
-                    Ok(outcome) => chunk_outcomes.push(outcome),
-                    Err(_error) => tracing::warn!(
-                        target: "transport_nostr_adapter::adapter",
-                        method = caller,
-                        error_kind = "registration_task_failed",
-                        "transport registration task failed"
-                    ),
-                }
-            }
-            chunk_outcomes.sort_by_key(|(sub_index, _, _)| *sub_index);
-            outcomes.extend(
-                chunk_outcomes
-                    .into_iter()
-                    .map(|(_, request, outcome)| (request, outcome)),
-            );
         }
+        outcomes.sort_by_key(|(sub_index, _, _)| *sub_index);
         outcomes
+            .into_iter()
+            .map(|(_, request, outcome)| (request, outcome))
+            .collect()
     }
 
     /// Drain relay unsubscribes queued in `pending_unsubscribes`. A local
@@ -2521,6 +2524,7 @@ fn diff_group_subscriptions(
             let route_key = group_route_key(account_id, group);
             let attempt = current_attempts
                 .get(&route_key)
+                .or_else(|| desired_attempts.get(&route_key))
                 .copied()
                 .unwrap_or_else(|| state.next_route_generation(account_id));
             desired_attempts.insert(route_key.clone(), attempt);

@@ -98,6 +98,66 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
     }
 }
 
+struct RollingSubscribeRelayClient {
+    started: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    first_wave_barrier: Barrier,
+}
+
+impl Default for RollingSubscribeRelayClient {
+    fn default() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            // Seven blocked requests from the initial wave plus the first
+            // refill request. A chunk barrier can never release this gate.
+            first_wave_barrier: Barrier::new(8),
+        }
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for RollingSubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let ordinal = self.started.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        if (1..=8).contains(&ordinal) {
+            self.first_wave_barrier.wait().await;
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
 #[derive(Default)]
 struct BlockingSubscribeRelayClient {
     block_subscribes: AtomicBool,
@@ -1284,6 +1344,89 @@ async fn removed_then_readded_route_gets_a_fresh_generation() {
         .unwrap();
     assert_ne!(first_a.subscription_id(), readded_a.subscription_id());
     assert_ne!(first_a.attempt(), readded_a.attempt());
+}
+
+#[tokio::test]
+async fn duplicate_normalized_group_routes_share_one_generation() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA4; 32]);
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    relay.take_issued_subscriptions();
+
+    let group_id = cgka_traits::GroupId::new(vec![0xB5; 16]);
+    let transport_group_id = vec![0xC6; 32];
+    let first = TransportEndpoint("wss://first.example".into());
+    let second = TransportEndpoint("wss://second.example".into());
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![first.clone(), second.clone()],
+                },
+                TransportGroupSubscription {
+                    group_id,
+                    transport_group_id,
+                    endpoints: vec![second, first],
+                },
+            ],
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    let group_subscriptions = relay
+        .take_issued_subscriptions()
+        .into_iter()
+        .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(group_subscriptions.len(), 2);
+    assert_eq!(
+        group_subscriptions[0].subscription_id(),
+        group_subscriptions[1].subscription_id(),
+        "one normalized route must never mint an orphaned generation"
+    );
+}
+
+#[tokio::test]
+async fn registration_limit_refills_without_waiting_for_a_chunk_barrier() {
+    let relay = Arc::new(RollingSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA5; 32]);
+    let groups = (0_u8..9)
+        .map(|index| TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![index + 1; 16]),
+            transport_group_id: vec![index + 32; 32],
+            endpoints: vec![TransportEndpoint(format!("wss://route-{index}.example"))],
+        })
+        .collect();
+
+    tokio::time::timeout(
+        concurrent_subscribe_timeout(),
+        adapter.activate_account(TransportAccountActivation {
+            account_id,
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: groups,
+            since: None,
+        }),
+    )
+    .await
+    .expect("a completed slot must admit the next registration immediately")
+    .unwrap();
+
+    assert_eq!(relay.started.load(Ordering::SeqCst), 10);
+    assert_eq!(relay.max_active.load(Ordering::SeqCst), 8);
 }
 
 #[tokio::test]

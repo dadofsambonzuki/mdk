@@ -2125,7 +2125,9 @@ impl MarmotRelayPlaneAccountAdapter {
     /// canonically duplicated by an admitted endpoint, and registration is
     /// known to be complete. Adapter EOSE alone covers only admitted endpoints
     /// and must not silently forgive policy-excluded or compatibility-unknown
-    /// coverage.
+    /// coverage. This is intentionally stricter than route usability: the
+    /// explicit repair contract keeps excluded requested coverage visible as
+    /// incomplete until routing or policy changes.
     pub(crate) fn subscription_replay_coverage_complete(&self) -> bool {
         let snapshot = self
             .relay_plane
