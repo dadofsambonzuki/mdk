@@ -2056,7 +2056,13 @@ fn finalize_transport_snapshot(
     let completely_available = routes.iter().all(|route| {
         route.state == crate::AccountTransportRouteState::Registered
             && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
-            && route.requested_endpoint_count == route.admitted_endpoint_count
+            && route.endpoints.iter().all(|endpoint| {
+                matches!(
+                    endpoint.admission,
+                    crate::EndpointAdmissionOutcome::Allowed
+                        | crate::EndpointAdmissionOutcome::Duplicate
+                )
+            })
             && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
     });
     snapshot.state = if registered == 0 {
@@ -2097,7 +2103,13 @@ fn policy_exclusion_count<'a>(
 ) -> usize {
     routes
         .flat_map(|route| &route.endpoints)
-        .filter(|endpoint| endpoint.admission != crate::EndpointAdmissionOutcome::Allowed)
+        .filter(|endpoint| {
+            !matches!(
+                endpoint.admission,
+                crate::EndpointAdmissionOutcome::Allowed
+                    | crate::EndpointAdmissionOutcome::Duplicate
+            )
+        })
         .count()
 }
 
@@ -2109,10 +2121,11 @@ impl MarmotRelayPlaneAccountAdapter {
             .mark_replay_complete(&self.account_id);
     }
 
-    /// Replay can complete only when every requested endpoint is admitted and
-    /// its registration is known to be complete. Adapter EOSE alone covers
-    /// only admitted endpoints and must not silently forgive policy-excluded
-    /// or compatibility-unknown coverage.
+    /// Replay can complete only when every requested endpoint is admitted or
+    /// canonically duplicated by an admitted endpoint, and registration is
+    /// known to be complete. Adapter EOSE alone covers only admitted endpoints
+    /// and must not silently forgive policy-excluded or compatibility-unknown
+    /// coverage.
     pub(crate) fn subscription_replay_coverage_complete(&self) -> bool {
         let snapshot = self
             .relay_plane

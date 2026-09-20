@@ -206,6 +206,13 @@ impl AccountTransportStatusRegistry {
         let _ = self.publish(account_id, AccountTransportStatusSnapshot::inactive());
     }
 
+    pub(crate) fn remove(&self, account_id: &MemberId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id);
+    }
+
     pub(crate) fn mark_replay_complete(&self, account_id: &MemberId) {
         let mut snapshot = self.snapshot(account_id);
         if snapshot.state == AccountTransportState::Inactive {
@@ -343,5 +350,28 @@ mod tests {
         let update = subscription.recv().await.expect("latest update");
         assert_eq!(update.revision, 2);
         assert_eq!(update.state, AccountTransportState::Available);
+    }
+
+    #[tokio::test]
+    async fn registry_removal_closes_subscriptions_and_drops_saved_status() {
+        let registry = AccountTransportStatusRegistry::default();
+        let account_id = MemberId::new(vec![0xBB; 32]);
+        let (_stopping_sender, stopping) = watch::channel(false);
+        let mut subscription =
+            RuntimeAccountTransportStatusSubscription::new(&registry, &account_id, stopping);
+        let mut available = AccountTransportStatusSnapshot::inactive();
+        available.state = AccountTransportState::Available;
+        assert!(registry.publish(&account_id, available));
+        assert_eq!(
+            subscription.recv().await.unwrap().state,
+            AccountTransportState::Available
+        );
+
+        registry.remove(&account_id);
+
+        assert!(subscription.recv().await.is_none());
+        let recreated = registry.snapshot(&account_id);
+        assert_eq!(recreated.state, AccountTransportState::Inactive);
+        assert_eq!(recreated.revision, 0);
     }
 }

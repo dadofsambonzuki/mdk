@@ -447,6 +447,7 @@ struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
+    exact_registration: bool,
 }
 
 struct TestNotificationSource {
@@ -659,6 +660,33 @@ impl NostrRelayClient for RecordingRelayClient {
     ) -> Result<(), TransportAdapterError> {
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
+    }
+
+    async fn subscribe_detailed(
+        &self,
+        request: transport_nostr_adapter::NostrSubscriptionRegistrationRequest,
+    ) -> Result<transport_nostr_adapter::NostrSubscriptionRegistration, TransportAdapterError> {
+        let endpoints = request.registration_endpoints.clone();
+        self.subscribe(request.subscription).await?;
+        if self.exact_registration {
+            Ok(transport_nostr_adapter::NostrSubscriptionRegistration {
+                detail: transport_nostr_adapter::SubscriptionRegistrationDetail::Exact,
+                endpoints: endpoints
+                    .into_iter()
+                    .map(
+                        |endpoint| transport_nostr_adapter::SubscriptionEndpointRegistration {
+                            endpoint,
+                            registered: true,
+                        },
+                    )
+                    .collect(),
+            })
+        } else {
+            Ok(transport_nostr_adapter::NostrSubscriptionRegistration {
+                detail: transport_nostr_adapter::SubscriptionRegistrationDetail::Unknown,
+                endpoints: Vec::new(),
+            })
+        }
     }
 
     async fn unsubscribe(
@@ -959,7 +987,10 @@ fn notification_trigger_endpoints_use_the_relay_safety_policy() {
 
 #[tokio::test]
 async fn relay_plane_deduplicates_canonical_relay_endpoints() {
-    let relay = Arc::new(RecordingRelayClient::default());
+    let relay = Arc::new(RecordingRelayClient {
+        exact_registration: true,
+        ..RecordingRelayClient::default()
+    });
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let alice = MemberId::new(vec![0xA1; 32]);
     let group_id = GroupId::new(vec![0xC3; 32]);
@@ -967,7 +998,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
 
     alice_adapter
         .activate_account(TransportAccountActivation {
-            account_id: alice,
+            account_id: alice.clone(),
             inbox_endpoints: vec![
                 TransportEndpoint(" wss://relay.example ".into()),
                 TransportEndpoint("wss://relay.example".into()),
@@ -991,6 +1022,39 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
         | NostrSubscription::Group { endpoints, .. }
         | NostrSubscription::GroupMaintenance { endpoints, .. } => endpoints.len() == 1,
     }));
+
+    let status = relay_plane.account_transport_status(&alice);
+    assert_eq!(status.state, crate::AccountTransportState::Available);
+    assert!(alice_adapter.subscription_replay_coverage_complete());
+    for route in status
+        .inbox
+        .iter()
+        .chain(status.current_group_routes.iter())
+    {
+        assert_eq!(route.requested_endpoint_count, 2);
+        assert_eq!(route.admitted_endpoint_count, 1);
+        assert_eq!(route.registered_endpoint_count, Some(1));
+        assert_eq!(
+            route
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.admission)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::EndpointAdmissionOutcome::Allowed,
+                crate::EndpointAdmissionOutcome::Duplicate,
+            ]
+        );
+    }
+    assert_eq!(
+        relay_plane
+            .relay_telemetry()
+            .await
+            .metrics
+            .subscription_policy_exclusions,
+        0,
+        "canonical duplicates are covered by their admitted endpoint"
+    );
 }
 
 #[tokio::test]

@@ -5787,6 +5787,7 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         self.set_account_tearing_down(&account.account_id_hex, true);
         let result = async {
             self.shared
@@ -5812,6 +5813,10 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
+            self.shared
+                .relay_plane
+                .account_transport_status_registry()
+                .remove(&account_id);
             self.onboarding_updates
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
