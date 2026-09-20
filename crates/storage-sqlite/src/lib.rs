@@ -109,9 +109,9 @@ pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use storage::messages::StorageFormatBenchSizes;
 pub use subscription_replay::{
-    SubscriptionReplayClearResult, SubscriptionReplayGeneration, SubscriptionReplayGroupRole,
-    SubscriptionReplayObligation, SubscriptionReplayPreparation, SubscriptionReplayReplacement,
-    SubscriptionReplayRoute,
+    SubscriptionReplayClearResult, SubscriptionReplayCompletionFence, SubscriptionReplayGeneration,
+    SubscriptionReplayGroupRole, SubscriptionReplayObligation, SubscriptionReplayPreparation,
+    SubscriptionReplayReplacement, SubscriptionReplayRoute,
 };
 pub use timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,

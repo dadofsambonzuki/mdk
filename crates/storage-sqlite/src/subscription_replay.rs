@@ -96,6 +96,14 @@ pub struct SubscriptionReplayObligation {
     pub generation: SubscriptionReplayGeneration,
 }
 
+/// Frozen replay-completion fence. Both the route incarnation and the replay
+/// floor must still match before an EOSE observation may clear the obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubscriptionReplayCompletionFence {
+    pub generation: SubscriptionReplayGeneration,
+    pub replay_floor: Option<Timestamp>,
+}
+
 /// One route to prepare before issuing its subscription. Preparing an
 /// unchanged route preserves its generation and widens its floor only.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +128,8 @@ pub enum SubscriptionReplayClearResult {
     Cleared {
         count: usize,
     },
-    /// At least one frozen generation was removed or replaced. Nothing cleared.
+    /// At least one frozen generation was removed/replaced or its floor was
+    /// widened after the snapshot. Nothing cleared.
     StaleGeneration,
     /// Delivery overflow remains durable. Nothing cleared.
     DeliveryOverflowPending,
@@ -250,8 +259,8 @@ impl SqliteAccountStorage {
             .collect()
     }
 
-    /// Clear a frozen completion set only if every generation is still current
-    /// and no account delivery-overflow marker is present.
+    /// Clear a frozen completion set only if every generation and replay floor
+    /// is still current and no account delivery-overflow marker is present.
     ///
     /// Call this in the same outer [`cgka_traits::storage::StorageProvider::with_transaction`]
     /// operation as the account projection checkpoint that precedes completion.
@@ -259,9 +268,13 @@ impl SqliteAccountStorage {
     pub fn clear_subscription_replay_obligations(
         &self,
         account_label: &str,
-        generations: &[SubscriptionReplayGeneration],
+        fences: &[SubscriptionReplayCompletionFence],
     ) -> StorageResult<SubscriptionReplayClearResult> {
-        validate_unique_generations(generations, "clear")?;
+        let generations = fences
+            .iter()
+            .map(|fence| fence.generation)
+            .collect::<Vec<_>>();
+        validate_unique_generations(&generations, "clear")?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let overflow_pending = conn
@@ -276,30 +289,33 @@ impl SqliteAccountStorage {
             if overflow_pending {
                 return Ok(SubscriptionReplayClearResult::DeliveryOverflowPending);
             }
-            for generation in generations {
-                let exists = conn
+            for fence in fences {
+                let current_floor = conn
                     .query_row_cached(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM subscription_replay_obligations
-                            WHERE generation = ?1
-                         )",
-                        params![generation.as_bytes().as_slice()],
-                        |row| row.get::<_, bool>(0),
+                        "SELECT replay_floor FROM subscription_replay_obligations
+                         WHERE generation = ?1",
+                        params![fence.generation.as_bytes().as_slice()],
+                        |row| row.get::<_, Option<i64>>(0),
                     )
+                    .optional()
                     .storage()?;
-                if !exists {
+                let Some(current_floor) = current_floor else {
+                    return Ok(SubscriptionReplayClearResult::StaleGeneration);
+                };
+                let current_floor = current_floor.map(i64_to_u64).transpose()?.map(Timestamp);
+                if current_floor != fence.replay_floor {
                     return Ok(SubscriptionReplayClearResult::StaleGeneration);
                 }
             }
-            for generation in generations {
+            for fence in fences {
                 conn.execute_cached(
                     "DELETE FROM subscription_replay_obligations WHERE generation = ?1",
-                    params![generation.as_bytes().as_slice()],
+                    params![fence.generation.as_bytes().as_slice()],
                 )
                 .storage()?;
             }
             Ok(SubscriptionReplayClearResult::Cleared {
-                count: generations.len(),
+                count: fences.len(),
             })
         })
     }

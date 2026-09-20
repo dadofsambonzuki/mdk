@@ -38,6 +38,7 @@ c_mirror! {
     /// One requested endpoint's local admission and registration result.
     MarmotAccountTransportEndpointStatus from AccountTransportEndpointStatusFfi {
         str requested_endpoint,
+        /// Canonical form, NULL when the requested endpoint is invalid.
         opt_str normalized_endpoint,
         copy admission: MarmotEndpointAdmissionOutcome,
         copy registration: MarmotEndpointRegistrationOutcome,
@@ -48,7 +49,9 @@ c_mirror! {
     /// One desired inbox or group route. Owned by its enclosing snapshot.
     MarmotAccountTransportRouteStatus from AccountTransportRouteStatusFfi {
         str route_ref,
+        /// Caller-owned MLS group id, NULL for the account inbox route.
         opt_str group_id_hex,
+        /// Nostr routing handle, NULL for the account inbox route.
         opt_str transport_group_id_hex,
         copy role: MarmotAccountTransportRouteRole,
         copy state: MarmotAccountTransportRouteState,
@@ -69,6 +72,7 @@ c_mirror! {
     free marmot_account_transport_status_snapshot_free {
         copy revision: u64,
         copy state: MarmotAccountTransportState,
+        /// Inbox route status, NULL only while the account is inactive.
         opt_rec inbox: MarmotAccountTransportRouteStatus,
         vec current_group_routes/current_group_routes_len: MarmotAccountTransportRouteStatus,
         vec historical_group_routes/historical_group_routes_len: MarmotAccountTransportRouteStatus,

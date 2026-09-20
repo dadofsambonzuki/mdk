@@ -299,6 +299,7 @@ impl NostrRelayClient for StoredReplayRelayClient {
 /// subscription it sees, then fails the group REQ while armed.
 #[derive(Default)]
 struct PartialFailureRelayClient {
+    fail_inbox_subscribes: AtomicBool,
     fail_group_subscribes: AtomicBool,
     subscriptions: Mutex<Vec<NostrSubscription>>,
 }
@@ -319,6 +320,13 @@ impl NostrRelayClient for PartialFailureRelayClient {
             .lock()
             .unwrap()
             .push(subscription.clone());
+        if self.fail_inbox_subscribes.load(Ordering::SeqCst)
+            && matches!(subscription, NostrSubscription::AccountInbox { .. })
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected inbox subscribe failure".into(),
+            ));
+        }
         if self.fail_group_subscribes.load(Ordering::SeqCst)
             && matches!(
                 subscription,
@@ -354,6 +362,51 @@ impl NostrRelayClient for PartialFailureRelayClient {
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
         Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
     }
+}
+
+#[tokio::test]
+async fn inbox_registration_failure_preserves_a_healthy_group_route() {
+    let relay = Arc::new(PartialFailureRelayClient::default());
+    relay.fail_inbox_subscribes.store(true, Ordering::SeqCst);
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0x91; 32]);
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0x92; 16]),
+                transport_group_id: vec![0x93; 32],
+                endpoints: vec![TransportEndpoint("wss://group.example".into())],
+            }],
+            since: None,
+        })
+        .await
+        .expect("a healthy group route keeps the account usable");
+
+    let registrations = adapter.account_registration_snapshot(&account_id).await;
+    let inbox = registrations
+        .iter()
+        .find(|registration| {
+            matches!(
+                registration.subscription,
+                NostrSubscription::AccountInbox { .. }
+            )
+        })
+        .expect("failed inbox registration remains visible for retry");
+    assert!(!inbox.registered);
+    assert!(
+        inbox.endpoints.iter().all(|endpoint| {
+            endpoint.state == SubscriptionEndpointRegistrationState::RetryPending
+        })
+    );
+    let group = registrations
+        .iter()
+        .find(|registration| matches!(registration.subscription, NostrSubscription::Group { .. }))
+        .expect("healthy group registration remains active");
+    assert!(group.registered);
+    assert_eq!(group.detail, SubscriptionRegistrationDetail::Unknown);
 }
 
 #[derive(Default)]
@@ -1266,6 +1319,21 @@ async fn account_scoped_reconciliation_does_not_consume_another_accounts_work() 
             .await
             .expect("one endpoint keeps each account usable");
     }
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_a.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0xB6; 16]),
+                transport_group_id: vec![0xB7; 32],
+                endpoints: vec![
+                    TransportEndpoint("wss://one.example".into()),
+                    TransportEndpoint("wss://two.example".into()),
+                ],
+            }],
+            since: None,
+        })
+        .await
+        .expect("syncing one account preserves another account's registration state");
     relay.requests.lock().unwrap().clear();
     relay.fail_second.store(false, Ordering::SeqCst);
 

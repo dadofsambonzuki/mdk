@@ -9,9 +9,10 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, TransportEndpoint};
 use storage_sqlite::{
-    SubscriptionReplayGeneration, SubscriptionReplayGroupRole, SubscriptionReplayObligation,
-    SubscriptionReplayPreparation, SubscriptionReplayReplacement, SubscriptionReplayRoute,
-    TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
+    SubscriptionReplayCompletionFence, SubscriptionReplayGeneration, SubscriptionReplayGroupRole,
+    SubscriptionReplayObligation, SubscriptionReplayPreparation, SubscriptionReplayReplacement,
+    SubscriptionReplayRoute, TransportReconciliationItem, TransportReconciliationRoute,
+    clamp_to_max_future_skew,
 };
 use tokio::time::timeout;
 use transport_nostr_adapter::{
@@ -714,7 +715,10 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .subscription_replay_obligations()?
             .into_iter()
-            .map(|obligation| obligation.generation)
+            .map(|obligation| SubscriptionReplayCompletionFence {
+                generation: obligation.generation,
+                replay_floor: obligation.replay_floor,
+            })
             .collect();
         Ok(())
     }
@@ -724,12 +728,12 @@ impl AppClient {
     /// checkpoint and this compare-and-clear merely causes duplicate replay.
     fn clear_completed_subscription_replay_obligations(&mut self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
-        let generations = self.subscription_replay_snapshot.clone();
-        if generations.is_empty() {
+        let fences = self.subscription_replay_snapshot.clone();
+        if fences.is_empty() {
             return Ok(false);
         }
         let cleared = matches!(
-            storage.clear_subscription_replay_obligations(&self.state.label, &generations)?,
+            storage.clear_subscription_replay_obligations(&self.state.label, &fences)?,
             storage_sqlite::SubscriptionReplayClearResult::Cleared { .. }
         );
         self.subscription_replay_snapshot.clear();

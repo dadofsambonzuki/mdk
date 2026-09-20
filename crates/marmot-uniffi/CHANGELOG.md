@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Expose account-scoped transport coverage snapshots and a bounded coalescing
+  subscription, including typed inbox/current/historical route state, endpoint
+  admission and registration outcomes, and pending replay/retry state.
+
 ## 0.10.4 - 2026-09-20
 
 ### Fixed

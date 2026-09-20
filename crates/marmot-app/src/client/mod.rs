@@ -418,10 +418,10 @@ pub struct AppClient {
     /// Coalesces a burst of host connectivity-restored notifications into one
     /// early transport-registration reconciliation per backoff interval.
     pub(crate) transport_subscription_connectivity_wake_used: bool,
-    /// Storage generations frozen by the most recent full account activation.
-    /// Group-only replacement cannot expand this set, so stale EOSE from the
-    /// older activation cannot clear a newly prepared route obligation.
-    pub(crate) subscription_replay_snapshot: Vec<storage_sqlite::SubscriptionReplayGeneration>,
+    /// Storage generation/floor fences frozen by the most recent full account
+    /// activation. Group-only replacement or a widened replay range cannot be
+    /// cleared by stale EOSE from the older activation.
+    pub(crate) subscription_replay_snapshot: Vec<storage_sqlite::SubscriptionReplayCompletionFence>,
     /// Last transport cursor promoted by a completed drain checkpoint. Live
     /// one-at-a-time worker ingests may advance `state` for diagnostics, but
     /// they persist this older safe floor until a drain has observed any

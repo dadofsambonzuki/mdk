@@ -40,6 +40,15 @@ fn prepare(
     }
 }
 
+fn completion_fence(
+    obligation: &SubscriptionReplayObligation,
+) -> SubscriptionReplayCompletionFence {
+    SubscriptionReplayCompletionFence {
+        generation: obligation.generation,
+        replay_floor: obligation.replay_floor,
+    }
+}
+
 #[test]
 fn prepare_is_idempotent_widens_earliest_floor_and_unfloored_dominates() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -214,7 +223,7 @@ fn clear_is_generation_conditional_and_fenced_by_delivery_overflow() {
     store.mark_account_delivery_recovery("alice", 7, 1).unwrap();
     assert_eq!(
         store
-            .clear_subscription_replay_obligations("alice", &[obligation.generation])
+            .clear_subscription_replay_obligations("alice", &[completion_fence(&obligation)])
             .unwrap(),
         SubscriptionReplayClearResult::DeliveryOverflowPending
     );
@@ -226,8 +235,11 @@ fn clear_is_generation_conditional_and_fenced_by_delivery_overflow() {
             .clear_subscription_replay_obligations(
                 "alice",
                 &[
-                    obligation.generation,
-                    SubscriptionReplayGeneration::from_bytes([0xaa; 16]),
+                    completion_fence(&obligation),
+                    SubscriptionReplayCompletionFence {
+                        generation: SubscriptionReplayGeneration::from_bytes([0xaa; 16]),
+                        replay_floor: Some(Timestamp(10)),
+                    },
                 ],
             )
             .unwrap(),
@@ -236,11 +248,36 @@ fn clear_is_generation_conditional_and_fenced_by_delivery_overflow() {
     assert_eq!(store.subscription_replay_obligations().unwrap().len(), 1);
     assert_eq!(
         store
-            .clear_subscription_replay_obligations("alice", &[obligation.generation])
+            .clear_subscription_replay_obligations("alice", &[completion_fence(&obligation)])
             .unwrap(),
         SubscriptionReplayClearResult::Cleared { count: 1 }
     );
     assert!(store.subscription_replay_obligations().unwrap().is_empty());
+}
+
+#[test]
+fn widened_floor_invalidates_a_frozen_completion_fence() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.ensure_account_projection("alice").unwrap();
+    let route = inbox(&["wss://relay.example"]);
+    let frozen = store
+        .prepare_subscription_replay_obligations(&[prepare(route.clone(), Some(100))])
+        .unwrap()
+        .remove(0);
+    let widened = store
+        .prepare_subscription_replay_obligations(&[prepare(route, Some(50))])
+        .unwrap()
+        .remove(0);
+    assert_eq!(widened.generation, frozen.generation);
+    assert_eq!(widened.replay_floor, Some(Timestamp(50)));
+
+    assert_eq!(
+        store
+            .clear_subscription_replay_obligations("alice", &[completion_fence(&frozen)])
+            .unwrap(),
+        SubscriptionReplayClearResult::StaleGeneration
+    );
+    assert_eq!(store.subscription_replay_obligations().unwrap(), [widened]);
 }
 
 #[test]
@@ -269,7 +306,8 @@ fn replay_clear_and_projection_checkpoint_share_one_crash_boundary() {
     let rolled_back: StorageResult<()> = store.with_transaction(|store| {
         store.save_account_projection_state(&advanced, 32, 120)?;
         assert_eq!(
-            store.clear_subscription_replay_obligations("alice", &[obligation.generation])?,
+            store
+                .clear_subscription_replay_obligations("alice", &[completion_fence(&obligation)],)?,
             SubscriptionReplayClearResult::Cleared { count: 1 }
         );
         Err(StorageError::Backend("injected crash boundary".to_owned()))
@@ -288,7 +326,10 @@ fn replay_clear_and_projection_checkpoint_share_one_crash_boundary() {
         .with_transaction::<_, StorageError, _>(|store| {
             store.save_account_projection_state(&advanced, 32, 120)?;
             assert_eq!(
-                store.clear_subscription_replay_obligations("alice", &[obligation.generation],)?,
+                store.clear_subscription_replay_obligations(
+                    "alice",
+                    &[completion_fence(&obligation)],
+                )?,
                 SubscriptionReplayClearResult::Cleared { count: 1 }
             );
             Ok(())

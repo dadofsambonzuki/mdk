@@ -1441,6 +1441,9 @@ typedef struct MarmotAttachmentPageRead {
  */
 typedef struct MarmotAccountTransportEndpointStatus {
   char *requested_endpoint;
+  /**
+   * Canonical form, NULL when the requested endpoint is invalid.
+   */
   char *normalized_endpoint;
   enum MarmotEndpointAdmissionOutcome admission;
   enum MarmotEndpointRegistrationOutcome registration;
@@ -1451,7 +1454,13 @@ typedef struct MarmotAccountTransportEndpointStatus {
  */
 typedef struct MarmotAccountTransportRouteStatus {
   char *route_ref;
+  /**
+   * Caller-owned MLS group id, NULL for the account inbox route.
+   */
   char *group_id_hex;
+  /**
+   * Nostr routing handle, NULL for the account inbox route.
+   */
   char *transport_group_id_hex;
   enum MarmotAccountTransportRouteRole role;
   enum MarmotAccountTransportRouteState state;
@@ -1480,6 +1489,9 @@ typedef struct MarmotAccountTransportRouteStatus {
 typedef struct MarmotAccountTransportStatusSnapshot {
   uint64_t revision;
   enum MarmotAccountTransportState state;
+  /**
+   * Inbox route status, NULL only while the account is inactive.
+   */
   struct MarmotAccountTransportRouteStatus *inbox;
   struct MarmotAccountTransportRouteStatus *current_group_routes;
   uintptr_t current_group_routes_len;

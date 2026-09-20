@@ -1523,7 +1523,7 @@ impl TransportAdapter for NostrTransportAdapter {
                 .account_subscription_ids(&account_id)
                 .into_iter()
                 .collect();
-            state.retain_live_registration_ids(&live_ids);
+            state.retain_live_registration_ids(&account_id, &live_ids);
         };
         staging_committed.store(true, Ordering::Release);
 
@@ -2083,9 +2083,6 @@ impl AdapterState {
                     state.detail = registration.detail;
                     state.pending_endpoints =
                         registration.failed_endpoints_for(&request.registration_endpoints);
-                    if state.pending_endpoints.is_empty() {
-                        state.pending_endpoints = request.registration_endpoints.clone();
-                    }
                     state.retry_pending = true;
                     self.metrics.subscription_registration_total_failures += 1;
                 }
@@ -2103,10 +2100,13 @@ impl AdapterState {
         registered
     }
 
-    fn retain_live_registration_ids(&mut self, live_ids: &HashSet<String>) {
-        self.registrations.retain(|id, _| live_ids.contains(id));
+    fn retain_live_registration_ids(&mut self, account_id: &MemberId, live_ids: &HashSet<String>) {
+        self.registrations.retain(|id, registration| {
+            registration.request.subscription.account_id() != account_id || live_ids.contains(id)
+        });
+        let registered_ids = self.registrations.keys().cloned().collect::<HashSet<_>>();
         self.pending_registrations
-            .retain(|id| live_ids.contains(id));
+            .retain(|id| registered_ids.contains(id));
     }
 
     /// Queue relay unsubscribes whose relay-side teardown has not been

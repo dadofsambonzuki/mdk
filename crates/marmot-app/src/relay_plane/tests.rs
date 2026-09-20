@@ -448,6 +448,9 @@ struct RecordingRelayClient {
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
     exact_registration: bool,
+    block_next_registration: AtomicBool,
+    registration_started: Notify,
+    registration_release: Notify,
 }
 
 struct TestNotificationSource {
@@ -666,6 +669,10 @@ impl NostrRelayClient for RecordingRelayClient {
         &self,
         request: transport_nostr_adapter::NostrSubscriptionRegistrationRequest,
     ) -> Result<transport_nostr_adapter::NostrSubscriptionRegistration, TransportAdapterError> {
+        if self.block_next_registration.swap(false, Ordering::SeqCst) {
+            self.registration_started.notify_waiters();
+            self.registration_release.notified().await;
+        }
         let endpoints = request.registration_endpoints.clone();
         self.subscribe(request.subscription).await?;
         if self.exact_registration {
@@ -720,6 +727,67 @@ impl NostrRelayClient for RecordingRelayClient {
             failed: Vec::<TransportEndpointFailure>::new(),
         })
     }
+}
+
+#[tokio::test]
+async fn group_sync_publishes_only_the_finalized_registration_snapshot() {
+    let relay = Arc::new(RecordingRelayClient {
+        exact_registration: true,
+        ..RecordingRelayClient::default()
+    });
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD7; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint::from("wss://inbox.example")],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane.account_transport_status(&account_id).state,
+        crate::AccountTransportState::Available
+    );
+
+    relay.block_next_registration.store(true, Ordering::SeqCst);
+    let registration_started = relay.registration_started.notified();
+    let sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let account_id = account_id.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id,
+                    group_subscriptions: vec![TransportGroupSubscription {
+                        group_id: GroupId::new(vec![0x37; 16]),
+                        transport_group_id: vec![0x47; 32],
+                        endpoints: vec![TransportEndpoint::from("wss://group.example")],
+                    }],
+                    since: None,
+                })
+                .await
+        }
+    });
+    registration_started.await;
+
+    assert_eq!(
+        relay_plane.account_transport_status(&account_id).state,
+        crate::AccountTransportState::Available,
+        "an in-flight group sync must not publish a transient unavailable snapshot"
+    );
+    relay.registration_release.notify_waiters();
+    sync.await.unwrap().unwrap();
+
+    let status = relay_plane.account_transport_status(&account_id);
+    assert_eq!(status.state, crate::AccountTransportState::Available);
+    assert_eq!(status.current_group_routes.len(), 1);
+    assert_eq!(
+        status.current_group_routes[0].state,
+        crate::AccountTransportRouteState::Registered
+    );
 }
 
 #[tokio::test]
@@ -835,6 +903,54 @@ async fn status_matches_reused_group_registration_after_endpoint_reordering() {
         status.current_group_routes[0].state,
         crate::AccountTransportRouteState::Registered,
         "status matching must use the same order-insensitive route identity as adapter reuse"
+    );
+}
+
+#[tokio::test]
+async fn equivalent_normalized_group_routes_have_one_status_row() {
+    let relay = Arc::new(RecordingRelayClient {
+        exact_registration: true,
+        ..RecordingRelayClient::default()
+    });
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD6; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay);
+    let group_id = GroupId::new(vec![0x32; 7]);
+    let transport_group_id = vec![0x42; 32];
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint::from("wss://inbox.example")],
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![
+                        TransportEndpoint::from("wss://first.example"),
+                        TransportEndpoint::from("wss://second.example"),
+                    ],
+                },
+                TransportGroupSubscription {
+                    group_id,
+                    transport_group_id,
+                    endpoints: vec![
+                        TransportEndpoint::from("wss://second.example"),
+                        TransportEndpoint::from("wss://first.example"),
+                    ],
+                },
+            ],
+            since: None,
+        })
+        .await
+        .unwrap();
+
+    let status = relay_plane.account_transport_status(&account_id);
+    assert_eq!(status.current_group_routes.len(), 1);
+    assert!(status.historical_group_routes.is_empty());
+    assert_eq!(
+        status.current_group_routes[0].state,
+        crate::AccountTransportRouteState::Registered
     );
 }
 
