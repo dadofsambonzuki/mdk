@@ -397,6 +397,11 @@ and validates a temporary output before replacing the original archive.
 Those builder-owned settings are not a user-facing escape hatch; measurement
 scripts may override LTO and codegen units on direct Cargo commands for a
 controlled baseline comparison.
+These are configured profile values, not proof that Cargo applies LTO to every
+output: the mixed `rlib`/`cdylib`/`staticlib` binding target can suppress LTO.
+The measured reduction belongs to the combined profile, not to thin LTO alone.
+Changing crate types to enable effective LTO also requires revisiting the
+incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
 
 ```sh
 # Inexpensive regressions, including provenance JSON and archive bitcode checks:

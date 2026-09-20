@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real Apple archive reconstruction and link regression, not synthetic Mach-O."""
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +16,15 @@ spec.loader.exec_module(archive)
 
 @unittest.skipUnless(sys.platform == "darwin", "requires Apple toolchain")
 class NativeArchiveTests(unittest.TestCase):
+    def setUp(self):
+        # Host executables must not inherit an iOS workflow deployment target.
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("IPHONEOS_DEPLOYMENT_TARGET", "TVOS_DEPLOYMENT_TARGET",
+                     "WATCHOS_DEPLOYMENT_TARGET", "XROS_DEPLOYMENT_TARGET", "SDKROOT"):
+            os.environ.pop(name, None)
+
     def test_sanitized_embedded_bitcode_object_still_links(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -25,6 +35,11 @@ class NativeArchiveTests(unittest.TestCase):
             self.assertTrue(archive.member_has_bitcode(obj.read_bytes()))
             library = root / "native.a"
             subprocess.run(["xcrun", "libtool", "-static", "-o", str(library), str(obj)], check=True)
+            original = library.read_bytes()
+            with patch.object(archive, "check_archive", side_effect=archive.ArchiveError("injected validation failure")):
+                with self.assertRaises(archive.ArchiveError):
+                    archive.sanitize_archive(library)
+            self.assertEqual(library.read_bytes(), original)
             archive.sanitize_archive(library)
             archive.check_archive(library)
             main = root / "main.c"
@@ -49,6 +64,9 @@ class NativeArchiveTests(unittest.TestCase):
             subprocess.run(["xcrun", "libtool", "-static", "-o", str(library), *map(str, objects)], check=True)
             members = [(name, data) for _, name, data in archive.iter_ar_members(library.read_bytes())]
             original_bytes = library.read_bytes()
+            with patch.object(archive, "write_archive", side_effect=AssertionError("native archive must not be rebuilt")):
+                archive.sanitize_archive(library)
+            self.assertEqual(library.read_bytes(), original_bytes)
             with patch.object(archive, "check_archive", side_effect=archive.ArchiveError("injected native validation failure")):
                 with self.assertRaises(archive.ArchiveError):
                     archive.sanitize_archive(library)

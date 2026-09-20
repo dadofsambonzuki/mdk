@@ -23,6 +23,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from functools import cache
 from pathlib import Path
 
 
@@ -46,20 +47,11 @@ LITTLE_ENDIAN_ON_LE_DECODE = {
 }
 LC_SEGMENT = 0x01
 LC_SEGMENT_64 = 0x19
-EMBED_BITCODE_RUSTFLAG = "-C embed-bitcode=no"
-
-
-def _cname(raw: bytes) -> bytes:
-    return raw.split(b"\0", 1)[0]
 
 
 def _section_is_llvm_bitcode(sectname: bytes, section_segname: bytes) -> bool:
     """True for leftover Apple bitcode, including MH_OBJECT section fields."""
     return sectname == b"__bitcode" or section_segname == b"__LLVM"
-
-
-def _range_overlap(start: int, end: int, other_start: int, other_end: int) -> int:
-    return max(0, min(end, other_end) - max(start, other_start))
 
 
 class ArchiveError(ValueError):
@@ -202,37 +194,28 @@ def check_archive(path: Path, otool_output: str | None = None) -> int:
     return len(members)
 
 
-def apple_target_rustflags_key(triple: str) -> str:
-    return f"CARGO_TARGET_{triple.upper().replace('-', '_')}_RUSTFLAGS"
-
-
-def apply_apple_native_archive_rustflags(env: dict[str, str], triple: str) -> dict[str, str]:
-    """Keep Apple rustc from embedding bitcode; do not replace other target flags."""
-    updated = dict(env)
-    key = apple_target_rustflags_key(triple)
-    current = updated.get(key, "")
-    if "embed-bitcode=no" not in current:
-        updated[key] = f"{current} {EMBED_BITCODE_RUSTFLAG}".strip()
-    return updated
-
-
-def strip_macho_bitcode(content: bytes) -> bytes:
-    """Delegate section, symbol and relocation rewriting to Rust's LLVM tools."""
-    if not member_has_bitcode(content):
-        return content
+@cache
+def llvm_objcopy() -> Path:
     sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
     version = subprocess.check_output(["rustc", "-vV"], text=True)
     host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
     objcopy = Path(sysroot) / "lib" / "rustlib" / host / "bin" / "llvm-objcopy"
     if not objcopy.is_file():
         raise ArchiveError("install llvm-tools-preview for the active Rust toolchain")
+    return objcopy
+
+
+def strip_macho_bitcode(content: bytes) -> bytes:
+    """Delegate section, symbol and relocation rewriting to Rust's LLVM tools."""
+    if not member_has_bitcode(content):
+        return content
     with tempfile.TemporaryDirectory(prefix="native-object-") as directory:
         source = Path(directory) / "input.o"
         output = Path(directory) / "output.o"
         source.write_bytes(content)
         try:
             subprocess.run([
-                str(objcopy), "--regex", "--remove-section=^__LLVM,.*$",
+                str(llvm_objcopy()), "--regex", "--remove-section=^__LLVM,.*$",
                 "--remove-section=^.*,__bitcode$", str(source), str(output)
             ], check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as error:
@@ -285,6 +268,10 @@ def sanitize_archive(path: Path) -> int:
     members = [(name, content) for _, name, content in iter_ar_members(path.read_bytes())]
     if not members:
         raise ArchiveError(f"{path} contains no archive members")
+    if not any(member_has_bitcode(content) for _, content in members):
+        # Do not rewrite a native archive or require Apple reconstruction tools
+        # for portable profile-propagation fixtures. Still validate it.
+        return check_archive(path)
     sanitized = [(name, sanitize_member(name, content)) for name, content in members]
     # Validate a sibling output first: failed native validation must leave the
     # caller's original archive intact for diagnosis or retry.
