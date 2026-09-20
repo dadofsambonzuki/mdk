@@ -1347,7 +1347,7 @@ async fn removed_then_readded_route_gets_a_fresh_generation() {
 }
 
 #[tokio::test]
-async fn duplicate_normalized_group_routes_share_one_generation() {
+async fn duplicate_normalized_group_routes_register_and_deliver_once() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
     let account_id = MemberId::new(vec![0xA4; 32]);
@@ -1368,7 +1368,7 @@ async fn duplicate_normalized_group_routes_share_one_generation() {
     let second = TransportEndpoint("wss://second.example".into());
     adapter
         .sync_account_groups(TransportGroupSync {
-            account_id,
+            account_id: account_id.clone(),
             group_subscriptions: vec![
                 TransportGroupSubscription {
                     group_id: group_id.clone(),
@@ -1391,11 +1391,25 @@ async fn duplicate_normalized_group_routes_share_one_generation() {
         .into_iter()
         .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
         .collect::<Vec<_>>();
-    assert_eq!(group_subscriptions.len(), 2);
-    assert_eq!(
-        group_subscriptions[0].subscription_id(),
-        group_subscriptions[1].subscription_id(),
-        "one normalized route must never mint an orphaned generation"
+    assert_eq!(group_subscriptions.len(), 1);
+
+    let subscription_id = group_subscriptions[0].subscription_id();
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://first.example".into()),
+            subscription_id: Some(subscription_id),
+            event: group_event("normalized-duplicate", &[0xC6; 32]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(delivered, 1);
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, account_id);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), adapter.receive())
+            .await
+            .is_err(),
+        "equivalent normalized routes must not duplicate inbound delivery"
     );
 }
 

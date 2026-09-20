@@ -1261,12 +1261,14 @@ impl NostrTransportAdapter {
 impl TransportAdapter for NostrTransportAdapter {
     async fn activate_account(
         &self,
-        activation: TransportAccountActivation,
+        mut activation: TransportAccountActivation,
     ) -> Result<(), TransportAdapterError> {
         // Serialize with sync/deactivate so this account's re-subscribe cannot
         // interleave a concurrent sync's unsubscribe drain (see the field doc).
         let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         let account_id = activation.account_id.clone();
+        activation.group_subscriptions =
+            deduplicate_group_subscriptions(&account_id, activation.group_subscriptions);
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "activate_account",
@@ -1396,13 +1398,15 @@ impl TransportAdapter for NostrTransportAdapter {
 
     async fn sync_account_groups(
         &self,
-        sync: TransportGroupSync,
+        mut sync: TransportGroupSync,
     ) -> Result<(), TransportAdapterError> {
         // Serialize against other subscription-lifecycle operations so the
         // drain's live-route filter and its relay unsubscribes cannot race a
         // concurrent re-add of the same deterministic subscription id.
         let subscription_guard = self.subscription_lock.clone().lock_owned().await;
         let account_id = sync.account_id.clone();
+        sync.group_subscriptions =
+            deduplicate_group_subscriptions(&account_id, sync.group_subscriptions);
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
@@ -2585,6 +2589,21 @@ fn normalized_endpoints(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoin
     endpoints.sort();
     endpoints.dedup();
     endpoints
+}
+
+/// Preserve the first occurrence of each normalized route. Public adapter
+/// callers are not required to pre-normalize endpoint order, and retaining two
+/// equivalent entries would issue the same REQ twice and duplicate delivery
+/// routes in the account index.
+fn deduplicate_group_subscriptions(
+    account_id: &MemberId,
+    groups: Vec<TransportGroupSubscription>,
+) -> Vec<TransportGroupSubscription> {
+    let mut seen = HashSet::new();
+    groups
+        .into_iter()
+        .filter(|group| seen.insert(group_route_key(account_id, group)))
+        .collect()
 }
 
 fn endpoint_set_digest(endpoints: &[TransportEndpoint]) -> String {
