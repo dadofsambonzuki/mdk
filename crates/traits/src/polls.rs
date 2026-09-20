@@ -95,11 +95,12 @@ pub enum PollError {
 
 pub fn poll_tags(
     created_at: u64,
+    question: &str,
     labels: &[String],
     poll_type: PollType,
     ends_at: Option<u64>,
 ) -> Result<Vec<Vec<String>>, PollError> {
-    validate_question_and_labels("placeholder", labels)?;
+    validate_question_and_labels(question, labels)?;
     validate_deadline(created_at, ends_at)?;
     let mut tags = labels
         .iter()
@@ -206,14 +207,26 @@ pub fn validate_poll_response(
     {
         return Err(PollError::InvalidDeadline);
     }
-    validate_selection_shape(selections, poll.options.len())?;
-    if poll.poll_type == PollType::SingleChoice && selections.len() != 1 {
-        return Err(PollError::InvalidSelection);
-    }
     let option_ids = poll
         .options
         .iter()
-        .map(|option| option.id.as_str())
+        .map(|option| option.id.clone())
+        .collect::<Vec<_>>();
+    validate_poll_selection(poll.poll_type, &option_ids, selections)
+}
+
+pub fn validate_poll_selection(
+    poll_type: PollType,
+    option_ids: &[String],
+    selections: &[String],
+) -> Result<(), PollError> {
+    validate_selection_shape(selections, option_ids.len())?;
+    if poll_type == PollType::SingleChoice && selections.len() != 1 {
+        return Err(PollError::InvalidSelection);
+    }
+    let option_ids = option_ids
+        .iter()
+        .map(String::as_str)
         .collect::<HashSet<_>>();
     if selections
         .iter()
@@ -235,10 +248,6 @@ fn validate_question_and_labels(question: &str, labels: &[String]) -> Result<(),
         })
         .collect::<Vec<_>>();
     validate_options(&options)
-}
-
-pub fn validate_poll_input(question: &str, labels: &[String]) -> Result<(), PollError> {
-    validate_question_and_labels(question, labels)
 }
 
 fn validate_question(question: &str) -> Result<(), PollError> {
@@ -336,19 +345,20 @@ mod tests {
         let poll = event(
             MARMOT_APP_EVENT_KIND_POLL,
             100,
-            poll_tags(100, &labels, PollType::SingleChoice, Some(200)).unwrap(),
+            poll_tags(100, "Drink?", &labels, PollType::SingleChoice, Some(200)).unwrap(),
             "Drink?",
         );
         let parsed = parse_poll(&poll).unwrap();
         assert_eq!(parsed.options[1].id, "1");
         assert_eq!(parsed.ends_at, Some(200));
-        assert!(poll_tags(100, &labels, PollType::SingleChoice, Some(100)).is_err());
+        assert!(poll_tags(100, "Drink?", &labels, PollType::SingleChoice, Some(100)).is_err());
     }
 
     #[test]
     fn rejects_relay_tags_duplicate_choices_and_bidi_text() {
         let mut tags = poll_tags(
             100,
+            "Drink?",
             &["Tea".to_owned(), "Coffee".to_owned()],
             PollType::MultipleChoice,
             None,
@@ -359,7 +369,16 @@ mod tests {
             parse_poll(&event(MARMOT_APP_EVENT_KIND_POLL, 100, tags, "Drink?")),
             Err(PollError::InvalidTags)
         );
-        assert!(validate_poll_input("Drink?", &["Tea".into(), "\u{202e}Coffee".into()]).is_err());
+        assert!(
+            poll_tags(
+                100,
+                "Drink?",
+                &["Tea".into(), "\u{202e}Coffee".into()],
+                PollType::SingleChoice,
+                None,
+            )
+            .is_err()
+        );
         assert!(poll_response_tags(&"22".repeat(32), &["0".into(), "0".into()]).is_err());
     }
 

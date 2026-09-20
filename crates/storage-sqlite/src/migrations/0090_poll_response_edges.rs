@@ -3,8 +3,9 @@ use cgka_traits::storage::StorageResult;
 use cgka_traits::{EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_POLL_RESPONSE};
 use rusqlite::{Transaction, params};
 
-/// Backfill the normalized target edge for poll responses that older versions
-/// retained as unknown custom events. New responses are indexed on ingest.
+/// Backfill normalized target edges for poll responses that older versions
+/// retained as unknown custom events, and remove their obsolete derived
+/// timeline bubbles. New responses are indexed and hidden on ingest.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     let mut stmt = tx
         .prepare(
@@ -60,5 +61,13 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             .storage()?;
         }
     }
+    // Before kind 1018 became a hidden poll modifier, older builds projected it
+    // as an unknown custom-event bubble. Keep the source event, but remove that
+    // obsolete derived row so upgraded timelines agree with fresh projection.
+    tx.execute(
+        "DELETE FROM message_timeline WHERE kind = ?1",
+        params![i64::try_from(MARMOT_APP_EVENT_KIND_POLL_RESPONSE).unwrap_or_default()],
+    )
+    .storage()?;
     Ok(())
 }

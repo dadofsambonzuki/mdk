@@ -2232,6 +2232,34 @@ Send an app-defined event with an arbitrary non-reserved kind. `tags` and `conte
 
 [Source](src/commands/message.rs#L193)
 
+### `Marmot::create_poll`
+
+**Current.** Typed API for an encrypted NIP-88 group poll; do not build kinds 1068/1018 through `send_custom_event`.
+
+```rust
+pub async fn create_poll( &self, account_ref: String, group_id_hex: String, question: String, options: Vec<String>, poll_type: PollTypeFfi, ends_at: Option<u64>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Pass two through ten option labels and an optional Unix-seconds deadline no more than 30 days after creation. MDK
+validates bounded display text, assigns stable option ids in display order, and exposes results through the timeline
+poll projection. Polls are neither anonymous nor election-grade. See [Polls](POLLS.md).
+
+[Source](src/commands/message.rs#L211)
+
+### `Marmot::cast_poll_vote`
+
+**Current.** Use for a complete replacement selection on an existing encrypted group poll.
+
+```rust
+pub async fn cast_poll_vote( &self, account_ref: String, group_id_hex: String, poll_event_id: String, option_ids: Vec<String>, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+The poll must already be a valid local timeline row in this group and remain open. Pass one option id for single choice
+or one through ten unique ids for multiple choice; use the ids from `TimelineMessageRecordFfi.poll`, not option labels.
+This is a replacement, not a delta or unvote. See [Polls](POLLS.md).
+
+[Source](src/commands/message.rs#L236)
+
 ### `Marmot::messages`
 
 **Lower-level.** Raw stored messages; complete conversation screens use open_conversation_window.
@@ -4083,38 +4111,5 @@ are not idempotent or restart-resumable; query token status after unknown outcom
 See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
 
 [Source](src/commands/local_submissions.rs#L101)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `Marmot::cast_poll_vote`
-
-**Current.** Use for a complete replacement selection on an existing encrypted group poll.
-
-```rust
-pub async fn cast_poll_vote( &self, account_ref: String, group_id_hex: String, poll_event_id: String, option_ids: Vec<String>, ) -> Result<SendSummaryFfi, MarmotKitError>
-```
-
-The poll must already be a valid local timeline row in this group and remain open. Pass one option id for single choice
-or one through ten unique ids for multiple choice; use the ids from `TimelineMessageRecordFfi.poll`, not option labels.
-This is a replacement, not a delta or unvote. See [Polls](POLLS.md).
-
-[Source](src/commands/message.rs#L236)
-
-### `Marmot::create_poll`
-
-**Current.** Typed API for an encrypted NIP-88 group poll; do not build kinds 1068/1018 through `send_custom_event`.
-
-```rust
-pub async fn create_poll( &self, account_ref: String, group_id_hex: String, question: String, options: Vec<String>, poll_type: PollTypeFfi, ends_at: Option<u64>, ) -> Result<SendSummaryFfi, MarmotKitError>
-```
-
-Pass two through ten option labels and an optional Unix-seconds deadline no more than 30 days after creation. MDK
-validates bounded display text, assigns stable option ids in display order, and exposes results through the timeline
-poll projection. Polls are neither anonymous nor election-grade. See [Polls](POLLS.md).
-
-[Source](src/commands/message.rs#L211)
 
 </details>

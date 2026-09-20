@@ -1721,21 +1721,13 @@ impl AccountManager {
         if !poll.open {
             return Err(AppError::InvalidAppMessagePayload("poll is closed".into()));
         }
-        let allowed = poll
+        let option_ids_in_poll = poll
             .options
             .iter()
-            .map(|option| option.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let unique = option_ids.iter().collect::<std::collections::HashSet<_>>();
-        if option_ids.is_empty()
-            || unique.len() != option_ids.len()
-            || option_ids.iter().any(|id| !allowed.contains(id.as_str()))
-            || (poll.poll_type == cgka_traits::PollType::SingleChoice && option_ids.len() != 1)
-        {
-            return Err(AppError::InvalidAppMessagePayload(
-                "poll response contains an invalid selection".into(),
-            ));
-        }
+            .map(|option| option.id.clone())
+            .collect::<Vec<_>>();
+        cgka_traits::validate_poll_selection(poll.poll_type, &option_ids_in_poll, &option_ids)
+            .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
         self.send_app_event(
             &account.account_id_hex,
             group_id,

@@ -115,6 +115,7 @@ fn poll(id: &str, sender: &str, at: u64) -> StoredAppEvent {
         kind: MARMOT_APP_EVENT_KIND_POLL,
         tags: cgka_traits::poll_tags(
             at,
+            "Drink?",
             &["Tea".to_owned(), "Coffee".to_owned()],
             cgka_traits::PollType::SingleChoice,
             Some(at + 100),
@@ -135,6 +136,17 @@ fn poll_response(
     option: &str,
     direction: &str,
 ) -> StoredAppEvent {
+    poll_response_options(id, sender, target, at, &[option], direction)
+}
+
+fn poll_response_options(
+    id: &str,
+    sender: &str,
+    target: &str,
+    at: u64,
+    options: &[&str],
+    direction: &str,
+) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
         message_id_hex: id.to_owned(),
@@ -144,7 +156,14 @@ fn poll_response(
         sender: sender.to_owned(),
         plaintext: String::new(),
         kind: MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
-        tags: cgka_traits::poll_response_tags(target, &[option.to_owned()]).unwrap(),
+        tags: cgka_traits::poll_response_tags(
+            target,
+            &options
+                .iter()
+                .map(|option| (*option).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
@@ -183,6 +202,7 @@ fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
         .poll
         .unwrap();
     assert_eq!(projected.participants, 2);
+    assert!(!projected.open);
     assert_eq!(projected.local_selection, ["0"]);
     assert_eq!(
         projected
@@ -210,6 +230,170 @@ fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
             .collect::<Vec<_>>(),
         [2, 0]
     );
+}
+
+#[test]
+fn poll_projection_is_independent_of_response_arrival_order() {
+    let poll_id = "12".repeat(32);
+    let older = poll_response(&"13".repeat(32), "bob", &poll_id, 140, "0", "received");
+    let newer = poll_response(&"14".repeat(32), "bob", &poll_id, 150, "1", "received");
+    let mut projections = Vec::new();
+    for responses in [[&older, &newer], [&newer, &older]] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&poll(&poll_id, "creator", 100))
+            .unwrap();
+        for response in responses {
+            store.record_app_event(response).unwrap();
+        }
+        projections.push(
+            store
+                .timeline_message(&"11".repeat(32), &poll_id)
+                .unwrap()
+                .unwrap()
+                .poll
+                .unwrap(),
+        );
+    }
+    assert_eq!(projections[0], projections[1]);
+    assert_eq!(
+        projections[0]
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+}
+
+#[test]
+fn poll_delete_fallback_ignores_deleted_rows_before_the_retention_bound() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let poll_id = "22".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    let response_ids = (0_u64..65)
+        .map(|index| format!("{:064x}", index + 1))
+        .collect::<Vec<_>>();
+    for (index, response_id) in response_ids.iter().enumerate() {
+        store
+            .record_app_event(&poll_response(
+                response_id,
+                "bob",
+                &poll_id,
+                150,
+                if index == 0 { "0" } else { "1" },
+                "received",
+            ))
+            .unwrap();
+    }
+    for (index, response_id) in response_ids.iter().enumerate().skip(1) {
+        store
+            .record_app_event(&delete(
+                &format!("{:064x}", index + 1_000),
+                "bob",
+                response_id,
+                170,
+            ))
+            .unwrap();
+    }
+
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.participants, 1);
+    assert_eq!(
+        projected
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [1, 0]
+    );
+}
+
+#[test]
+fn multiple_choice_poll_counts_one_participant_across_selected_options() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let poll_id = "77".repeat(32);
+    let mut multiple = poll(&poll_id, "creator", 100);
+    multiple.tags = cgka_traits::poll_tags(
+        100,
+        "Drink?",
+        &["Tea".to_owned(), "Coffee".to_owned()],
+        cgka_traits::PollType::MultipleChoice,
+        Some(200),
+    )
+    .unwrap();
+    store.record_app_event(&multiple).unwrap();
+    store
+        .record_app_event(&poll_response_options(
+            &"88".repeat(32),
+            "bob",
+            &poll_id,
+            150,
+            &["0", "1"],
+            "received",
+        ))
+        .unwrap();
+
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.participants, 1);
+    assert_eq!(
+        projected
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+}
+
+#[test]
+fn sibling_device_vote_is_local_without_overloading_delivery_direction() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO notification_settings (
+                account_label, account_id_hex, local_notifications_enabled,
+                native_push_enabled, updated_at_ms
+             ) VALUES ('local', 'alice', 1, 0, 1)",
+            [],
+        )
+        .unwrap();
+    let poll_id = "99".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &"aa".repeat(32),
+            "alice",
+            &poll_id,
+            150,
+            "1",
+            "received",
+        ))
+        .unwrap();
+
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.local_selection, ["1"]);
 }
 
 fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {

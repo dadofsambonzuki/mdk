@@ -4032,6 +4032,35 @@ Send a custom application event into the group. `tags` is a flat array of `tags_
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_custom_event) · [Header contract](include/marmot.h#L8359)
 
+### `marmot_create_poll`
+
+**Current.** Create an encrypted NIP-88 group poll through the bounded typed surface.
+
+```c
+MarmotStatus marmot_create_poll(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *question, const char *const *options, uintptr_t options_len, uint32_t poll_type, uint8_t has_ends_at, uint64_t ends_at, struct MarmotSendSummary **out);
+```
+
+Pass two through ten labels, a valid `MarmotPollType` discriminant, and use `has_ends_at` to distinguish no deadline
+from the Unix-seconds `ends_at` value. MDK assigns stable option ids. The call blocks and `out` is released with
+`marmot_send_summary_free`; recompile for the added timeline poll record. See
+[the shared poll contract](../marmot-uniffi/POLLS.md).
+
+[Header contract](include/marmot.h#L8377)
+
+### `marmot_cast_poll_vote`
+
+**Current.** C mirror of the typed replacement-vote API.
+
+```c
+MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *poll_event_id, const char *const *option_ids, uintptr_t option_ids_len, struct MarmotSendSummary **out);
+```
+
+Pass the complete option-id selection from the poll projection; an empty selection is not an unvote. The poll must be
+valid, local to the named group, and open. The call blocks and `out` is released with `marmot_send_summary_free`. See
+[the shared poll contract](../marmot-uniffi/POLLS.md).
+
+[Header contract](include/marmot.h#L8395)
+
 ### `marmot_set_usage_diagnostics_consent`
 
 ```c
@@ -4841,39 +4870,5 @@ idempotent: query token status after an unknown outcome before repeating them.
 See [local sends](../marmot-uniffi/LOCAL-SENDS.md) for epoch and cancellation semantics.
 
 [Header contract](include/marmot.h#L8062)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `marmot_cast_poll_vote`
-
-**Current.** C mirror of the typed replacement-vote API.
-
-```c
-MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *poll_event_id, const char *const *option_ids, uintptr_t option_ids_len, struct MarmotSendSummary **out);
-```
-
-Pass the complete option-id selection from the poll projection; an empty selection is not an unvote. The poll must be
-valid, local to the named group, and open. The call blocks and `out` is released with `marmot_send_summary_free`. See
-[the shared poll contract](../marmot-uniffi/POLLS.md).
-
-[Header contract](include/marmot.h#L8395)
-
-### `marmot_create_poll`
-
-**Current.** Create an encrypted NIP-88 group poll through the bounded typed surface.
-
-```c
-MarmotStatus marmot_create_poll(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *question, const char *const *options, uintptr_t options_len, uint32_t poll_type, uint8_t has_ends_at, uint64_t ends_at, struct MarmotSendSummary **out);
-```
-
-Pass two through ten labels, a valid `MarmotPollType` discriminant, and use `has_ends_at` to distinguish no deadline
-from the Unix-seconds `ends_at` value. MDK assigns stable option ids. The call blocks and `out` is released with
-`marmot_send_summary_free`; recompile for the added timeline poll record. See
-[the shared poll contract](../marmot-uniffi/POLLS.md).
-
-[Header contract](include/marmot.h#L8377)
 
 </details>

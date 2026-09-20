@@ -4595,26 +4595,11 @@ impl AppClient {
             );
         }
         let moderation_grant = message.authority.is_some_and(|a| a.moderation_grant);
-        // A sibling device authenticates as the same Marmot account. Preserve
-        // that account-wide authorship for poll selection even though this
-        // device observed the response on the inbound path.
-        let direction = if message.kind == cgka_traits::MARMOT_APP_EVENT_KIND_POLL_RESPONSE
-            && message.sender
-                == self
-                    .app
-                    .account_home()
-                    .account(&self.state.label)?
-                    .account_id_hex
-        {
-            "sent"
-        } else {
-            "received"
-        };
         let message_projection = AppMessageProjection {
             authority: message.authority,
             message_id_hex: message.message_id_hex.clone(),
             source_message_id_hex: Some(message.source_message_id_hex.clone()),
-            direction: direction.to_owned(),
+            direction: "received".to_owned(),
             group_id_hex: hex::encode(message.group_id.as_slice()),
             sender: message.sender.clone(),
             plaintext: message.plaintext.clone(),

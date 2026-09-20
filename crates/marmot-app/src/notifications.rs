@@ -2089,7 +2089,10 @@ pub(crate) fn message_text_mentions_account(
 /// only approved text/status fields; group-system rows expose supported parsed
 /// text only, so their JSON envelope never reaches a notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
-    if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
+    if is_push_gossip_kind(kind)
+        || kind == MARMOT_APP_EVENT_KIND_POLL
+        || plaintext.trim().is_empty()
+    {
         None
     } else if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
         // Reuse the bounded, version-checked parser. This is fallback text,

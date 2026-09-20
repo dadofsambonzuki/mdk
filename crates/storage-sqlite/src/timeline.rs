@@ -440,6 +440,16 @@ struct RawAppEvent {
 }
 
 #[derive(Clone, Debug)]
+struct PollResponseCandidate {
+    group_id_hex: String,
+    message_id_hex: String,
+    direction: String,
+    sender: String,
+    tags: Vec<Vec<String>>,
+    recorded_at: u64,
+}
+
+#[derive(Clone, Debug)]
 struct PrunedAppEvent {
     message_id_hex: String,
     kind: u64,
@@ -3972,6 +3982,25 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
     })
 }
 
+fn poll_response_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PollResponseCandidate> {
+    Ok(PollResponseCandidate {
+        group_id_hex: row.get(0)?,
+        message_id_hex: row.get(1)?,
+        direction: row.get(2)?,
+        sender: row.get(3)?,
+        tags: tags_from_json(row.get::<_, String>(4)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        recorded_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+    })
+}
+
 fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineMessageRecord> {
     let deleted = row.get::<_, bool>(17)?;
     Ok(TimelineMessageRecord {
@@ -4088,6 +4117,17 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
     if definitions.is_empty() {
         return Ok(());
     }
+    let local_account_id_hex = conn
+        .query_row(
+            "SELECT account_id_hex
+             FROM notification_settings
+             ORDER BY updated_at_ms DESC, account_label DESC
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .storage()?;
 
     let mut by_group = BTreeMap::<String, Vec<String>>::new();
     for (group, poll_id) in definitions.keys() {
@@ -4103,9 +4143,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
-                        direction, sender, plaintext, kind, tags_json, recorded_at, received_at,
-                        invalidated, invalidation_reason, moderation_grant
+                "SELECT group_id_hex, message_id_hex, direction, sender, tags_json, recorded_at
                  FROM (
                     SELECT app_events.*,
                            ROW_NUMBER() OVER (
@@ -4119,14 +4157,29 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                     WHERE edges.group_id_hex = ?
                       AND edges.kind = ?
                       AND app_events.invalidated = 0
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM message_modifier_edges AS delete_edges
+                          JOIN app_events AS delete_events
+                            ON delete_events.group_id_hex = delete_edges.group_id_hex
+                           AND delete_events.message_id_hex = delete_edges.modifier_message_id_hex
+                          WHERE delete_edges.group_id_hex = app_events.group_id_hex
+                            AND delete_edges.kind = ?
+                            AND delete_edges.target_message_id_hex = app_events.message_id_hex
+                            AND delete_events.invalidated = 0
+                            AND delete_events.sender = app_events.sender
+                      )
                       AND edges.target_message_id_hex IN ({placeholders})
                  )
                  WHERE voter_rank <= ?"
             );
-            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 3);
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 4);
             values.push(rusqlite::types::Value::Text(group.clone()));
             values.push(rusqlite::types::Value::Integer(u64_to_i64(
                 MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+            )?));
+            values.push(rusqlite::types::Value::Integer(u64_to_i64(
+                MARMOT_APP_EVENT_KIND_DELETE,
             )?));
             values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
             values.push(rusqlite::types::Value::Integer(
@@ -4134,43 +4187,27 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
             ));
             let mut stmt = conn.prepare_cached(&sql).storage()?;
             responses.extend(
-                stmt.query_map(params_from_iter(values.iter()), raw_event_from_row)
-                    .storage()?
-                    .collect::<Result<Vec<_>, _>>()
-                    .storage()?,
+                stmt.query_map(
+                    params_from_iter(values.iter()),
+                    poll_response_candidate_from_row,
+                )
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?,
             );
         }
     }
 
-    let mut deleted = HashSet::new();
-    let mut responses_by_group = HashMap::<String, Vec<RawAppEvent>>::new();
-    for response in responses {
-        responses_by_group
-            .entry(response.group_id_hex.clone())
-            .or_default()
-            .push(response);
-    }
-    for (group, group_responses) in &responses_by_group {
-        deleted.extend(deleted_reaction_ids_for_target_tx(
-            conn,
-            group,
-            group_responses,
-        )?);
-    }
-
     let mut effective =
         HashMap::<(String, String, String), (u64, String, String, Vec<String>)>::new();
-    for response in responses_by_group.into_values().flatten() {
-        if deleted.contains(&response.message_id_hex) {
-            continue;
-        }
+    for response in responses {
         let event = MarmotAppEvent {
             id: response.message_id_hex.clone(),
             pubkey: response.sender.clone(),
             created_at: response.recorded_at,
-            kind: response.kind,
+            kind: MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
             tags: response.tags.clone(),
-            content: response.plaintext.clone(),
+            content: String::new(),
         };
         let Ok((poll_id, selections)) = parse_poll_response(&event) else {
             continue;
@@ -4207,6 +4244,15 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         }
     }
 
+    let mut effective_by_poll =
+        HashMap::<(String, String), Vec<(String, String, Vec<String>)>>::new();
+    for ((group, poll_id, sender), (_, _, direction, selections)) in effective {
+        effective_by_poll
+            .entry((group, poll_id))
+            .or_default()
+            .push((sender, direction, selections));
+    }
+
     let now = unix_now_seconds();
     for ((group, poll_id), (index, definition, creator, _)) in definitions {
         let mut counts = definition
@@ -4216,18 +4262,22 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
             .collect::<BTreeMap<_, _>>();
         let mut local_selection = Vec::new();
         let mut participants = 0_u64;
-        for ((vote_group, vote_poll, _), (_, _, direction, selections)) in &effective {
-            if vote_group != &group || vote_poll != &poll_id {
-                continue;
-            }
+        for (sender, direction, selections) in effective_by_poll
+            .remove(&(group, poll_id))
+            .unwrap_or_default()
+        {
             participants = participants.saturating_add(1);
-            for selection in selections {
+            for selection in &selections {
                 if let Some(count) = counts.get_mut(selection) {
                     *count = count.saturating_add(1);
                 }
             }
-            if direction == "sent" {
-                local_selection = selections.clone();
+            if direction == "sent"
+                || local_account_id_hex
+                    .as_deref()
+                    .is_some_and(|local| sender.eq_ignore_ascii_case(local))
+            {
+                local_selection = selections;
             }
         }
         messages[index].poll = Some(PollProjection {

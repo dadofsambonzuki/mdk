@@ -104,8 +104,8 @@ pub use polls::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, POLL_MAX_LIFETIME_SECONDS,
     POLL_MAX_OPTION_BYTES, POLL_MAX_OPTIONS, POLL_MAX_QUESTION_BYTES, PollDefinition, PollError,
     PollOptionDefinition, PollOptionResult, PollProjection, PollType, parse_poll,
-    parse_poll_response, poll_response_tags, poll_tags, validate_poll_input,
-    validate_poll_response,
+    parse_poll_response, poll_response_tags, poll_tags, validate_poll_response,
+    validate_poll_selection,
 };
 pub use storage::{
     CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,

@@ -17,7 +17,7 @@ use cgka_traits::app_event::{
 use cgka_traits::reporting::ReportReason;
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollType, poll_response_tags,
-    poll_tags, validate_poll_input,
+    poll_tags,
 };
 use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
@@ -442,9 +442,7 @@ pub(crate) fn build_inner_event_with_media_reply(
             poll_type,
             ends_at,
         } => {
-            validate_poll_input(question, options)
-                .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
-            let tags = poll_tags(created_at, options, *poll_type, *ends_at)
+            let tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
                 .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
             Ok(event(MARMOT_APP_EVENT_KIND_POLL, tags, question.clone()))
         }

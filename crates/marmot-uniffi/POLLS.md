@@ -14,10 +14,15 @@ send one id for single choice and one through ten unique ids for multiple choice
 timeline row in the same group and still be open. An empty selection is not an unvote operation.
 
 `TimelineMessageRecordFfi.poll` is present on valid kind-1068 rows. It contains the ordered options and counts, total
-participating authenticated identities, the device's effective sent selection, creator, deadline, and current open
+participating authenticated identities, the account's effective sent selection, creator, deadline, and current open
 state. Kind-1018 responses do not form timeline rows. For each authenticated author MDK selects the response with the
 greatest `(created_at, canonical event id)`; ordinary author deletion or retention expiry falls back to the newest
 retained valid response. Projection work considers at most the newest 64 retained responses per author.
+
+`open` is recomputed whenever the timeline row is read or reprojected. A host that keeps a row on screen across its
+deadline should also close its controls from the `endsAt` timestamp instead of waiting for another message. Local block
+lists suppress alerts and presentation for blocked senders but do not rewrite the shared poll tally; every authenticated
+member's valid response remains part of the group result.
 
 Polls are coordination tools, not anonymous or election-grade voting. Every group member receives authenticated voter
 identity with each response, and distributed clients/relays do not provide a global sequencer at the closing boundary.
