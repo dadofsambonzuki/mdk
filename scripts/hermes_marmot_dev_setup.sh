@@ -249,7 +249,12 @@ clone_hermes_repo() {
     local delay=8
     while [ "$attempt" -le "$max_attempts" ]; do
         rm -rf "$dest"
-        if git_with_github_auth clone "$hermes_url" "$dest"; then
+        # The default branch can carry generated files whose checkout-time
+        # normalization differs from an older pinned cohort. Materializing it
+        # first can therefore leave a dirty worktree and make the subsequent
+        # pinned checkout fail. Clone objects and refs only; install_hermes
+        # checks out exactly the requested cohort below.
+        if git_with_github_auth clone --no-checkout "$hermes_url" "$dest"; then
             return 0
         fi
         if [ "$attempt" -lt "$max_attempts" ]; then

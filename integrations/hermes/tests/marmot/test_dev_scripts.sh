@@ -29,6 +29,7 @@ capture_auth() {
 case " $* " in
     *" clone "*)
         capture_auth
+        printf 'clone_args=%s\n' "$*" >>"$AUTH_CAPTURE"
         dest="${@: -1}"
         mkdir -p "$dest/.git"
         ;;
@@ -59,6 +60,7 @@ expected_basic="$(printf 'x-access-token:%s' 'test-actions-token' | base64 | tr 
 [ "$(grep -Fxc 'count=1' "$auth_capture")" -eq 2 ]
 [ "$(grep -Fxc 'key=http.https://github.com/.extraheader' "$auth_capture")" -eq 2 ]
 [ "$(grep -Fxc "value=AUTHORIZATION: basic $expected_basic" "$auth_capture")" -eq 2 ]
+grep -F 'clone_args=clone --no-checkout ' "$auth_capture" >/dev/null
 if grep -F 'test-actions-token' "$auth_capture" >/dev/null; then
     echo "raw GitHub token leaked into git configuration" >&2
     exit 1
