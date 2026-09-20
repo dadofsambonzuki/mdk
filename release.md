@@ -166,6 +166,27 @@ supplement link; do not silently rewrite the source/binary provenance.
 
 ## Preflight For Any Release
 
+### Initial release PR
+
+Keep the initial release PR limited to version fields, workspace package versions in `Cargo.lock`, vector
+`conformance_version` values, changelogs, release/integration documentation, README/install version pins, and other
+release metadata. Before opening it, run only:
+
+```sh
+just release-pr-preflight <version>
+```
+
+This deliberately checks the release version, companion-document linkage, installer guidance, diff whitespace, tag
+availability, and coordinator inputs without compiling, testing, benchmarking, generating binding bundles, or building
+artifacts. Open the PR immediately after it passes and use required GitHub CI as the compile/test signal. Do not run
+`just fast-ci`, `just test`, `just ci`, Tamarin, benchmarks, binding bundle builds, or artifact builds first.
+
+If release preparation exposes an implementation or workflow defect, stop and fix it in a separate PR with the normal
+targeted verification; do not turn the release-metadata PR into a code/test repair branch. After the metadata PR merges
+and required CI succeeds, start the actual cohort build with `just release-all <version>`.
+
+### Final release readiness
+
 Start from a clean checkout at the commit you intend to release:
 
 ```sh
@@ -188,7 +209,9 @@ links. It also rejects a supplied version that differs from the workspace. The f
 release coordinator runs this check before any tag/release mutation, including dry runs.
 A successful check verifies existence/linkage, not the accuracy or completeness of prose.
 
-Run the normal workspace checks:
+Required GitHub CI on the exact release commit is the authoritative workspace check. Do not repeat that matrix locally
+after the initial release PR merges. If the intended release commit was changed after CI, or required CI did not cover
+the relevant surface, run the missing checks before tagging:
 
 ```sh
 just fmt-check
@@ -426,9 +449,8 @@ Each binary/plugin tarball carries a `manifest.json` recording the release tag, 
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
 The installer assets are generated during the release and default to their own immutable `wn-agent-v<version>` release
-tag and `<version>` asset suffix. The mutable `wn-agent-latest` release is a rolling convenience alias, not an
-authoritative pin; repeatable installs use immutable `wn-agent-v<version>` tags. A verified install for the current
-workspace release looks like:
+tag and `<version>` asset suffix. Versioned releases are the only supported install channel; the release workflow must
+not create or update a mutable latest alias. A verified install for the current workspace release looks like:
 
 ```sh
 (
