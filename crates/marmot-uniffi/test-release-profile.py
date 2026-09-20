@@ -15,6 +15,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 
 HERE = Path(__file__).resolve().parent
@@ -59,8 +60,10 @@ def write_ar(path: Path, members: list[tuple[str, bytes]]) -> None:
     blob = bytearray(b"!<arch>\n")
     for name, content in members:
         encoded = name.encode("ascii")
-        if len(encoded) > 16:
-            raise ValueError(name)
+        if len(encoded) > 15:
+            stored = encoded + b"\0"
+            content = stored + content
+            encoded = f"#1/{len(stored)}".encode()
         header = (
             encoded.ljust(16)
             + b"0".ljust(12)
@@ -460,6 +463,15 @@ class ReleaseProfileTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # These fixtures deliberately contain synthetic, non-linkable objects.
+        # Real toolchain reconstruction/link checks live in test-native-archive.py.
+        self.writer = patch.object(archive, "write_archive", side_effect=write_ar)
+        self.writer.start()
+        self.addCleanup(self.writer.stop)
+        inspect = archive.inspect_otool
+        self.inspector = patch.object(archive, "inspect_otool", side_effect=lambda path, text=None: inspect(path, text) if text is not None else None)
+        self.inspector.start()
+        self.addCleanup(self.inspector.stop)
 
     def test_root_and_canonical_thin_parity(self):
         cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())
@@ -587,210 +599,6 @@ class ReleaseProfileTests(unittest.TestCase):
                 with self.assertRaises(archive.ArchiveError):
                     archive.check_archive(rejected)
 
-    def test_sanitize_removes_llvm_from_compiler_builtins_named_member(self):
-        native = macho64(True, b"__TEXT")
-        llvm = macho64(True, b"__LLVM")
-        path = self.root / "libmarmot_uniffi.a"
-        archive.write_archive(
-            path,
-            [
-                ("obj.o", native),
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    llvm,
-                ),
-            ],
-        )
-        with self.assertRaises(archive.ArchiveError):
-            archive.check_archive(path)
-        count = archive.sanitize_archive(path)
-        self.assertEqual(count, 2)
-        self.assertGreater(archive.check_archive(path), 0)
-        names = [name for _, name, _ in archive.iter_ar_members(path.read_bytes())]
-        self.assertTrue(
-            any(name.startswith("compiler_builtins-") for name in names),
-            names,
-        )
-        trailing = self.root / "trailing-llvm.a"
-        payload = b"\x00" * 0xE80
-        archive.write_archive(
-            trailing,
-            [
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    macho64_trailing_llvm(True, payload),
-                )
-            ],
-        )
-        self.assertTrue(archive.member_has_bitcode(macho64_trailing_llvm(True, payload)))
-        archive.sanitize_archive(trailing)
-        members = list(archive.iter_ar_members(trailing.read_bytes()))
-        self.assertEqual(len(members), 1)
-        self.assertFalse(archive.member_has_bitcode(members[0][2]))
-        self.assertLess(len(members[0][2]), 0xE80)
-
-    def test_sanitize_removes_mh_object_section_level_llvm_bitcode(self):
-        native = b"NATIVEOBJ"
-        bitcode = b"\x11" * 0xE80
-        member = macho64_mh_object_text_and_llvm(True, native, bitcode)
-        path = self.root / "compiler-builtins-mh-object.a"
-        archive.write_archive(
-            path,
-            [
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    member,
-                )
-            ],
-        )
-        with self.assertRaises(archive.ArchiveError):
-            archive.check_archive(path)
-        count = archive.sanitize_archive(path)
-        self.assertEqual(count, 1)
-        names = [name for _, name, content in archive.iter_ar_members(path.read_bytes())]
-        self.assertTrue(any(name.startswith("compiler_builtins-") for name in names), names)
-        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
-        self.assertFalse(archive.member_has_bitcode(stripped))
-        self.assertIn(native, stripped)
-        self.assertNotIn(bitcode, stripped)
-        self.assertLess(len(stripped), len(member))
-        text_only = macho64(True, b"__TEXT", sectname=b"__bitcode")
-        text_path = self.root / "text-bitcode-section.a"
-        archive.write_archive(text_path, [("obj.o", text_only)])
-        archive.sanitize_archive(text_path)
-        self.assertFalse(
-            archive.member_has_bitcode(list(archive.iter_ar_members(text_path.read_bytes()))[0][2])
-        )
-        bundle = macho64_mh_object_text_and_llvm(True, native, bitcode, llvm_sectname=b"__bundle")
-        bundle_path = self.root / "llvm-bundle.a"
-        archive.write_archive(bundle_path, [("obj.o", bundle)])
-        archive.sanitize_archive(bundle_path)
-        self.assertFalse(
-            archive.member_has_bitcode(list(archive.iter_ar_members(bundle_path.read_bytes()))[0][2])
-        )
-
-    def test_sanitize_preserves_version_min_after_midfile_bitcode_removal(self):
-        leading = b"LEADINGOBJ"
-        bitcode = b"\x22" * 0xE80
-        trailing = b"TRAILINGOBJ"
-        uuid = (
-            struct.pack("<I", 0x1B)
-            + struct.pack("<I", 24)
-            + bytes(range(16))
-        )
-        member = macho64_mh_object_midfile_llvm_with_version_min(
-            True, leading, bitcode, trailing, extra_cmd=uuid
-        )
-        path = self.root / "midfile-version-min.a"
-        archive.write_archive(
-            path,
-            [
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    member,
-                )
-            ],
-        )
-        with self.assertRaises(archive.ArchiveError):
-            archive.check_archive(path)
-        count = archive.sanitize_archive(path)
-        self.assertEqual(count, 1)
-        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
-        self.assertFalse(archive.member_has_bitcode(stripped))
-        self.assertIn(leading, stripped)
-        self.assertIn(trailing, stripped)
-        self.assertNotIn(bitcode, stripped)
-        self.assertIn(struct.pack("<I", 0x25), stripped)
-        self.assertIn(bytes(range(16)), stripped)
-        self.assertLess(len(stripped), len(member))
-
-    def test_sanitize_snaps_segment_fileoff_off_leading_bitcode(self):
-        native = b"NATIVE784"
-        bitcode = b"\x44" * 0xE80
-        member = macho64_mh_object_bitcode_at_segment_fileoff(True, native, bitcode)
-        path = self.root / "segment-fileoff-784.a"
-        archive.write_archive(
-            path,
-            [
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    member,
-                )
-            ],
-        )
-        with self.assertRaises(archive.ArchiveError):
-            archive.check_archive(path)
-        count = archive.sanitize_archive(path)
-        self.assertEqual(count, 1)
-        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
-        self.assertFalse(archive.member_has_bitcode(stripped))
-        self.assertIn(native, stripped)
-        self.assertNotIn(bitcode, stripped)
-        self.assertIn(struct.pack("<I", 0x25), stripped)
-        self.assertLess(len(stripped), len(member))
-        fileoff = struct.unpack_from("<Q", stripped, 32 + 40)[0]
-        filesize = struct.unpack_from("<Q", stripped, 32 + 48)[0]
-        self.assertEqual(fileoff, 784)
-        self.assertEqual(filesize, len(native))
-        text_off = struct.unpack_from("<I", stripped, 32 + 72 + 48)[0]
-        reloff = struct.unpack_from("<I", stripped, 32 + 72 + 56)[0]
-        self.assertEqual(text_off, 784)
-        self.assertEqual(reloff, 784 + len(native))
-
-    def test_sanitize_snaps_empty_section_offset_off_leading_bitcode(self):
-        native = b"NATIVE784"
-        bitcode = b"\x66" * 0xE80
-        member = macho64_mh_object_bitcode_at_segment_fileoff(
-            True, native, bitcode, empty_native_sections=(b"__const", b"__eh_frame")
-        )
-        path = self.root / "empty-section-fileoff-784.a"
-        archive.write_archive(
-            path,
-            [
-                (
-                    "compiler_builtins-c474715e2ac50578.compiler_builtins.498324e461c21fb7-cgu.227.rcgu.o",
-                    member,
-                )
-            ],
-        )
-        with self.assertRaises(archive.ArchiveError):
-            archive.check_archive(path)
-        count = archive.sanitize_archive(path)
-        self.assertEqual(count, 1)
-        stripped = list(archive.iter_ar_members(path.read_bytes()))[0][2]
-        self.assertFalse(archive.member_has_bitcode(stripped))
-        self.assertIn(native, stripped)
-        self.assertNotIn(bitcode, stripped)
-        nsects = struct.unpack_from("<I", stripped, 32 + 64)[0]
-        self.assertEqual(nsects, 3)
-        const_off = struct.unpack_from("<I", stripped, 32 + 72 + 48)[0]
-        eh_off = struct.unpack_from("<I", stripped, 32 + 72 + 80 + 48)[0]
-        text_off = struct.unpack_from("<I", stripped, 32 + 72 + 160 + 48)[0]
-        self.assertEqual(const_off, 784)
-        self.assertEqual(eh_off, 784)
-        self.assertEqual(text_off, 784)
-
-    def test_sanitize_still_rejects_section_offset_inside_removed_bitcode(self):
-        native = b"NATIVE784"
-        bitcode = b"\x55" * 0xE80
-        member = macho64_mh_object_bitcode_at_segment_fileoff(
-            True, native, bitcode, native_fileoff=800
-        )
-        path = self.root / "section-inside-bitcode.a"
-        archive.write_archive(path, [("obj.o", member)])
-        with self.assertRaisesRegex(archive.ArchiveError, "section offset 800 lands inside removed bitcode"):
-            archive.sanitize_archive(path)
-
-    def test_sanitize_still_rejects_unknown_midfile_load_command(self):
-        unknown = struct.pack("<I", 0x99) + struct.pack("<I", 8)
-        member = macho64_mh_object_midfile_llvm_with_version_min(
-            True, b"LEADINGOBJ", b"\x33" * 0x80, b"TRAILINGOBJ", extra_cmd=unknown
-        )
-        path = self.root / "unknown-midfile.a"
-        archive.write_archive(path, [("obj.o", member)])
-        with self.assertRaisesRegex(archive.ArchiveError, "unknown Mach-O load command 0x99"):
-            archive.sanitize_archive(path)
-
     def test_bsd_long_name_length_uses_archive_error(self):
         header = (
             b"#1/xx".ljust(16)
@@ -853,6 +661,7 @@ class ReleaseProfileTests(unittest.TestCase):
         log.write_text("")
         bin_dir = self.root / "bin"
         target = self.root / "target"
+        write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
         workspace = self.root / "old-source"
         crate = workspace / "crates/marmot-uniffi"
         (crate / "kotlin-support/dev/ipf/marmotkit").mkdir(parents=True)
@@ -953,6 +762,7 @@ class ReleaseProfileTests(unittest.TestCase):
         log.write_text("")
         bin_dir = self.root / "bin"
         workspace = self.root / "old-source"
+        write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
         crate = workspace / "crates/marmot-uniffi"
         (crate / "kotlin-support/dev/ipf/marmotkit").mkdir(parents=True)
         (crate / "kotlin-support/io/crates/keyring").mkdir(parents=True)

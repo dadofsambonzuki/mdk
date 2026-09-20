@@ -32,12 +32,14 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
   `-C embed-bitcode=no` (iOS rustc defaults to embedding bitcode). After cargo writes each `.a`,
   `release-profile-archive.py --sanitize` removes leftover `__LLVM` / `__bitcode` segments and
   MH_OBJECT section-level `__LLVM` leftovers from every member, including toolchain
-  `compiler_builtins` objects; it does not skip names or accept raw LLVM bitcode. Mid-file
-  leftover removal keeps offset-free load commands such as `LC_VERSION_MIN_IPHONEOS`
-  and snaps a parent segment whose `fileoff` equals the leftover bitcode start onto
-  the remaining native data, including empty native sections that reuse that
-  same file offset. This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none` and
-  `debug=0`, and the packagers publish that profile as provenance. Package the sanitized native
+  `compiler_builtins` objects; it does not skip names or accept raw LLVM bitcode.
+  Rust's `llvm-tools-preview` component supplies `llvm-objcopy` to rewrite sections,
+  symbols and relocations; do not implement custom Mach-O offset rewriting.
+  Archive reconstruction uses Apple `libtool` to regenerate alignment and symbol
+  indexes, preserves duplicate object names, and replaces the original only after
+  validation. Never copy an old symbol index into a rewritten archive.
+  This is not a symbol strip: `marmotkit-release-profile.env` still pins `strip=none`
+  and `debug=0`, and the packagers publish that profile as provenance. Package the sanitized native
   archives as raw-library XCFramework slices. Render the feature-selected privacy declaration
   from the packaged source's `apple-privacy/` and publish it separately with a checksum; also include it in the
   existing provenance bundle. Never stage resource-bearing framework wrappers or another complete-package ZIP.

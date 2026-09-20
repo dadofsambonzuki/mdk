@@ -391,6 +391,9 @@ Standard MarmotKit release builds use the workspace `[profile.release]` together
 `CARGO_PROFILE_RELEASE_STRIP=symbols`. Apple target invocations add
 `-C embed-bitcode=no` and sanitize leftover `__LLVM` / `__bitcode` sections
 before packaging so shipped archives stay native; that is not a symbol strip.
+Sanitization requires the active Rust toolchain's `llvm-tools-preview` component
+(included by `rust-toolchain.toml`) and Xcode's `libtool`. It rebuilds symbol indexes
+and validates a temporary output before replacing the original archive.
 Those builder-owned settings are not a user-facing escape hatch; measurement
 scripts may override LTO and codegen units on direct Cargo commands for a
 controlled baseline comparison.
@@ -398,6 +401,9 @@ controlled baseline comparison.
 ```sh
 # Inexpensive regressions, including provenance JSON and archive bitcode checks:
 python3 crates/marmot-uniffi/test-release-profile.py
+
+# On macOS: real archive reconstruction, embedded-bitcode removal and linking:
+python3 crates/marmot-uniffi/test-native-archive.py
 
 # Controlled host/Android/Apple/CPU comparison. Missing platforms are recorded as
 # unavailable, never as zero. Isolated target directories keep the two variants

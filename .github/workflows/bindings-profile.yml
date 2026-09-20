@@ -11,6 +11,7 @@ on:
       - crates/marmot-uniffi/release-profile-archive.py
       - crates/marmot-uniffi/measure-release-profile.py
       - crates/marmot-uniffi/test-release-profile.py
+      - crates/marmot-uniffi/test-native-archive.py
       - crates/marmot-uniffi/kotlin-bindings.sh
       - crates/marmot-uniffi/xcframework.sh
       - crates/marmot-uniffi/xcframework-macos.sh
@@ -238,6 +239,9 @@ jobs:
           rustc --version
           cargo --version
           xcodebuild -version
+
+      - name: Verify native archive reconstruction and linking
+        run: python3 crates/marmot-uniffi/test-native-archive.py
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
