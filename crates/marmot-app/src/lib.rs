@@ -6482,19 +6482,15 @@ fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
     // unfloored replay to later incarnations. Sorting the whole vector could
     // silently promote a historical route to current.
     if routes.len() > 1 {
-        routes[1..].sort_by(|left, right| {
+        let current = routes.remove(0);
+        routes.sort_by(|left, right| {
             left.transport_group_id
                 .cmp(&right.transport_group_id)
                 .then_with(|| left.endpoints.cmp(&right.endpoints))
         });
-    }
-    let mut index = 1;
-    while index < routes.len() {
-        if routes[..index].contains(&routes[index]) {
-            routes.remove(index);
-        } else {
-            index += 1;
-        }
+        routes.dedup();
+        routes.retain(|route| route != &current);
+        routes.insert(0, current);
     }
 }
 

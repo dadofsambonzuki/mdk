@@ -51,7 +51,7 @@ pub enum SubscriptionReplayRoute {
 }
 
 impl SubscriptionReplayRoute {
-    pub fn normalized_endpoints(&self) -> &[TransportEndpoint] {
+    fn normalized_endpoints(&self) -> &[TransportEndpoint] {
         match self {
             Self::Inbox {
                 normalized_endpoints,
@@ -70,8 +70,9 @@ impl SubscriptionReplayRoute {
 pub struct SubscriptionReplayGeneration([u8; GENERATION_BYTES]);
 
 impl SubscriptionReplayGeneration {
+    #[cfg(test)]
     #[must_use]
-    pub fn from_bytes(bytes: [u8; GENERATION_BYTES]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; GENERATION_BYTES]) -> Self {
         Self(bytes)
     }
 
@@ -159,7 +160,8 @@ struct RawObligation {
 impl SqliteAccountStorage {
     /// Atomically prepare or widen every supplied route. Existing exact route
     /// identities retain their generation. The result follows input order.
-    pub fn prepare_subscription_replay_obligations(
+    #[cfg(test)]
+    pub(crate) fn prepare_subscription_replay_obligations(
         &self,
         preparations: &[SubscriptionReplayPreparation],
     ) -> StorageResult<Vec<SubscriptionReplayObligation>> {
@@ -224,7 +226,8 @@ impl SqliteAccountStorage {
 
     /// Retire exact generations after authoritative route removal. The batch
     /// is all-or-nothing; a stale/missing generation rejects every retirement.
-    pub fn retire_subscription_replay_obligations(
+    #[cfg(test)]
+    pub(crate) fn retire_subscription_replay_obligations(
         &self,
         generations: &[SubscriptionReplayGeneration],
     ) -> StorageResult<usize> {

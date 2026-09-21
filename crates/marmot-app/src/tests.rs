@@ -12561,6 +12561,15 @@ fn durable_delivery_overflow_marker_forces_unfloored_account_reopen() {
                 .is_none(),
             "the durable marker clears only after the recovery replay reaches EOSE"
         );
+        assert!(
+            reopened
+                .account_storage("alice")
+                .unwrap()
+                .subscription_replay_obligations()
+                .unwrap()
+                .is_empty(),
+            "overflow recovery must retry the frozen replay clear after removing its marker"
+        );
         let health = reopened.relay_plane.relay_health().await;
         assert_eq!(health.account_delivery_recovery_attempts, 1);
         assert_eq!(health.account_delivery_recovery_successes, 1);

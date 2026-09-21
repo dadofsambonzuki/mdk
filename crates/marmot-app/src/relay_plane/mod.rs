@@ -19,7 +19,7 @@ use nostr_sdk::prelude::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
@@ -2622,7 +2622,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             inbox_endpoints: activation.inbox_endpoints.clone(),
             since,
         });
-        let mut previous = self.incremental_activation.lock().await;
+        let mut previous = self.incremental_activation.clone().lock_owned().await;
         let reuse = incremental.is_some()
             && *previous == incremental
             && self.account_subscription_eose().await.complete();
@@ -2630,22 +2630,50 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         // unconditional orphan-REQ cleanup. None always requests full history.
         *previous = None;
         let adapter = &self.relay_plane.inner.transport.adapter;
-        let result = if reuse {
-            adapter
+        if reuse {
+            let result = adapter
                 .sync_account_groups(TransportGroupSync {
                     account_id: activation.account_id,
                     group_subscriptions: activation.group_subscriptions,
                     since: activation.since,
                 })
-                .await
-        } else {
-            adapter.activate_account(activation).await
-        };
+                .await;
+            self.publish_registration_snapshot_for(desired_status, None)
+                .await;
+            if result.is_ok() {
+                *previous = incremental;
+            }
+            return result;
+        }
+
+        // Keep the relay-plane lifecycle lock in a detached cancellation guard.
+        // The transport adapter owns its own matching guard; waiting for a
+        // second deactivation therefore serializes behind its route cleanup.
+        // Mark the host-facing snapshot inactive before releasing this outer
+        // lock so a replacement activation cannot race the cleanup publish.
+        let (activation_complete, activation_abandoned) =
+            oneshot::channel::<Option<IncrementalActivation>>();
+        let cleanup_transport = Arc::clone(&self.relay_plane.inner.transport);
+        let cleanup_statuses = self.relay_plane.inner.transport_statuses.clone();
+        let cleanup_account_id = self.account_id.clone();
+        tokio::spawn(async move {
+            match activation_abandoned.await {
+                Ok(next_activation) => *previous = next_activation,
+                Err(_) => {
+                    let _ = cleanup_transport
+                        .adapter
+                        .deactivate_account(&cleanup_account_id)
+                        .await;
+                    cleanup_statuses.mark_inactive(&cleanup_account_id);
+                }
+            }
+        });
+
+        let result = adapter.activate_account(activation).await;
         self.publish_registration_snapshot_for(desired_status, None)
             .await;
-        if result.is_ok() {
-            *previous = incremental;
-        }
+        let next_activation = if result.is_ok() { incremental } else { None };
+        let _ = activation_complete.send(next_activation);
         result
     }
 

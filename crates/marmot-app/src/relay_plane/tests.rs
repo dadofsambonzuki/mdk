@@ -791,6 +791,53 @@ async fn group_sync_publishes_only_the_finalized_registration_snapshot() {
 }
 
 #[tokio::test]
+async fn cancelled_reactivation_marks_transport_status_inactive_after_cleanup() {
+    let relay = Arc::new(RecordingRelayClient {
+        exact_registration: true,
+        ..RecordingRelayClient::default()
+    });
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD8; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+    let activation = || TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint::from("wss://inbox.example")],
+        group_subscriptions: Vec::new(),
+        since: None,
+    };
+
+    adapter.activate_account(activation()).await.unwrap();
+    assert_eq!(
+        relay_plane.account_transport_status(&account_id).state,
+        crate::AccountTransportState::Available
+    );
+
+    relay.block_next_registration.store(true, Ordering::SeqCst);
+    let registration_started = relay.registration_started.notified();
+    let reactivation = tokio::spawn({
+        let adapter = adapter.clone();
+        let activation = activation();
+        async move { adapter.activate_account(activation).await }
+    });
+    registration_started.await;
+    reactivation.abort();
+    assert!(reactivation.await.unwrap_err().is_cancelled());
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if relay_plane.account_transport_status(&account_id).state
+                == crate::AccountTransportState::Inactive
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled activation cleanup must retire a stale available snapshot");
+}
+
+#[tokio::test]
 async fn mixed_inbox_admission_keeps_damus_and_reports_exclusions() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());

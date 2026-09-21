@@ -732,12 +732,17 @@ impl AppClient {
         if fences.is_empty() {
             return Ok(false);
         }
-        let cleared = matches!(
-            storage.clear_subscription_replay_obligations(&self.state.label, &fences)?,
-            storage_sqlite::SubscriptionReplayClearResult::Cleared { .. }
-        );
-        self.subscription_replay_snapshot.clear();
-        Ok(cleared)
+        match storage.clear_subscription_replay_obligations(&self.state.label, &fences)? {
+            storage_sqlite::SubscriptionReplayClearResult::Cleared { .. } => {
+                self.subscription_replay_snapshot.clear();
+                Ok(true)
+            }
+            storage_sqlite::SubscriptionReplayClearResult::StaleGeneration => {
+                self.subscription_replay_snapshot.clear();
+                Ok(false)
+            }
+            storage_sqlite::SubscriptionReplayClearResult::DeliveryOverflowPending => Ok(false),
+        }
     }
 
     /// Persist a host connectivity-restored edge into every exact fanout whose
@@ -1265,12 +1270,9 @@ impl AppClient {
                 .adapter
                 .reconcile_pending_registrations(next_retry_delay)
                 .await;
-            if self.pending_transport_registration_retry {
-                return Ok(true);
-            }
         }
         if !self.pending_runtime_group_subscription_refresh {
-            return Ok(false);
+            return Ok(self.pending_transport_registration_retry);
         }
         if let Err(error) = self.sync_runtime_groups().await {
             if error.is_account_not_active() {
@@ -2149,9 +2151,31 @@ impl AppClient {
                 self.adapter.finish_delivery_overflow_recovery(attempt)
         {
             match self.clear_delivery_overflow_recovery(attempt.marker_token) {
-                Ok(true) => self
-                    .adapter
-                    .record_delivery_overflow_recovery_success(recovery_elapsed_ms),
+                Ok(true) => match self.clear_completed_subscription_replay_obligations() {
+                    Ok(true) => {
+                        self.adapter.mark_subscription_replay_complete();
+                        self.adapter
+                            .record_delivery_overflow_recovery_success(recovery_elapsed_ms);
+                    }
+                    Ok(false) => {
+                        self.adapter.fail_delivery_overflow_recovery();
+                        return Err(ClassifiedSyncFailure::at_stage(
+                            summary,
+                            AppError::Transport(cgka_traits::TransportAdapterError::Other(
+                                "subscription replay generation advanced".to_owned(),
+                            )),
+                            SyncFailureStage::RelayReceive,
+                        ));
+                    }
+                    Err(source) => {
+                        self.adapter.fail_delivery_overflow_recovery();
+                        return Err(ClassifiedSyncFailure::at_stage(
+                            summary,
+                            source,
+                            SyncFailureStage::StatePersist,
+                        ));
+                    }
+                },
                 Ok(false) => {
                     self.adapter.fail_delivery_overflow_recovery();
                     return Err(ClassifiedSyncFailure::at_stage(
@@ -5743,6 +5767,57 @@ mod runtime_group_subscription_refresh_tests {
                 .unwrap()
         );
         assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    #[tokio::test]
+    async fn pending_registration_does_not_starve_an_armed_group_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "registration and refresh",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &AppPerformanceTelemetry::default(),
+            )
+            .await
+            .unwrap();
+
+        relay.fail_next_subscribe();
+        let mut summary = SyncSummary::default();
+        assert!(
+            client
+                .checkpoint_sync_prefix(&mut summary, true, 0)
+                .await
+                .is_ok(),
+            "the isolated registration failure must preserve progress"
+        );
+        assert!(client.pending_transport_registration_retry);
+        // Model the independent durable-delivery edge arming a group rebuild
+        // while an older registration retry remains outstanding.
+        client.pending_runtime_group_subscription_refresh = true;
+        assert!(client.pending_runtime_group_subscription_refresh);
+
+        relay.set_fail_all_subscribes(true);
+        assert!(
+            client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap(),
+            "the failed registration remains scheduled"
+        );
+        assert!(client.pending_transport_registration_retry);
+        assert!(
+            !client.pending_runtime_group_subscription_refresh,
+            "the independent group refresh must run even while registration work stays pending"
+        );
     }
 
     /// The drained seam's subscription rebuild owes the same retry edge.
