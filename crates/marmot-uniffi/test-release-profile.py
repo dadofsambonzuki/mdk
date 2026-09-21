@@ -920,6 +920,12 @@ class ReleaseProfileTests(unittest.TestCase):
                 self.assertIn("embed-bitcode=no", row["darwin_rustflags"] or "")
                 self.assertIn("link-arg=-mmacosx-version-min=", row["darwin_rustflags"] or "")
         self.assertEqual(len(generate), 1)
+        # On Apple Silicon the host and distribution target share a triple.
+        # Cargo applies target rustflags even without --target, so exporting
+        # embed-bitcode=no globally breaks the thin-LTO bindgen executable.
+        host_commands = [row for row in records if "--target" not in row["argv"]]
+        for row in host_commands:
+            self.assertNotIn("embed-bitcode=no", row["darwin_rustflags"] or "")
         self.assertTrue((crate / extras["output"]).exists())
 
     def test_profile_workflow_is_non_publishing(self):

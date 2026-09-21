@@ -30,9 +30,10 @@ export CXXFLAGS_aarch64_apple_darwin="${CXXFLAGS_aarch64_apple_darwin:--mmacosx-
 # Target-scoped rather than RUSTFLAGS on purpose. Cargo treats a RUSTFLAGS env
 # var as replacing `[build] rustflags` from .cargo/config.toml rather than
 # merging with it, so a workspace-wide flag added later would be silently
-# dropped for this build alone. Scoping also keeps the flag off the host dylib
-# build below, whose target/release fingerprint is shared with xcframework.sh.
-export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -C embed-bitcode=no"
+# dropped for this build alone. Apply this only to the archive invocation:
+# on Apple Silicon the host has the same triple, and exporting it would also
+# pass embed-bitcode=no to the thin-LTO uniffi-bindgen executable.
+MACOS_ARCHIVE_RUSTFLAGS="${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS:+$CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS }-C link-arg=-mmacosx-version-min=${MACOSX_DEPLOYMENT_TARGET} -C embed-bitcode=no"
 
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Keep production release behavior and debug-symbol policy in one source of truth.
@@ -83,7 +84,8 @@ cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 # but passing --target keeps it in its own target dir and makes the
 # deployment-target flags apply, so keep it explicit.
 echo "==> Building macOS target ($MACOS_TARGET)"
-cargo build --release -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="$MACOS_ARCHIVE_RUSTFLAGS" \
+  cargo build --release -p "$CRATE_NAME" --target "$MACOS_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Generating Swift bindings"
 cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
