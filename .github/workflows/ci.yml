@@ -495,8 +495,9 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
-      - name: Test consent and both diagnostic exporters
+      - name: Test feature-gated diagnostics
         run: |
+          cargo test -p marmot-app --features audit-delivery --lib audit_delivery:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --test relay_telemetry_otlp --locked

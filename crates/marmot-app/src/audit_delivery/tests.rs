@@ -65,6 +65,40 @@ fn j02_acknowledged_prefix_is_not_resent() {
 }
 
 #[test]
+fn registration_is_refused_while_a_prepared_range_is_pending() {
+    let (root, journal, _segment, mut store) = store_with_segment(b"one\n");
+    store.prepare_next().unwrap().unwrap();
+    let second = SegmentId::generate();
+    fs_private::write_private(&store.segment_path(&second).unwrap(), b"two\n").unwrap();
+    assert!(matches!(
+        store.register_segment(second, SegmentStatus::Sealed),
+        Err(AuditDeliveryError::PreparationPending)
+    ));
+
+    drop(store);
+    let mut reopened = reopen(&root, &journal);
+    let prepared = reopened.recover_prepared().unwrap().unwrap();
+    reopened.acknowledge(prepared.token()).unwrap();
+}
+
+#[test]
+fn sealing_allows_the_next_active_segment_to_be_registered() {
+    let (_root, _journal, first, mut store) = store_with_segment(b"one\n");
+    store.seal_active_segment(&first).unwrap();
+    let second = SegmentId::generate();
+    fs_private::write_private(&store.segment_path(&second).unwrap(), b"two\n").unwrap();
+    store
+        .register_segment(second, SegmentStatus::Active)
+        .unwrap();
+
+    let first_range = store.prepare_next().unwrap().unwrap();
+    assert_eq!(first_range.bodies(), &[b"one".to_vec()]);
+    store.acknowledge(first_range.token()).unwrap();
+    let second_range = store.prepare_next().unwrap().unwrap();
+    assert_eq!(second_range.bodies(), &[b"two".to_vec()]);
+}
+
+#[test]
 fn j03_j04_reopen_recovers_prepare_and_durable_ack() {
     let (root, journal, _segment, mut store) = store_with_segment(b"one\ntwo\n");
     let prepared = store.prepare_next().unwrap().unwrap();
@@ -90,7 +124,10 @@ fn j05_j06_publication_faults_preserve_recoverable_state_and_fence_uncertainty()
 
     let (root, journal, _segment, mut store) = store_with_segment(b"one\n");
     store.fail_next(FaultPoint::DirectorySync);
-    assert!(store.prepare_next().is_err());
+    assert!(matches!(
+        store.prepare_next(),
+        Err(AuditDeliveryError::UncertainPublication { .. })
+    ));
     assert!(matches!(
         store.prepare_next(),
         Err(AuditDeliveryError::RecoveryRequired)
@@ -266,6 +303,36 @@ fn j09_middle_change_in_prepared_range_is_detected() {
     .unwrap();
     assert!(matches!(
         store.recover_prepared(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
+fn prepared_range_must_start_at_the_current_cursor() {
+    let (root, journal, segment, mut store) = store_with_segment(b"one\n");
+    let first = store.prepare_next().unwrap().unwrap();
+    store.acknowledge(first.token()).unwrap();
+    append(&store, &segment, b"two\n");
+    store.prepare_next().unwrap().unwrap();
+    drop(store);
+
+    let state_path = root
+        .path()
+        .join("audit-delivery/v1")
+        .join(journal.as_str())
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let mut digest = Sha256::new();
+    digest.update(3_u64.to_be_bytes());
+    digest.update(b"one");
+    state["prepared"]["start_offset"] = serde_json::json!(0);
+    state["prepared"]["end_offset"] = serde_json::json!(4);
+    state["prepared"]["ordered_body_digest"] = serde_json::json!(hex::encode(digest.finalize()));
+    fs_private::write_private(&state_path, &serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
         Err(AuditDeliveryError::CorruptState)
     ));
 }

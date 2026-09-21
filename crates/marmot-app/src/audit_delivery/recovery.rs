@@ -43,6 +43,11 @@ impl Faults {
                 *remaining -= 1;
             } else {
                 self.next = None;
+                if point == FaultPoint::DirectorySync {
+                    return Err(AuditDeliveryError::UncertainPublication {
+                        source: io::Error::other("injected audit-delivery fault"),
+                    });
+                }
                 return Err(AuditDeliveryError::Filesystem {
                     operation: point.operation(),
                     source: io::Error::other("injected audit-delivery fault"),
@@ -178,7 +183,7 @@ pub(super) fn open_segment_read(path: &Path) -> Result<File, AuditDeliveryError>
 }
 
 pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, AuditDeliveryError> {
-    let mut file = open_regular_read(path)?;
+    let file = open_regular_read(path)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -190,11 +195,15 @@ pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, AuditDeliveryError> {
         return Err(AuditDeliveryError::MetadataTooLarge);
     }
     let mut bytes = Vec::with_capacity(length as usize);
-    file.read_to_end(&mut bytes)
+    file.take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|source| AuditDeliveryError::Filesystem {
             operation: "read metadata file",
             source,
         })?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(AuditDeliveryError::MetadataTooLarge);
+    }
     Ok(bytes)
 }
 
@@ -230,10 +239,7 @@ pub(super) fn atomic_replace(
             source,
         })?;
         faults.check(FaultPoint::DirectorySync)?;
-        sync_directory(parent).map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "sync metadata directory",
-            source,
-        })
+        sync_directory(parent).map_err(|source| AuditDeliveryError::UncertainPublication { source })
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

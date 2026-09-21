@@ -21,6 +21,7 @@ const SEGMENTS_DIR: &str = "segments";
 const MAX_SEGMENTS: usize = 256;
 const MAX_RECORDS_PER_RANGE: usize = 8;
 const MAX_RANGE_BYTES: usize = 1024 * 1024;
+const BOUNDARY_DIGEST_BYTES: u64 = 64 * 1024;
 pub(super) const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +222,11 @@ pub enum AuditDeliveryError {
     Closed,
     #[error("audit-delivery owner requires reopen recovery")]
     RecoveryRequired,
+    #[error("audit-delivery metadata publication has uncertain durability")]
+    UncertainPublication {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not allocate a private staging file")]
     TemporaryNameExhausted,
     #[error("audit-delivery filesystem operation failed: {operation}")]
@@ -280,6 +286,9 @@ struct PreparedState {
     prepared_revision: u64,
 }
 
+// Reserved by the v1 handoff for later durable gap counters. PR1 writes only
+// `Clean`: after an uncertain directory sync it must fence in memory and reopen
+// the observable old/new document instead of attempting a second publication.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthState {
@@ -444,6 +453,9 @@ impl AuditDeliveryStore {
         status: SegmentStatus,
     ) -> Result<(), AuditDeliveryError> {
         self.ensure_mutable()?;
+        if self.state.prepared.is_some() {
+            return Err(AuditDeliveryError::PreparationPending);
+        }
         if self.manifest.segments.len() >= MAX_SEGMENTS {
             return Err(AuditDeliveryError::SegmentLimit);
         }
@@ -464,7 +476,7 @@ impl AuditDeliveryStore {
             return Err(AuditDeliveryError::InvalidSegmentOrder);
         }
         let path = self.segment_path(&segment_id)?;
-        let (length, digest) = file_length_and_digest(&path, None)?;
+        let (length, digest) = file_length_and_digest(&path)?;
         let relative_name = format!("{SEGMENTS_DIR}/{}.jsonl", segment_id.as_str());
         let mut manifest = self.manifest.clone();
         manifest.segments.push(SegmentEntry {
@@ -492,6 +504,42 @@ impl AuditDeliveryStore {
         Ok(())
     }
 
+    /// Seal the current active segment after its writer has stopped appending.
+    ///
+    /// This only publishes the final payload identity in the manifest. Recorder
+    /// rotation and lifecycle ownership remain outside this inactive foundation.
+    pub fn seal_active_segment(
+        &mut self,
+        segment_id: &SegmentId,
+    ) -> Result<(), AuditDeliveryError> {
+        self.ensure_mutable()?;
+        if self.state.prepared.is_some() {
+            return Err(AuditDeliveryError::PreparationPending);
+        }
+        let entry = self.segment(segment_id)?;
+        if entry.status != SegmentStatus::Active
+            || self.manifest.segments.last().map(|entry| &entry.segment_id) != Some(segment_id)
+        {
+            return Err(AuditDeliveryError::InvalidSegmentOrder);
+        }
+        let path = self.root.join(&entry.relative_name);
+        let (length, digest) = file_length_and_digest(&path)?;
+        let file = open_segment_read(&path)?;
+        validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
+
+        let mut manifest = self.manifest.clone();
+        let entry = manifest
+            .segments
+            .last_mut()
+            .ok_or(AuditDeliveryError::MissingSegment)?;
+        entry.status = SegmentStatus::Sealed;
+        entry.registered_length = length;
+        entry.registered_digest = hex::encode(digest);
+        self.publish_manifest_value(&manifest)?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
     /// Prepare the next bounded complete-line range, or return `None` when no
     /// complete new line is available. An existing unresolved range must be
     /// recovered with [`Self::recover_prepared`] first.
@@ -504,8 +552,7 @@ impl AuditDeliveryStore {
             let cursor = self.cursor(&entry.segment_id)?;
             let path = self.root.join(&entry.relative_name);
             let mut file = open_segment_read(&path)?;
-            validate_registered_prefix(&file, entry)?;
-            validate_acknowledged_prefix(&file, cursor)?;
+            validate_acknowledged_boundary(&file, cursor)?;
             let (bodies, end_offset) =
                 read_complete_range(&mut file, cursor.acknowledged_end, None)?;
             if bodies.is_empty() {
@@ -569,10 +616,10 @@ impl AuditDeliveryStore {
             return Ok(None);
         };
         validate_single_component(&prepared.attempt_id)?;
+        self.validate_prepared_cursor(&prepared)?;
         let entry = self.segment(&prepared.segment_id)?;
         let path = self.root.join(&entry.relative_name);
         let mut file = open_segment_read(&path)?;
-        validate_registered_prefix(&file, entry)?;
         let (bodies, end_offset) =
             read_complete_range(&mut file, prepared.start_offset, Some(prepared.end_offset))?;
         if end_offset != prepared.end_offset
@@ -595,6 +642,7 @@ impl AuditDeliveryStore {
             .prepared
             .clone()
             .ok_or(AuditDeliveryError::StaleToken)?;
+        self.validate_prepared_cursor(&prepared)?;
         if token.owner_epoch != self.owner_epoch
             || token.journal_id != self.state.journal_id
             || token.destination_profile != self.state.destination_profile
@@ -607,11 +655,8 @@ impl AuditDeliveryStore {
         // Re-verify the complete in-flight bytes immediately before advancing.
         self.recover_prepared()?;
         let entry = self.segment(&prepared.segment_id)?;
-        let prefix_digest = file_length_and_digest(
-            &self.root.join(&entry.relative_name),
-            Some(prepared.end_offset),
-        )?
-        .1;
+        let file = open_segment_read(&self.root.join(&entry.relative_name))?;
+        let boundary_digest = digest_boundary(&file, prepared.end_offset)?;
         let mut state = self.state.clone();
         state.revision = next_revision(state.revision)?;
         let cursor = state
@@ -620,7 +665,7 @@ impl AuditDeliveryStore {
             .find(|cursor| cursor.segment_id == prepared.segment_id)
             .ok_or(AuditDeliveryError::IncompleteState)?;
         cursor.acknowledged_end = prepared.end_offset;
-        cursor.boundary_digest = hex::encode(prefix_digest);
+        cursor.boundary_digest = hex::encode(boundary_digest);
         state.prepared = None;
         self.publish_state_value(&state)?;
         self.state = state;
@@ -676,7 +721,7 @@ impl AuditDeliveryStore {
             let cursor = self.cursor(&entry.segment_id)?;
             let file = open_segment_read(&self.root.join(&entry.relative_name))?;
             validate_registered_prefix(&file, entry)?;
-            validate_acknowledged_prefix(&file, cursor)?;
+            validate_acknowledged_boundary(&file, cursor)?;
         }
         match self.state.health.status {
             HealthStatus::Clean => {}
@@ -685,6 +730,18 @@ impl AuditDeliveryStore {
         }
         if self.state.prepared.is_some() {
             self.recover_prepared()?;
+        }
+        Ok(())
+    }
+
+    fn validate_prepared_cursor(&self, prepared: &PreparedState) -> Result<(), AuditDeliveryError> {
+        let cursor = self.cursor(&prepared.segment_id)?;
+        if prepared.start_offset != cursor.acknowledged_end
+            || prepared.end_offset <= prepared.start_offset
+            || prepared.end_offset - prepared.start_offset > MAX_RANGE_BYTES as u64
+            || prepared.prepared_revision != self.state.revision
+        {
+            return Err(AuditDeliveryError::CorruptState);
         }
         Ok(())
     }
@@ -725,18 +782,7 @@ impl AuditDeliveryStore {
     }
 
     fn publish_manifest_value(&mut self, manifest: &Manifest) -> Result<(), AuditDeliveryError> {
-        let bytes = encode_metadata(manifest)?;
-        let result = atomic_replace(&self.root.join(MANIFEST_FILE), &bytes, &mut self.faults);
-        if matches!(
-            result,
-            Err(AuditDeliveryError::Filesystem {
-                operation: "sync metadata directory",
-                ..
-            })
-        ) {
-            self.recovery_required = true;
-        }
-        result
+        self.publish_metadata(MANIFEST_FILE, manifest)
     }
 
     fn publish_state(&mut self) -> Result<(), AuditDeliveryError> {
@@ -745,15 +791,17 @@ impl AuditDeliveryStore {
     }
 
     fn publish_state_value(&mut self, state: &DurableState) -> Result<(), AuditDeliveryError> {
-        let bytes = encode_metadata(state)?;
-        let result = atomic_replace(&self.root.join(STATE_FILE), &bytes, &mut self.faults);
-        if matches!(
-            result,
-            Err(AuditDeliveryError::Filesystem {
-                operation: "sync metadata directory",
-                ..
-            })
-        ) {
+        self.publish_metadata(STATE_FILE, state)
+    }
+
+    fn publish_metadata(
+        &mut self,
+        file_name: &str,
+        value: &impl Serialize,
+    ) -> Result<(), AuditDeliveryError> {
+        let bytes = encode_metadata(value)?;
+        let result = atomic_replace(&self.root.join(file_name), &bytes, &mut self.faults);
+        if matches!(result, Err(AuditDeliveryError::UncertainPublication { .. })) {
             self.recovery_required = true;
         }
         result
@@ -821,11 +869,8 @@ fn next_revision(revision: u64) -> Result<u64, AuditDeliveryError> {
         .ok_or(AuditDeliveryError::CorruptState)
 }
 
-fn file_length_and_digest(
-    path: &Path,
-    prefix: Option<u64>,
-) -> Result<(u64, [u8; 32]), AuditDeliveryError> {
-    let mut file = open_segment_read(path)?;
+fn file_length_and_digest(path: &Path) -> Result<(u64, [u8; 32]), AuditDeliveryError> {
+    let file = open_segment_read(path)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -833,37 +878,10 @@ fn file_length_and_digest(
             source,
         })?
         .len();
-    let wanted = prefix.unwrap_or(length);
-    if wanted > length {
-        return Err(AuditDeliveryError::CorruptState);
-    }
-    let mut remaining = wanted;
-    let mut buffer = [0u8; 16 * 1024];
-    let mut hasher = Sha256::new();
-    while remaining > 0 {
-        let amount = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| AuditDeliveryError::CorruptState)?;
-        file.read_exact(&mut buffer[..amount]).map_err(|source| {
-            AuditDeliveryError::Filesystem {
-                operation: "read payload segment",
-                source,
-            }
-        })?;
-        hasher.update(&buffer[..amount]);
-        remaining -= amount as u64;
-    }
-    Ok((length, hasher.finalize().into()))
+    Ok((length, digest_range(&file, 0, length)?))
 }
 
 fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {
-    let mut file = file
-        .try_clone()
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "clone payload handle",
-            source,
-        })?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| AuditDeliveryError::CorruptState)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -874,35 +892,16 @@ fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), A
     if length < entry.registered_length {
         return Err(AuditDeliveryError::CorruptState);
     }
-    let mut remaining = entry.registered_length;
-    let mut buffer = [0u8; 16 * 1024];
-    let mut hasher = Sha256::new();
-    while remaining > 0 {
-        let amount = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| AuditDeliveryError::CorruptState)?;
-        file.read_exact(&mut buffer[..amount])
-            .map_err(|_| AuditDeliveryError::CorruptState)?;
-        hasher.update(&buffer[..amount]);
-        remaining -= amount as u64;
-    }
-    if hex::encode(hasher.finalize()) != entry.registered_digest {
+    if hex::encode(digest_range(file, 0, entry.registered_length)?) != entry.registered_digest {
         return Err(AuditDeliveryError::CorruptState);
     }
     Ok(())
 }
 
-fn validate_acknowledged_prefix(
+fn validate_acknowledged_boundary(
     file: &File,
     cursor: &SegmentCursor,
 ) -> Result<(), AuditDeliveryError> {
-    let mut file = file
-        .try_clone()
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "clone acknowledged payload handle",
-            source,
-        })?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| AuditDeliveryError::CorruptState)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -913,21 +912,45 @@ fn validate_acknowledged_prefix(
     if cursor.acknowledged_end > length {
         return Err(AuditDeliveryError::CorruptState);
     }
-    let mut hasher = Sha256::new();
-    let mut remaining = cursor.acknowledged_end;
-    let mut buffer = [0u8; 16 * 1024];
-    while remaining > 0 {
-        let amount = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| AuditDeliveryError::CorruptState)?;
-        file.read_exact(&mut buffer[..amount])
-            .map_err(|_| AuditDeliveryError::CorruptState)?;
-        hasher.update(&buffer[..amount]);
-        remaining -= amount as u64;
-    }
-    if hex::encode(hasher.finalize()) != cursor.boundary_digest {
+    if hex::encode(digest_boundary(file, cursor.acknowledged_end)?) != cursor.boundary_digest {
         return Err(AuditDeliveryError::CorruptState);
     }
     Ok(())
+}
+
+fn digest_boundary(file: &File, end: u64) -> Result<[u8; 32], AuditDeliveryError> {
+    let start = end.saturating_sub(BOUNDARY_DIGEST_BYTES);
+    digest_range(file, start, end - start)
+}
+
+fn digest_range(file: &File, start: u64, length: u64) -> Result<[u8; 32], AuditDeliveryError> {
+    let mut file = file
+        .try_clone()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "clone payload digest handle",
+            source,
+        })?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "seek payload digest range",
+            source,
+        })?;
+    let mut remaining = length;
+    let mut buffer = [0u8; 16 * 1024];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| AuditDeliveryError::CorruptState)?;
+        file.read_exact(&mut buffer[..amount]).map_err(|source| {
+            AuditDeliveryError::Filesystem {
+                operation: "read payload digest range",
+                source,
+            }
+        })?;
+        hasher.update(&buffer[..amount]);
+        remaining -= amount as u64;
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn read_complete_range(

@@ -64,6 +64,11 @@ App runtime bridge for the first real Marmot app surfaces.
   the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
   `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
   HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+- Keep the inactive, Rust-only audit journal delivery metadata foundation in `src/audit_delivery/`, behind the
+  off-by-default `audit-delivery` feature. It owns private manifests, cursor/preparation recovery, and synthetic segment
+  tests only; it must not reuse the lossy audit-upload checkpoint, create audit bodies, wire runtime ownership, send
+  network requests, expose bindings, or delete payloads until the corresponding integration PR explicitly adds those
+  responsibilities. Keep its feature-gated tests in `just test` and the GitHub feature-test job.
 - Record into distinct v4 files and upload only strictly validated v4 snapshots. Never migrate or send v1-v3
   or key-reveal files. Reject removed/unknown fields and duplicate keys before HTTP; cache ineligible file verdicts
   by size and mtime without retry cooldowns. On exclusive-root startup, `audit_log/legacy_cleanup.rs` deletes
