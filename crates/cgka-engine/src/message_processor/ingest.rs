@@ -6,6 +6,7 @@
 //! typed outcomes. `Err` is reserved for storage, peeler, serialization, and
 //! unclassified OpenMLS failures.
 
+use super::store::RowEpochs;
 use super::{DeferredPeelPayloadPreparationError, content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
@@ -564,7 +565,22 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
         if !self.epoch_manager.can_ingest(&group_id) {
-            self.persist_transport_message(msg, &group_id, current_epoch, MessageState::Retryable)?;
+            // No peel happened, so nobody opened these bytes: the row stays the
+            // only redelivery source, which is why no caller may read this
+            // `Buffered` as licence to retire it (AGENTS.md, "a `Buffered`
+            // outcome never lets the caller retire the wrapper"). Write-once for
+            // the same reason `retain_transport_message_refused_while_removed`
+            // is: internal replay re-enters ingest below the durable dedup seam,
+            // and re-stamping a `PeelDeferred` row `Retryable` would drop its
+            // deferred-peel lifecycle and leak its flood-cap slot (mdk#339).
+            if !self.raw_transport_row_awaiting_retry(&msg.id)? {
+                self.persist_transport_message(
+                    msg,
+                    &group_id,
+                    current_epoch,
+                    MessageState::Retryable,
+                )?;
+            }
             self.return_unmodified_mls_group(&group_id, mls_group);
             return reported(IngestOutcome::Buffered {
                 group_id,
@@ -935,6 +951,11 @@ impl<S: StorageProvider> Engine<S> {
             // marker pool so a later restart can short-circuit before peel.
             self.storage
                 .put_processed_transport_id(&group_id, &raw_msg_id)?;
+            // This wrapper is one of the arbitrarily many re-wraps a member can
+            // mint for the same MLS bytes, and the content record already
+            // stands for them. See AGENTS.md, "a `Buffered` outcome never lets
+            // the caller retire the wrapper".
+            self.retire_raw_wrapper(&raw_msg_id, &content_id, "content_record_already_durable")?;
             return reported(outcome);
         }
         if self.seen_message_ids.contains(&content_id) {
@@ -1084,7 +1105,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: if recovered_from_candidate_branch {
                         "recovered_under_candidate_branch"
@@ -1153,7 +1174,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
@@ -1166,7 +1187,7 @@ impl<S: StorageProvider> Engine<S> {
                 &openmls_msg,
                 msg,
                 &raw_msg_id,
-                current_epoch,
+                msg_epoch,
                 ConvergenceHandoff {
                     wrapper_retirement_reason: "buffered_into_convergence",
                     drain: sweep.drain_policy(),
@@ -1185,10 +1206,19 @@ impl<S: StorageProvider> Engine<S> {
         // which require the application to compute the resulting
         // AppDataDictionary before OpenMLS stages the commit.
         let processed = match self.storage.with_transaction(|_storage| {
-            self.persist_openmls_wire_message_with_processed_transport_id(
+            // A commit row's epoch is the epoch it forks from, and the
+            // `commit_should_enter_convergence` decision above left only
+            // past-epoch commits on this path. See the commit-row rule in
+            // `AGENTS.md`; the forensic row keeps reporting `current_epoch`.
+            let row_epoch = if msg_content_type == ContentType::Commit {
+                msg_epoch
+            } else {
+                current_epoch
+            };
+            self.persist_openmls_wire_message_with_processed_transport_id_at(
                 &openmls_msg,
                 &group_id,
-                current_epoch,
+                RowEpochs::row_at(row_epoch, current_epoch),
                 MessageState::Created,
                 &raw_msg_id,
             )?;
@@ -1199,6 +1229,12 @@ impl<S: StorageProvider> Engine<S> {
             })
         })? {
             Ok(p) => p,
+            // Every arm below transitions a row that may carry a commit's
+            // source epoch, so all of them report `current_epoch` explicitly:
+            // `update_stored_message_state`'s default would emit the row epoch.
+            // The success-path arms further down keep the plain form, because a
+            // commit `process_message` accepted was at the live epoch and an
+            // application row is persisted at `current_epoch`.
             Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
                 // Refine the historical classification (mdk#339):
                 // below either of this copy's floors the message was never
@@ -1222,7 +1258,13 @@ impl<S: StorageProvider> Engine<S> {
                         MessageDisposition::AppPayloadRetentionExpired.tag(),
                     ),
                 };
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                // The row may carry the message's own epoch; the forensic
+                // trail must not.
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current_epoch,
+                )?;
                 self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                 return reported(IngestOutcome::Stale { reason });
             }
@@ -1240,21 +1282,22 @@ impl<S: StorageProvider> Engine<S> {
                 if convergence_refused_for_missing_anchor {
                     // The retained content row is now the durable convergence
                     // witness for this rival and the group is scheduled for a
-                    // pass; a raw wrapper that arrived through the retry
-                    // lifecycle has done its job and leaves it the same way
-                    // the convergence-buffer path retires it.
-                    if raw_msg_id != msg.id {
-                        self.mark_raw_transport_message_processed_if_awaiting_retry(
-                            &raw_msg_id,
-                            "fork_rival_missing_retained_anchor",
-                        )?;
-                    }
+                    // pass.
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "fork_rival_missing_retained_anchor",
+                    )?;
                     return reported(
-                        self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, current)?,
+                        self.unadjudicable_fork_rival_without_anchor(group_id, &msg.id, msg_epoch)?,
                     );
                 }
 
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current,
+                )?;
                 return reported(IngestOutcome::Stale {
                     reason: StaleReason::AlreadyAtEpoch { current, msg_epoch },
                 });
@@ -1284,7 +1327,11 @@ impl<S: StorageProvider> Engine<S> {
                 // in-memory group the gate above already passed. Should it fire
                 // anyway, the content row stays `Failed` — and a later re-join's
                 // re-open, which takes raw transport rows only, leaves it there.
-                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Failed,
+                    current_epoch,
+                )?;
                 self.realize_self_eviction(&group_id, current_epoch)?;
                 return reported(IngestOutcome::LocalState {
                     state: LocalIngestState::Removed,
@@ -1298,6 +1345,15 @@ impl<S: StorageProvider> Engine<S> {
                     // Sender and membership-tag authentication can depend
                     // on a retained same-epoch parent. Try every retained
                     // branch before classifying the proposal as terminal.
+                    //
+                    // The pass below can report `Buffered`, so the wrapper is
+                    // retired here: see AGENTS.md, "a `Buffered` outcome never
+                    // lets the caller retire the wrapper".
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "parent_dependent_proposal_converged",
+                    )?;
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
                         .map_err(|error| EngineError::Backend(format!("converge: {error}")))?;
@@ -1318,7 +1374,11 @@ impl<S: StorageProvider> Engine<S> {
                         category,
                     )?);
                 }
-                self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
+                self.update_stored_message_state_reported_at(
+                    &msg.id,
+                    MessageState::Retryable,
+                    current_epoch,
+                )?;
                 return Err(EngineError::Backend(format!("process_message: {e:?}")));
             }
         };
@@ -1588,6 +1648,14 @@ impl<S: StorageProvider> Engine<S> {
                         mls_bytes.as_slice(),
                         commit_committer,
                         committer_index == mls_group.own_leaf_index(),
+                    )?;
+                    // The pass below can report `Buffered`, so the wrapper is
+                    // retired here: see AGENTS.md, "a `Buffered` outcome never
+                    // lets the caller retire the wrapper".
+                    self.retire_raw_wrapper(
+                        &raw_msg_id,
+                        &msg.id,
+                        "inbound_disband_candidate_converged",
                     )?;
                     let result = self
                         .converge_stored_openmls_messages(&group_id)
@@ -2526,15 +2594,12 @@ impl<S: StorageProvider> Engine<S> {
     /// be known; a device with a legitimate gap (`join_epoch == 0` legacy
     /// records defeat the pre-membership carve-out) is exactly the target.
     ///
-    /// Parking the rival `ConvergenceDeferred` keyed by `msg_epoch` was the same
-    /// defect one level down. That key is the row's `source_epoch`, and
-    /// `openmls_projection::historical_replay_start_epoch` takes the `min` over
-    /// unresolved rows to pick where a pass rewinds to — so the claimed epoch
-    /// would steer the convergence coordinator into its own
-    /// `MissingRetainedAnchor` halt on every later pass. The row this seam
-    /// leaves alone is the one ingest already persisted `Created` at
-    /// `current_epoch`: still retained, still pass-opening, but never a
-    /// historical rewind target chosen by an unauthenticated claim.
+    /// Parking the rival `ConvergenceDeferred` was the same defect one level
+    /// down: a durable disposition is a verdict, and this seam has none to
+    /// give. The row this seam leaves alone is the one ingest already persisted
+    /// `Created` — still retained, still pass-opening, and carrying the epoch
+    /// the rival forks from like every other commit row (see the persist site
+    /// above).
     ///
     /// # Retiring that row is the repair path's job, not this seam's
     ///
@@ -2563,7 +2628,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: GroupId,
         msg_id: &MessageId,
-        current: EpochId,
+        row_epoch: EpochId,
     ) -> Result<IngestOutcome, EngineError> {
         // `Buffered` promises a later replay of the retained row, and
         // applications open passes off `drain_pending_convergence_groups`, so
@@ -2579,7 +2644,7 @@ impl<S: StorageProvider> Engine<S> {
         );
         Ok(IngestOutcome::Buffered {
             group_id,
-            epoch: current,
+            epoch: row_epoch,
         })
     }
 
@@ -2705,13 +2770,17 @@ impl<S: StorageProvider> Engine<S> {
     /// transport wrapper that arrived through the deferred-peel retry lifecycle
     /// leaves that lifecycle here instead of being re-peeled on every later
     /// replay (mdk#339). No-op on the direct path, where no wrapper exists.
+    ///
+    /// `row_epoch` is what the convergence buffer stamps on that witness row —
+    /// the message's own MLS epoch — and is therefore what a `Buffered` verdict
+    /// here reports.
     fn buffer_openmls_message_into_convergence(
         &mut self,
         group_id: GroupId,
         openmls_msg: &TransportMessage,
         msg: &TransportMessage,
         raw_msg_id: &MessageId,
-        current_epoch: EpochId,
+        row_epoch: EpochId,
         handoff: ConvergenceHandoff<'_>,
     ) -> Result<IngestOutcome, EngineError> {
         let ConvergenceHandoff {
@@ -2726,19 +2795,14 @@ impl<S: StorageProvider> Engine<S> {
             Some(raw_msg_id),
         )
         .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
-        if raw_msg_id != &msg.id {
-            self.mark_raw_transport_message_processed_if_awaiting_retry(
-                raw_msg_id,
-                wrapper_retirement_reason,
-            )?;
-        }
+        self.retire_raw_wrapper(raw_msg_id, &msg.id, wrapper_retirement_reason)?;
         if drain == ConvergenceDrain::DeferredToCaller {
             // Durably buffered and awaiting the caller's single drain. There is
             // no verdict to report yet — by design: the point of deferring is
             // that no verdict be reached until the whole batch is in.
             return Ok(IngestOutcome::Buffered {
                 group_id,
-                epoch: current_epoch,
+                epoch: row_epoch,
             });
         }
         let result = self
@@ -2752,10 +2816,7 @@ impl<S: StorageProvider> Engine<S> {
             )
             .map_err(|e| EngineError::Backend(format!("converge: {e}")))?;
         Ok(convergence_ingest_outcome(
-            &result,
-            msg,
-            group_id,
-            current_epoch,
+            &result, msg, group_id, row_epoch,
         ))
     }
 

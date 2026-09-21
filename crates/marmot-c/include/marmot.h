@@ -169,6 +169,14 @@ enum MarmotStatus
   MARMOT_STATUS_CONVERSATION_WINDOW_PRESENTATION = 90,
   MARMOT_STATUS_MESSAGE_DRAFT_REVISION_CONFLICT = 91,
   MARMOT_STATUS_CONVERSATION_WINDOW_MESSAGE_NOT_RETAINED = 92,
+  /**
+   * The automatic acquisition API requires HostManaged configuration.
+   */
+  MARMOT_STATUS_ATTACHMENT_MODE_REQUIRED = 93,
+  /**
+   * A signed-out account cannot grant automatic network permission.
+   */
+  MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -795,6 +803,9 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_PAUSED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_REMOVED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_POLICY_BLOCKED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_PREVIOUSLY_ACQUIRED_UNAVAILABLE,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_COMPLETED_UNRETAINED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_EXHAUSTED,
 } MarmotAttachmentTransferState;
 
 typedef enum MarmotChatListView {
@@ -829,6 +840,11 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_NEXT,
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
+
+typedef enum MarmotAttachmentAcquisitionMode {
+  MARMOT_ATTACHMENT_ACQUISITION_MODE_NATIVE_AUTOMATIC,
+  MARMOT_ATTACHMENT_ACQUISITION_MODE_HOST_MANAGED,
+} MarmotAttachmentAcquisitionMode;
 
 typedef enum MarmotAttachmentControl {
   MARMOT_ATTACHMENT_CONTROL_CANCEL,
@@ -1213,6 +1229,10 @@ typedef struct MarmotClientOptions {
    * Optional callback store; NULL selects the platform keychain.
    */
   const struct MarmotSecretStore *store;
+  /**
+   * 0 = NativeAutomatic (default), 1 = HostManaged (initially denied).
+   */
+  uint32_t attachment_acquisition_mode;
 } MarmotClientOptions;
 
 /**
@@ -2029,6 +2049,23 @@ typedef struct MarmotAppQuarantinedGroupList {
 } MarmotAppQuarantinedGroupList;
 
 /**
+ * Durable local acceptance, not a relay acknowledgment.
+ */
+typedef struct MarmotLocalSendAcceptance {
+  char *client_token;
+  char *message_id_hex;
+} MarmotLocalSendAcceptance;
+
+/**
+ * Local submission status: 0 queued, 1 engine-owned, 2 completed, 3 rejected.
+ * Summary is present only for completed attempts; inspect its disposition.
+ */
+typedef struct MarmotLocalSendStatus {
+  uint32_t state;
+  struct MarmotSendSummary *summary;
+} MarmotLocalSendStatus;
+
+/**
  * Result of the per-group secure-delete sweep.
  */
 typedef struct MarmotSecureDeleteExpiredResult {
@@ -2549,6 +2586,16 @@ typedef struct MarmotChatListMessagePreview {
   struct MarmotMarkdownDocument content_tokens;
   uint64_t kind;
   uint64_t timeline_at;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
   bool deleted;
   enum MarmotDeletionSource deletion_source;
   bool has_attachment_kind;
@@ -3469,6 +3516,14 @@ typedef struct MarmotMediaUploadResult {
 } MarmotMediaUploadResult;
 
 /**
+ * Uploaded references and optional durable message acceptance.
+ */
+typedef struct MarmotMediaUploadSubmission {
+  struct MarmotMediaUploadResult upload;
+  struct MarmotLocalSendAcceptance *acceptance;
+} MarmotMediaUploadSubmission;
+
+/**
  * Result of `marmot_download_media`: decrypted plaintext plus its
  * metadata.
  */
@@ -3668,6 +3723,7 @@ typedef struct MarmotTimelineMessageRecord {
    * for delivered messages.
    */
   char *invalidation_status;
+  char *client_token;
 } MarmotTimelineMessageRecord;
 
 /**
@@ -5063,6 +5119,21 @@ typedef struct MarmotAttachmentDownloadPolicyInput {
   uint64_t transfer_limit;
 } MarmotAttachmentDownloadPolicyInput;
 
+typedef struct MarmotAutomaticAttachmentRequest {
+  struct MarmotAttachmentTransferStatus status;
+  bool newly_queued;
+} MarmotAutomaticAttachmentRequest;
+
+/**
+ * Borrowed runtime permission. All fields are boolean integers (nonzero = true).
+ */
+typedef struct MarmotAttachmentAutomaticPermissionInput {
+  uint8_t images;
+  uint8_t videos;
+  uint8_t audio;
+  uint8_t files;
+} MarmotAttachmentAutomaticPermissionInput;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -6394,6 +6465,54 @@ MarmotStatus marmot_send_text(const struct MarmotClient *client,
                               const char *group_id_hex,
                               const char *text,
                               struct MarmotSendSummary **out);
+
+/**
+ * Return durable local acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_send_text_with_client_token(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                const char *text,
+                                                const char *client_token,
+                                                struct MarmotLocalSendAcceptance **out);
+
+/**
+ * Return durable local reply acceptance, not relay delivery. Free with `marmot_local_send_acceptance_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_reply_to_message_with_client_token(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       const char *group_id_hex,
+                                                       const char *target_message_id,
+                                                       const char *text,
+                                                       const char *client_token,
+                                                       struct MarmotLocalSendAcceptance **out);
+
+/**
+ * Look up the retained local attempt status; completion may still await delivery. Free with `marmot_local_send_status_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_local_send_status(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const char *client_token,
+                                      struct MarmotLocalSendStatus **out);
 
 /**
  * Re-drive delivery/convergence for the group (e.g. a stuck pending
@@ -7896,6 +8015,18 @@ MarmotStatus marmot_upload_media(const struct MarmotClient *client,
                                  const char *group_id_hex,
                                  const struct MarmotMediaUploadRequest *request,
                                  struct MarmotMediaUploadResult **out);
+
+/**
+ * Upload and optionally admit a token-bound message. Free with marmot_media_upload_submission_free.
+ * # Safety
+ * Client and borrowed strings/request must be valid; out must be writable.
+ */
+MarmotStatus marmot_upload_media_with_client_token(const struct MarmotClient *client,
+                                                   const char *account_ref,
+                                                   const char *group_id_hex,
+                                                   const struct MarmotMediaUploadRequest *request,
+                                                   const char *client_token,
+                                                   struct MarmotMediaUploadSubmission **out);
 
 /**
  * Download, verify, and decrypt one attachment. Free with
@@ -9799,6 +9930,20 @@ MarmotStatus marmot_send_message_draft(const struct MarmotClient *client,
                                        struct MarmotSendSummary **out);
 
 /**
+ * Atomically consume a draft and admit its token-bound message locally.
+ * # Safety
+ * Client, account, token and revision must be valid; attachments readable for
+ * length (NULL allowed at zero); out writable. Free with marmot_local_send_acceptance_free.
+ */
+MarmotStatus marmot_send_message_draft_with_client_token(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const struct MarmotMessageDraftRevision *revision,
+                                                         const struct MarmotMediaAttachmentReference *attachments,
+                                                         uintptr_t attachments_len,
+                                                         const char *client_token,
+                                                         struct MarmotLocalSendAcceptance **out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -10352,6 +10497,36 @@ void marmot_group_recovery_status_free(struct MarmotGroupRecoveryStatus *ptr);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_local_send_acceptance_free(struct MarmotLocalSendAcceptance *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_media_upload_submission_free(struct MarmotMediaUploadSubmission *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_local_send_status_free(struct MarmotLocalSendStatus *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_group_maintenance_status_free(struct MarmotGroupMaintenanceStatus *ptr);
 
 /**
@@ -10886,6 +11061,47 @@ MarmotStatus marmot_attachment_transfer_snapshot(const struct MarmotClient *clie
                                                  const struct MarmotAttachmentLocalTarget *targets,
                                                  uintptr_t targets_len,
                                                  struct MarmotAttachmentTransferSnapshot **out);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_automatic_attachment_request_free(struct MarmotAutomaticAttachmentRequest *ptr);
+
+/**
+ * Revoke automatic permission and return a single-use generation.
+ * # Safety
+ * Client and account must be live, out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_begin_attachment_permission_update(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       char **out);
+
+/**
+ * Apply permission only for the current unused generation.
+ * # Safety
+ * Inputs must be live and permission nonnull, out writable. Inputs are borrowed.
+ */
+MarmotStatus marmot_set_attachment_automatic_permission(const struct MarmotClient *client,
+                                                        const char *account_ref,
+                                                        const char *generation,
+                                                        const struct MarmotAttachmentAutomaticPermissionInput *permission,
+                                                        bool *out);
+
+/**
+ * Idempotent automatic demand, preserving suppression, history and retry budget.
+ * # Safety
+ * Inputs must be live, target nonnull, out writable. Free the returned record.
+ */
+MarmotStatus marmot_request_automatic_attachment(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 const struct MarmotAttachmentLocalTarget *target,
+                                                 struct MarmotAutomaticAttachmentRequest **out);
 
 #ifdef __cplusplus
 }  // extern "C"

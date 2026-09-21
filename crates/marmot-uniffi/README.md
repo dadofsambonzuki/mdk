@@ -2,6 +2,8 @@
 
 UniFFI bindings for the Marmot app runtime.
 
+Host-controlled automatic downloads use the [host-managed attachment contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104), including Android WorkManager migration.
+
 ## Integration guide and API reference
 
 This is the current integration entry point for Swift/iOS, Swift/macOS and Kotlin/Android.
@@ -15,8 +17,9 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 | [Release integration index](../../docs/integration/README.md) | Find the companion guide for your upgrade; read intervening guides when skipping versions. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
-| [Chat-list rows](CHAT-LIST-ROWS.md) | Unreleased C3 selected previews, live draft updates and row-action availability. |
+| [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
+| [Durable local sends](LOCAL-SENDS.md) | 0.10.4 early acceptance, exact optimistic-bubble correlation and retry semantics. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership. |
 
 ### What MDK owns and what the host owns
@@ -360,6 +363,30 @@ Public profile-image uploads default to `https://blossom.primal.net`. Rust
 hosts can override or disable that third-party service with
 `MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
 to pass an explicit Blossom server to `uploadProfileImage`.
+
+## Build phases
+
+The no-argument build scripts still build complete local bundles. Release CI
+uses separate phases to parallelize compilation across runners:
+
+| Script | Phase | Work |
+| --- | --- | --- |
+| `xcframework.sh` | `generate` | Host library and generated Swift/headers in `build/ios/swift`; no device builds |
+| `xcframework.sh` | `native <target>` | One `aarch64-apple-ios` or `aarch64-apple-ios-sim` native build |
+| `xcframework.sh` | `assemble` | Assemble existing native slices and `build/ios/swift` into the usual iOS output |
+| `xcframework-macos.sh` | `native` | One `aarch64-apple-darwin` build with the macOS deployment flags |
+| `xcframework-macos.sh` | `assemble` | Assemble the native slice with shared Swift/headers placed in `build/macos/swift` |
+| `kotlin-bindings.sh` | `generate` | Host library, generated Kotlin and Android support files; no NDK required |
+| `kotlin-bindings.sh` | `native` | JNI libraries for `ANDROID_ABIS`; no host library or binding generation |
+
+Run independent phases in separate checkouts/runners. Multiple Cargo processes
+sharing one target directory contend on its lock; separate phases do not make
+concurrent invocations in one checkout safe. All inputs must have matching source,
+builder, toolchain, profile and features. CI transfers inputs only within the same
+workflow run. Apple assembly checks required files before replacing an existing
+bundle and never compiles Rust. Both Apple scripts honor `CARGO_TARGET_DIR`.
+See the [release guide](../../release.md#parallel-builds-and-build-only-rehearsals)
+for the build-only benchmark workflow and cache-warming procedure.
 
 ## Kotlin / Android
 

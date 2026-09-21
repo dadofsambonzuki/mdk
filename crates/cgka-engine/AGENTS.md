@@ -593,6 +593,34 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   At most `MAX_OWN_COMMIT_REISSUE_ATTEMPTS`
   re-issues, then `Abandoned`. The decision is returned as a `SupersededIntentReport` so the runtime can announce it
   (mdk#1734). Tests: `tests/distributed_convergence.rs::superseded_profile_edit_*`.
+- **A commit row's `epoch` column is the epoch that commit forks FROM, at every inbound door that has parsed the
+  content type** — the pre-parse persists (a peel failure, a non-MLS or Welcome body in a group-message envelope) stamp
+  `current_epoch`, because no commit is known to be in hand yet. The convergence door stamps the projected
+  `source_epoch`; direct ingest stamps the commit's own wire epoch, which is always below
+  `current_epoch` there because the `commit_should_enter_convergence` decision routes every commit at or above the live
+  epoch into convergence. Two seams already state the rule for rows they read: `distributed_convergence.rs` ("the
+  stored record's epoch is the commit's source epoch (the fork it lost)") and `openmls_projection.rs`'s own-checkpoint
+  prefix, which computes `resulting_epoch` as `record.epoch + 1`. The reachable hazard from a device-epoch stamp is in
+  `apply_start_epoch_for_canonicalization_result`: it reads the first accepted commit NOT already in the applied
+  prefix, so when a lower commit whose anchor exists heads the branch and is already in that prefix, a direct-path row
+  becomes the first non-prefix commit; a device-epoch stamp then yields `apply_start_epoch >= current_epoch`,
+  `rewind_to_retained_anchor` stays false, and the replay runs against live state — `WrongEpoch`, failed apply,
+  rollback. That hazard is derived from reading `apply_start_epoch_for_canonicalization_result`, not pinned by any test
+  below — the tests listed pin the stamp and the forensic epoch, not the replay it would misdirect. In the
+  missing-anchor rival's own case the pass halts `MissingRetainedAnchor` with no accepted commits and never reaches
+  the apply; the row still has to be right, because nothing later corrects it. The stamp is a stored-input
+  shape, not a verdict — the unauthenticated-claim rule above still holds. Forensics is decoupled on purpose: the audit
+  row for that persist and every arm of the direct-path error match that writes the row itself keep reporting
+  `current_epoch` (all four use `update_stored_message_state_reported_at`; the classified-rejection branch is reached
+  only after `decrypt_message`, where a past-epoch commit has already failed `WrongEpoch`), and the convergence pass's
+  disposition transitions report the
+  device's pre-apply tip, because `incident-replay` reads `MessageStateChanged.epoch` as where the engine was and calls
+  a drop a rollback. Tests, all in `tests/fork_detection.rs`:
+  `restarted_committer_without_source_anchor_halts_through_convergence` (row epoch + the persist's forensic epoch),
+  `stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork` (the terminal transition's forensic epoch on
+  the routine redelivery path), `canonicalization_transition_reports_the_device_tip_not_the_rival_source_epoch` (the
+  pass's disposition transitions), `inbound_commit_at_the_live_epoch_takes_the_convergence_door`, and
+  `commit_refused_by_the_incoming_wire_format_policy_reports_the_device_epoch` (the unclassified `Retryable` arm).
 - **A retained anchor for epoch E is the state of E as the device *left* E.** `retain_current_group_epoch_snapshot`
   therefore runs both before an advance past E and immediately after a replayed proposal enters the store at E
   (`openmls_projection::process_openmls_messages_inner`, the `ProposalMessage` arm, under the same
@@ -632,6 +660,26 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   state makes `recorded_message_outcome` answer `Duplicate` forever, so a never-applied message would be dead for this
   device. (Convergence graph seeding is not the hazard; it skips raw-transport payloads.) Pinned by
   `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_refused_for_lack_of_room_redeliverable`.
+- **A `Buffered` outcome never lets the caller retire the wrapper; ingest owns retirement.** Every site that returns
+  `IngestOutcome::Buffered` AFTER a peel retires its own raw transport wrapper through one mechanism,
+  `Engine::retire_raw_wrapper` (five call sites today: the content-record seam, the missing-anchor fork rival, the
+  parent-dependent proposal pass, the inbound disband candidate, and `buffer_openmls_message_into_convergence`). Grep
+  that helper for the current set rather than trusting this list. The `Buffered` that retires nothing is the
+  **pre-peel** halt gate (`!can_ingest`): it parked bytes NOBODY OPENED and keeps the row as their only redelivery
+  source, so a caller that stamps `Processed` on every `Buffered` makes `recorded_message_outcome` answer `Duplicate`
+  for that id forever — on exactly the halted and forked groups that carry the largest deferred backlogs. Only ingest
+  can tell the two apart, so `replay_buffered_messages` and `reingest_deferred_peel_row` stamp nothing on `Buffered`
+  and read the row's current state instead. (`do_ingest`'s durable dedup seam also answers `Buffered` for an existing
+  `Created`/`Retryable` row, pre-peel; internal replay enters below it.) Two consequences worth keeping straight: the
+  halt gate is write-once, because internal replay re-enters ingest below that dedup seam and re-stamping a
+  `PeelDeferred` row `Retryable` would drop its deferred-peel lifecycle; and the flood-cap slot belongs to the
+  `PeelDeferred` STATE, not to the stamp, so both callers release it via
+  `release_cap_slot_if_row_left_peel_deferred` — on the direct path, where wrapper and content share one id, a content
+  row replaces the deferred row without `retire_raw_wrapper` ever running. Pinned by
+  `tests/deferred_peel_lifecycle.rs::replay_keeps_a_row_the_halt_gate_never_peeled_redeliverable` and its
+  retiring-direction controls `::replay_still_retires_a_deferred_row_it_resolves`,
+  `::unchanged_192_row_contested_backlog_enumerates_candidates_once`, and
+  `tests/mip03_guards.rs::a_retained_wrapper_is_retired_when_its_proposal_waits_for_its_fork_parent`.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They
   do reference the `marmot.transport.nostr.routing.v1` app-component by id (`NOSTR_ROUTING_COMPONENT_ID`,
   `NostrRoutingV1`) and name Nostr concepts in comments (e.g. the kind-445 exporter label), so

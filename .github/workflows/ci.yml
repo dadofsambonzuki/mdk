@@ -96,6 +96,9 @@ jobs:
           python3 scripts/check_binding_docs.py
           python3 scripts/test_check_binding_docs.py
 
+      - name: Binding build phase contracts
+        run: python3 crates/marmot-uniffi/test-build-phases.py
+
       - name: Install example SHA-256 gate
         run: |
           python3 scripts/check_install_example_sha256.py
@@ -1036,6 +1039,15 @@ jobs:
           ./scripts/hermes_marmot_dev_setup.sh \
             --root "$RUNNER_TEMP/hermes-installer-auth" \
             --install-pinned-wheel
+
+      - name: Pinned Hermes approval host contract
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/hermes-installer-auth/env.sh"
+          HERMES_APPROVAL_CONTRACT=1 PYTHONPATH="$HERMES_AGENT_REPO" \
+            "$HERMES_AGENT_REPO/.venv/bin/python" -m unittest discover \
+            -s integrations/hermes/tests/marmot -p test_approval_host_contract.py -v
 
       - name: Hermes installer unit and mock regressions
         run: |

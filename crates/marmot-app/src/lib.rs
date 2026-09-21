@@ -90,6 +90,8 @@ pub mod conversation_presentation;
 mod conversions;
 mod directory;
 mod drafts;
+mod local_submissions;
+pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
 mod external_signer;
 mod groups;
@@ -183,9 +185,10 @@ pub(crate) use client::{
     ConvergenceScheduleState, DeliveryOverflowRecoveryOutcome, EpochBackfillRunOutcome,
 };
 pub use config::{
-    AttachmentAcquisitionPolicy, AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence,
-    MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
+    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
 };
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
@@ -956,7 +959,7 @@ pub struct AppMessageQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
@@ -5653,10 +5656,9 @@ impl MarmotApp {
     /// fresh send intent for an id a failed send already retracted starts from a
     /// live pending row instead of a permanent tombstone.
     ///
-    /// Inner app-event ids are NIP-01 hashes over
-    /// (pubkey, created_at, kind, tags, content) with second-granular
-    /// `created_at`, so a resend of identical text inside the same second as a
-    /// failed send reuses that send's id. `record_app_event`'s upsert keeps
+    /// An exact retained-event retry reuses the failed send's id; identical
+    /// independently authored chat messages within one second also share an id.
+    /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
     /// evidence — and the send intent is the evidence. Only this path can
     /// produce one: replay seams (`observe_drained_session_events`, backfill,
@@ -6270,10 +6272,24 @@ impl MarmotApp {
                 .all(|component_id| metadata.app_components.contains(component_id))
     }
 
-    fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
+    fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = self.relay_urls.clone();
+        let relays = relay_plane::RelaySafetyPolicy::with_allow_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        )
+        .sanitize_endpoints(
+            relays
+                .unwrap_or_else(|| self.relay_urls.clone())
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "group create",
+        )
+        .map_err(AppError::InvalidNostrRouting)?
+        .into_iter()
+        .map(|endpoint| endpoint.0)
+        .collect();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
     }
 }
@@ -6894,9 +6910,10 @@ pub use storage_sqlite::{
 pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
 
 pub use runtime::{
-    AttachmentAssetRef, AttachmentCategory, AttachmentControl, AttachmentDownloadPolicy,
-    AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion, AttachmentLocalTarget,
-    AttachmentPage, AttachmentPageRead, AttachmentTransferState, AttachmentTransferStatus,
-    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
+    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
+    AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
+    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
+    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+    RuntimeAttachmentTransferSubscription,
 };

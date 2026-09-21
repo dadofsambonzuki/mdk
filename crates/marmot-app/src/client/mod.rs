@@ -1504,12 +1504,7 @@ impl AppClient {
             });
         }
 
-        let AppCreateGroupOptions {
-            description,
-            initial_image,
-            disappearing_message_secs,
-        } = options;
-        if initial_image.is_some() {
+        if options.initial_image.is_some() {
             return Err(AppError::InvalidEncryptedMedia(
                 "group creation accepts either inline or prepared image input".into(),
             ));
@@ -1517,13 +1512,12 @@ impl AppClient {
 
         self.create_group_with_initial_source_and_optional_telemetry(
             name,
-            description,
             member_refs,
+            options,
             Some(InitialGroupImageSource::Prepared {
                 upload_id: upload_id.to_owned(),
                 component_data: record.component_data,
             }),
-            disappearing_message_secs,
             Some(telemetry),
         )
         .await
@@ -1536,17 +1530,13 @@ impl AppClient {
         options: AppCreateGroupOptions,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
-        let AppCreateGroupOptions {
-            description,
-            initial_image,
-            disappearing_message_secs,
-        } = options;
+        let mut options = options;
+        let initial_image = options.initial_image.take();
         self.create_group_with_initial_source_and_optional_telemetry(
             name,
-            description,
             member_refs,
+            options,
             initial_image.map(InitialGroupImageSource::Inline),
-            disappearing_message_secs,
             telemetry,
         )
         .await
@@ -1555,12 +1545,17 @@ impl AppClient {
     pub(crate) async fn create_group_with_initial_source_and_optional_telemetry(
         &mut self,
         name: &str,
-        description: String,
         member_refs: &[&str],
+        options: AppCreateGroupOptions,
         initial_image: Option<InitialGroupImageSource>,
-        disappearing_message_secs: u64,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
+        let AppCreateGroupOptions {
+            description,
+            disappearing_message_secs,
+            relays,
+            ..
+        } = options;
         validate_group_profile(name, &description)?;
         if name.trim().is_empty()
             && member_refs.len() == 1
@@ -1572,7 +1567,7 @@ impl AppClient {
         {
             return Err(AppError::UserBlocked);
         }
-        let nostr_routing = self.app.new_nostr_routing()?;
+        let nostr_routing = self.app.new_nostr_routing(relays)?;
         let nostr_routing_bytes =
             encode_nostr_routing_v1(&nostr_routing).map_err(AppError::InvalidNostrRouting)?;
         let mut app_components = vec![AppComponentData {
@@ -1634,6 +1629,17 @@ impl AppClient {
             );
         }
         let members = resolved.key_packages;
+        // Resolution still validates every requested package and inbox route.
+        // Reject an explicit creator before MLS mutation instead of surfacing
+        // OpenMLS's opaque DuplicateSignatureKey error from add_members.
+        let creator = self.app.account_home().account(&self.state.label)?;
+        for member in &members {
+            let metadata = cgka_engine::key_package::key_package_metadata(member)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if metadata.credential_identity_hex == creator.account_id_hex {
+                return Err(AppError::GroupCreateIncludesCreator);
+            }
+        }
         self.refresh_routing()?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
@@ -3585,6 +3591,21 @@ impl AppClient {
     where
         F: FnMut(crate::AppProjectionUpdate),
     {
+        self.send_app_event_with_context(group_id, intent, on_local_projection, draft, None)
+            .await
+    }
+
+    async fn send_app_event_with_context<F>(
+        &mut self,
+        group_id: &GroupId,
+        intent: AppMessageIntent,
+        on_local_projection: F,
+        draft: Option<(crate::MessageDraftRevision, Option<String>)>,
+        prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
         use crate::{ProductFamily as Family, ProductUnit};
         let (family, operation) = match &intent {
             AppMessageIntent::Report { .. } | AppMessageIntent::DismissReports { .. } => {
@@ -3619,6 +3640,7 @@ impl AppClient {
             intent,
             on_local_projection,
             draft,
+            prepared,
         ))
         .await;
         if let Some(observation) = observation {
@@ -3634,12 +3656,45 @@ impl AppClient {
         result
     }
 
+    pub(crate) async fn publish_local_submission<F>(
+        &mut self,
+        submission: &storage_sqlite::LocalSubmission,
+        on_projection: F,
+    ) -> Result<SendSummary, AppError>
+    where
+        F: FnMut(crate::AppProjectionUpdate),
+    {
+        let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
+            AppError::InvalidAppMessagePayload("invalid local submission group".into())
+        })?);
+        let request = crate::local_submissions::LocalMessageRequest::decode_retained(
+            submission.request_json.as_deref().ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("missing local submission request".into())
+            })?,
+        )?;
+        let (event, payload) = crate::local_submissions::retained_event(submission)?;
+        if !request.attachments.is_empty() {
+            self.sync_runtime_groups().await?;
+            self.validate_draft_media_references(&group, &request.attachments)?;
+        }
+        self.send_app_event_with_context(
+            &group,
+            request.intent(),
+            on_projection,
+            None,
+            Some((event, payload)),
+        )
+        .await
+        .map(|(_, summary)| summary)
+    }
+
     async fn send_app_event_with_local_projection_unobserved<F>(
         &mut self,
         group_id: &GroupId,
         intent: AppMessageIntent,
         mut on_local_projection: F,
         draft: Option<(crate::MessageDraftRevision, Option<String>)>,
+        prepared: Option<(MarmotInnerEvent, Vec<u8>)>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
     where
         F: FnMut(crate::AppProjectionUpdate),
@@ -3753,16 +3808,24 @@ impl AppClient {
                 .map(|attachment| cgka_traits::types::EpochId(attachment.source_epoch)),
             _ => None,
         };
-        let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
-            Some(reply) => build_inner_event_with_media_reply(
-                &intent,
-                &sender,
-                unix_now_seconds(),
-                Some(reply),
-            )?,
-            None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+        let (event, payload) = if let Some((event, payload)) = prepared {
+            event.validate_sender(&sender).map_err(|_| {
+                AppError::InvalidAppMessagePayload("invalid local submission author".into())
+            })?;
+            (event, payload)
+        } else {
+            let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
+                Some(reply) => build_inner_event_with_media_reply(
+                    &intent,
+                    &sender,
+                    unix_now_seconds(),
+                    Some(reply),
+                )?,
+                None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+            };
+            let payload = encode_inner_event(&event)?;
+            (event, payload)
         };
-        let payload = encode_inner_event(&event)?;
         let _draft_guard = if let Some((revision, _)) = draft {
             let storage = self.app.draft_storage(&self.state.label)?;
             self.runtime.session().set_message_draft_commit_observer(

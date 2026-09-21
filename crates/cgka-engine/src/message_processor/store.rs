@@ -156,6 +156,47 @@ pub(crate) fn normalized_deferred_peel_lifecycle(
     (normalized, true)
 }
 
+/// Whether a row in this state is still awaiting retry — the same
+/// `Created | Retryable | PeelDeferred` set `replay_buffered_messages` and the
+/// deferred-peel sweep admit at entry. `None` (a vanished row) is not.
+pub(crate) fn row_state_is_awaiting_retry(state: Option<MessageState>) -> bool {
+    matches!(
+        state,
+        Some(MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred)
+    )
+}
+
+/// The epoch a message row carries and the epoch the forensic trail reports for
+/// writing it.
+///
+/// They differ only for a past-epoch commit on direct ingest: the row keeps the
+/// epoch the commit forks from, while `MessageStateChanged.epoch` must keep
+/// saying where this engine was — `incident-replay` folds that field into an
+/// engine's current position and reads a drop as a rollback.
+#[derive(Clone, Copy)]
+pub(crate) struct RowEpochs {
+    row: EpochId,
+    reported: EpochId,
+}
+
+impl RowEpochs {
+    /// The ordinary case: the engine was at the epoch the row records.
+    pub(crate) fn at(epoch: EpochId) -> Self {
+        Self {
+            row: epoch,
+            reported: epoch,
+        }
+    }
+
+    /// The row records `row` while the engine was at `device`.
+    pub(crate) fn row_at(row: EpochId, device: EpochId) -> Self {
+        Self {
+            row,
+            reported: device,
+        }
+    }
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) fn recorded_message_outcome(
         &self,
@@ -244,14 +285,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: &MessageId,
     ) -> Result<bool, EngineError> {
-        match self.storage.get_message(id) {
-            Ok(record) => Ok(matches!(
-                record.state,
-                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
-            )),
-            Err(StorageError::NotFound) => Ok(false),
-            Err(e) => Err(EngineError::Storage(e)),
-        }
+        Ok(row_state_is_awaiting_retry(self.stored_message_state(id)?))
     }
 
     pub(crate) fn record_sent_message(
@@ -275,7 +309,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             MessageState::Sent,
             StoredMessagePayload::staged_invite_welcome(msg.clone(), origin_commit_id.clone()),
             None,
@@ -341,7 +375,7 @@ impl<S: StorageProvider> Engine<S> {
             self.persist_stored_message_payload(
                 msg.id.clone(),
                 group_id,
-                epoch,
+                RowEpochs::at(epoch),
                 MessageState::Sent,
                 payload,
                 None,
@@ -449,7 +483,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             StoredMessagePayload::raw_transport(msg.clone()),
             None,
@@ -616,7 +650,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_encoded_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             encoded_payload,
             None,
@@ -663,7 +697,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            RowEpochs::at(epoch),
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
             None,
@@ -681,10 +715,36 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
         transport_id: &MessageId,
     ) -> Result<(), EngineError> {
+        self.persist_openmls_wire_message_with_processed_transport_id_at(
+            msg,
+            group_id,
+            RowEpochs::at(epoch),
+            state,
+            transport_id,
+        )
+    }
+
+    /// [`Self::persist_openmls_wire_message_with_processed_transport_id`] with
+    /// the row epoch and the forensic epoch given separately.
+    ///
+    /// Only past-epoch commits on direct ingest need them apart: the row must
+    /// carry the epoch the commit forks from (see the commit-row rule in
+    /// `AGENTS.md`), while the forensic trail must keep saying where this engine
+    /// was when it handled the message — `incident-replay` folds
+    /// `MessageStateChanged.epoch` into an engine's current position and reads a
+    /// drop as a rollback.
+    pub(crate) fn persist_openmls_wire_message_with_processed_transport_id_at(
+        &self,
+        msg: &TransportMessage,
+        group_id: &GroupId,
+        epochs: RowEpochs,
+        state: MessageState,
+        transport_id: &MessageId,
+    ) -> Result<(), EngineError> {
         self.persist_stored_message_payload(
             msg.id.clone(),
             group_id,
-            epoch,
+            epochs,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
             Some(transport_id),
@@ -695,7 +755,7 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: MessageId,
         group_id: &GroupId,
-        epoch: EpochId,
+        epochs: RowEpochs,
         state: MessageState,
         payload: StoredMessagePayload,
         processed_transport_id: Option<&MessageId>,
@@ -706,7 +766,7 @@ impl<S: StorageProvider> Engine<S> {
         self.persist_encoded_stored_message_payload(
             id,
             group_id,
-            epoch,
+            epochs,
             state,
             payload,
             processed_transport_id,
@@ -717,11 +777,12 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: MessageId,
         group_id: &GroupId,
-        epoch: EpochId,
+        epochs: RowEpochs,
         state: MessageState,
         payload: Vec<u8>,
         processed_transport_id: Option<&MessageId>,
     ) -> Result<(), EngineError> {
+        let epoch = epochs.row;
         let id_hex = hex::encode(id.as_slice());
         let previous = match self.storage.get_message(&id) {
             Ok(record) => Some(record),
@@ -784,7 +845,7 @@ impl<S: StorageProvider> Engine<S> {
                 id_hex,
                 previous.map(|record| record.state),
                 state,
-                Some(epoch),
+                Some(epochs.reported),
                 "persist",
             ),
         );
@@ -796,13 +857,37 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
         state: MessageState,
     ) -> Result<(), EngineError> {
+        self.update_stored_message_state_inner(id, state, None)
+    }
+
+    /// [`Self::update_stored_message_state`] for a row whose epoch is the
+    /// message's own rather than this engine's.
+    ///
+    /// Same split as [`Self::persist_openmls_wire_message_with_processed_transport_id_at`]:
+    /// the row keeps the commit's source epoch, the forensic trail keeps
+    /// reporting where this engine was when it handled the message.
+    pub(crate) fn update_stored_message_state_reported_at(
+        &self,
+        id: &MessageId,
+        state: MessageState,
+        device_epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        self.update_stored_message_state_inner(id, state, Some(device_epoch))
+    }
+
+    fn update_stored_message_state_inner(
+        &self,
+        id: &MessageId,
+        state: MessageState,
+        device_epoch: Option<EpochId>,
+    ) -> Result<(), EngineError> {
         let previous = self.storage.get_message(id).ok();
         self.storage.update_message_state(id, state)?;
         let event = crate::audit_helpers::message_state_transition_event(
             hex::encode(id.as_slice()),
             previous.as_ref().map(|record| record.state),
             state,
-            previous.as_ref().map(|record| record.epoch),
+            device_epoch.or_else(|| previous.as_ref().map(|record| record.epoch)),
             "state_update",
         );
         if let Some(record) = previous {
@@ -1042,6 +1127,32 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    /// Retire the raw transport wrapper that carried `content_msg_id`, now that
+    /// a durable record stands for that content. No-op on the direct path,
+    /// where wrapper and content share one id and therefore one row.
+    ///
+    /// This is the single mechanism behind "a `Buffered` outcome never lets the
+    /// caller retire the wrapper" (AGENTS.md): every ingest site that returns
+    /// `Buffered` after a peel calls this, so no caller has to guess which of
+    /// them did.
+    ///
+    /// Deliberately not atomic with the content admission it follows. A
+    /// wrapper left awaiting retry beside a durable content record is a
+    /// legitimate state, not a torn one: internal replay and the sweep re-enter
+    /// ingest below the transport-id dedup seam, and the content-record seam
+    /// retires the wrapper on that pass.
+    pub(crate) fn retire_raw_wrapper(
+        &mut self,
+        raw_msg_id: &MessageId,
+        content_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        if raw_msg_id == content_msg_id {
+            return Ok(());
+        }
+        self.mark_raw_transport_message_processed_if_awaiting_retry(raw_msg_id, reason)
+    }
+
     /// Retire a raw transport wrapper whose content-derived row is now the
     /// durably buffered convergence witness. Mirrors
     /// [`Self::mark_raw_transport_message_failed_if_awaiting_retry`], but the
@@ -1087,6 +1198,7 @@ impl<S: StorageProvider> Engine<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::RowEpochs;
     use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
     use crate::engine::EngineBuilder;
     use async_trait::async_trait;
@@ -1298,7 +1410,7 @@ mod tests {
             .persist_stored_message_payload(
                 staged_welcome.id.clone(),
                 &group_id,
-                EpochId(3),
+                RowEpochs::at(EpochId(3)),
                 MessageState::Sent,
                 StoredMessagePayload::staged_invite_welcome(
                     staged_welcome.clone(),

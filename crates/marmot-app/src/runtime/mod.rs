@@ -85,10 +85,12 @@ pub use conversation_window::{
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
 mod attachment_controls;
+pub(crate) mod attachment_permission;
 pub use attachment_controls::{
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
     RuntimeAttachmentTransferSubscription,
 };
+pub use attachment_permission::{AttachmentAutomaticPermission, AutomaticAttachmentRequest};
 mod attachment_access;
 mod attachment_history;
 pub use attachment_access::{
@@ -104,6 +106,7 @@ mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
+mod local_submissions;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
@@ -276,9 +279,11 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
     attachment_cancellations: watch::Sender<()>,
+    attachment_permissions: attachment_permission::Permissions,
     product_analytics: crate::ProductAnalytics,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
@@ -367,8 +372,10 @@ impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
+            attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
             app_performance_telemetry: AppPerformanceTelemetry::default(),
             product_analytics: crate::ProductAnalytics::default(),
@@ -413,7 +420,9 @@ impl RuntimeSharedServices {
         Self {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
+            local_submission_wakeups: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
+            attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
             app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
                 app.product_analytics.clone(),
@@ -5742,6 +5751,10 @@ impl AccountManager {
         let account = self.app.account_home().account(account_ref)?;
         self.set_account_tearing_down(&account.account_id_hex, true);
         let result = async {
+            self.shared
+                .attachment_permissions
+                .forget_account(&account.account_id_hex);
+            self.shared.attachment_cancellations.send_modify(|_| {});
             let worker = self.workers.lock().await.remove(&account.account_id_hex);
             if let Some(worker) = worker {
                 worker.shutdown().await;
@@ -5879,6 +5892,10 @@ impl AccountManager {
             self.app
                 .account_home()
                 .set_account_signed_out(&account.label, true)?;
+            self.shared
+                .attachment_permissions
+                .forget_account(&account.account_id_hex);
+            self.shared.attachment_cancellations.send_modify(|_| {});
             let worker = self.workers.lock().await.remove(&account.account_id_hex);
             if let Some(worker) = worker {
                 worker.shutdown().await;

@@ -20,11 +20,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   `-C embed-bitcode=no`, and the packagers sanitize `__LLVM` / `__bitcode` segments and
   MH_OBJECT section-level leftovers from every archive member (including toolchain
   `compiler_builtins` objects) without skipping names or weakening the native-archive
-  validator. Mid-file leftover removal keeps offset-free load commands such as
-  `LC_VERSION_MIN_IPHONEOS` intact and snaps a parent segment whose `fileoff`
-  equals the leftover bitcode start onto the remaining native data, including
-  empty native sections that reuse that same file offset. This is not a
-  symbol strip.
+  validator. Rust's `llvm-objcopy` preserves native symbols and relocations;
+  Apple's `libtool` rebuilds the archive index. Archive flags are scoped away
+  from the host binding generator so they do not conflict with executable LTO.
+  This is not a symbol strip.
 
 ### Changed
 
@@ -32,6 +31,39 @@ versioning through the workspace version in the root `Cargo.toml`.
   workspace profile and the builder-owned MarmotKit environment. Host and Apple archives still keep
   symbols; Android JNI libraries still strip per invocation. Apple provenance records `lto` as JSON
   `false` or `"thin"`.
+
+## [0.10.4] - 2026-09-20
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 89; back up before upgrade because downgrade is unsupported. See the
+[release notes](../../docs/release/0.10.4.md) and the
+[client upgrade guide](../../docs/integration/0.10.4.md).
+
+### Added
+
+- Token-aware text, reply, draft and media-send entry points provide durable local acceptance and exact caller-token
+  correlation across restart. Existing send methods retain their relay-completion semantics.
+- Optional host-managed automatic attachment acquisition adds generation-fenced network/media permission, idempotent
+  demand, bounded durable retry budgets and terminal acquisition-history states. Native automatic acquisition remains
+  the default.
+- Chat-list message previews expose the selected message's pinned retention duration and expiry.
+- WN Agent control protocol v2 can create groups with optional founding relay routes. Hermes can opt into reaction-
+  based approval decisions; this remains disabled by default.
+
+### Fixed
+
+- Deferred transport wrappers parked before MLS peel remain redeliverable instead of being retired as processed.
+- Epoch-backfill overflow failures use execution-based exponential retry backoff instead of repeatedly returning to
+  the base delay. This is a pacing mitigation, not resumable recovery.
+- Revisioned draft saves avoid unused attachment-plaintext hydration, and conversation windows can return to a
+  coherent locally accepted pending-message checkpoint before relay publication completes.
+- Automatic attachment acquisition preserves verified publication across permission changes and prevents repeated
+  downloads after terminal retention or retry outcomes.
+
+### Packaging
+
+- MarmotKit release builds now compile Android ABIs and Apple slices in parallel, verify cross-platform provenance
+  agreement, and support non-publishing build-only rehearsals. Published bundle names and layouts are unchanged.
 
 ## [0.10.3] - 2026-09-19
 

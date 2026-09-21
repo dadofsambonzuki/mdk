@@ -15,34 +15,24 @@ retained in those reports and are recorded as unavailable, never fabricated.
 - Linux report sha256 `e0ddbd525e0b0b7a6cc210be510b78d422d5545e877fa17136a62683dc09438c`
 - macOS report sha256 `16a485692a20cf406f0aba644666cadd457e9cb996c083df3ef27df984b616e8`
 
-Host and Android JNI libraries shrank. Apple static archives grew about 85
-percent on that head because Apple rustc defaults to `embed-bitcode=yes`, so
-thin-LTO members carried native code plus LLVM bitcode, and the matching Rust
-1.97.1 iOS `compiler_builtins` rlib retains a leftover `__LLVM,__bitcode`
-section of size `0xe80`. macOS job `105104464502` then failed Validate Apple
-archives on `compiler_builtins-*.rcgu.o`. This revision disables embed-bitcode
-on Apple Cargo invocations and sanitizes leftover Mach-O bitcode sections
-from every member without skipping names. Exact-head macOS CI on
-`2c1fd5b97bd16c9577e18a795564579c2902f909` then failed sanitization because
-relocatable `compiler_builtins` members keep `__LLVM,__bitcode` as a section
-inside a parent `__TEXT` load command. The sanitizer now removes those
-section-level leftovers; it still does not whitelist members. Exact-head macOS
-CI on `e9fb5a8f577d2c6352d12eebf76111afbe8d6e01` then failed sanitization with
-`unknown Mach-O load command 0x25 after mid-file bitcode removal`
-(`LC_VERSION_MIN_IPHONEOS`). The sanitizer now keeps those offset-free
-commands intact. Exact-head macOS CI on
-`9dfab7008e1748a46df9b9240bb678fb4124d46c` then failed sanitization with
-`segment offset 784 lands inside removed bitcode` because the parent
-`__TEXT` `fileoff` equals the leftover bitcode start. The sanitizer now
-snaps that segment onto the remaining native sections. Exact-head macOS
-CI on `31c39233cba23f45c74353c0aa921823636d9928` then failed sanitization
-with `section offset 784 lands inside removed bitcode` because empty
-native sections reuse that first-payload offset. The sanitizer now snaps
-those empty section pointers as well and still rejects non-empty pointers
-that land strictly inside removed bitcode. Profile-affecting MarmotKit
-sources and these dated bytes are unchanged except for that sanitizer
-repair. Fresh exact-head CI is required after publication; these dated
-numbers describe the pre-fix candidate.
+These are historical, pre-sanitization measurements, not acceptance evidence for
+the current head. Fresh reports, artifact hashes, raw Criterion output and logs
+are uploaded by the non-publishing **MarmotKit Release Profile** workflow.
+
+Host and Android JNI libraries shrank in this combined-profile comparison.
+It does not isolate the contribution of each setting. In particular, Cargo does
+not apply cross-crate LTO to the mixed `cdylib/staticlib/lib` binding target;
+the configured `lto=thin` value is not proof that the binding library received
+LTO. It does apply to eligible executables, including the host binding generator.
+
+The old Apple archives grew because members retained embedded LLVM bitcode.
+Current builds disable new embedding only for native-archive invocations, then
+use Rust's `llvm-objcopy` and Apple's `libtool` to remove residual toolchain
+bitcode and rebuild the symbol index. Precompiled Rust 1.97.1
+`compiler_builtins` members can contain bitcode independently of the workspace
+LTO setting; deleting the sanitizer would not establish native-only archives.
+Host binding generation retains its own compatible flags. Current acceptance
+requires exact-head archive, binding-generation and Swift package validation.
 
 | Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
