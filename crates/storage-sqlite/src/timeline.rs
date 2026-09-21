@@ -4119,9 +4119,10 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
     }
     let local_account_id_hex = conn
         .query_row(
-            "SELECT account_id_hex
-             FROM notification_settings
-             ORDER BY updated_at_ms DESC, account_label DESC
+            "SELECT local_account_id_hex
+             FROM account_state
+             WHERE local_account_id_hex IS NOT NULL
+             ORDER BY updated_at DESC, label DESC
              LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
@@ -4272,11 +4273,11 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                     *count = count.saturating_add(1);
                 }
             }
-            if direction == "sent"
-                || local_account_id_hex
-                    .as_deref()
-                    .is_some_and(|local| sender.eq_ignore_ascii_case(local))
-            {
+            let is_local = local_account_id_hex.as_deref().map_or_else(
+                || direction == "sent",
+                |local| sender.eq_ignore_ascii_case(local),
+            );
+            if is_local {
                 local_selection = selections;
             }
         }

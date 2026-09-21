@@ -6,6 +6,7 @@ use cgka_traits::transport_adapter::{
 
 use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
+use crate::AppMessageProjection;
 use crate::publish_endpoints_from_bootstrap;
 use crate::tests::ScriptedPushRelayClient;
 
@@ -132,6 +133,111 @@ async fn message_journey_early_errors() {
         // Repeat after shutdown to cover lifecycle rejection before account lookup.
         runtime.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_send() {
+    let root = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(root.path(), vec![]);
+    let account = app.account_home().create_account("alice").unwrap();
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![1; 16]);
+    let group_id_hex = hex::encode(group.as_slice());
+
+    let error = runtime
+        .cast_poll_vote(&account.label, &group, "11".repeat(32), vec!["0".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidAppMessagePayload(message) if message.contains("valid locally accepted poll")),
+        "unexpected error: {error:?}"
+    );
+
+    let now = crate::unix_now_seconds();
+    let record_poll = |message_id_hex: String, created_at: u64, ends_at: u64| {
+        app.record_account_app_event(
+            &account.label,
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex,
+                source_message_id_hex: None,
+                direction: "received".into(),
+                group_id_hex: group_id_hex.clone(),
+                sender: "22".repeat(32),
+                plaintext: "Drink?".into(),
+                kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+                tags: cgka_traits::poll_tags(
+                    created_at,
+                    "Drink?",
+                    &["Tea".into(), "Coffee".into()],
+                    cgka_traits::PollType::SingleChoice,
+                    Some(ends_at),
+                )
+                .unwrap(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(created_at),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    };
+
+    let closed_poll_id = "33".repeat(32);
+    record_poll(
+        closed_poll_id.clone(),
+        now.saturating_sub(60),
+        now.saturating_sub(1),
+    );
+    let error = runtime
+        .cast_poll_vote(&account.label, &group, closed_poll_id, vec!["0".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidAppMessagePayload(message) if message == "poll is closed"),
+        "unexpected error: {error:?}"
+    );
+
+    let open_poll_id = "44".repeat(32);
+    record_poll(open_poll_id.clone(), now, now.saturating_add(60));
+    let error = runtime
+        .cast_poll_vote(&account.label, &group, open_poll_id, vec!["missing".into()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidAppMessagePayload(_)));
+
+    let sibling_poll_id = "66".repeat(32);
+    record_poll(sibling_poll_id.clone(), now, now.saturating_add(60));
+    app.record_account_app_event(
+        &account.label,
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: "77".repeat(32),
+            source_message_id_hex: None,
+            direction: "received".into(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: String::new(),
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+            tags: cgka_traits::poll_response_tags(&sibling_poll_id, &["1".into()]).unwrap(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(now.saturating_add(1)),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    let projected = runtime
+        .timeline_message(&account.label, &group_id_hex, &sibling_poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.local_selection, ["1"]);
+
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]

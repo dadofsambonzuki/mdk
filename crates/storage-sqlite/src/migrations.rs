@@ -184,6 +184,8 @@ mod migration_0086_attachment_controls;
 mod migration_0089_local_submissions;
 #[path = "migrations/0090_poll_response_edges.rs"]
 mod migration_0090_poll_response_edges;
+#[path = "migrations/0091_account_local_identity.rs"]
+mod migration_0091_account_local_identity;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -649,6 +651,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 90,
         name: "0090_poll_response_edges",
         apply: migration_0090_poll_response_edges::apply,
+    },
+    Migration {
+        version: 91,
+        name: "0091_account_local_identity",
+        apply: migration_0091_account_local_identity::apply,
     },
 ];
 

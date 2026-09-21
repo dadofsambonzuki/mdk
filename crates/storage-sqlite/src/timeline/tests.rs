@@ -362,15 +362,7 @@ fn multiple_choice_poll_counts_one_participant_across_selected_options() {
 fn sibling_device_vote_is_local_without_overloading_delivery_direction() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO notification_settings (
-                account_label, account_id_hex, local_notifications_enabled,
-                native_push_enabled, updated_at_ms
-             ) VALUES ('local', 'alice', 1, 0, 1)",
-            [],
-        )
+        .ensure_account_projection_with_identity("local", "alice")
         .unwrap();
     let poll_id = "99".repeat(32);
     store

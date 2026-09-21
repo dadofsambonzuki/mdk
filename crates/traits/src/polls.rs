@@ -19,7 +19,9 @@ pub const POLL_MAX_QUESTION_BYTES: usize = 1_024;
 pub const POLL_MAX_OPTION_BYTES: usize = 256;
 pub const POLL_MAX_OPTION_ID_BYTES: usize = 64;
 pub const POLL_MAX_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
-pub const POLL_MAX_TAGS: usize = POLL_MAX_OPTIONS + 2;
+/// Bound total receive-side work while leaving room for NIP-88 relay hints and
+/// future extension tags that this profile deliberately ignores.
+pub const POLL_MAX_TAGS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -81,7 +83,7 @@ pub enum PollError {
     InvalidOptionId,
     #[error("poll option label is empty or exceeds the byte limit")]
     InvalidOptionLabel,
-    #[error("poll contains a forbidden relay tag or unsupported tag shape")]
+    #[error("poll contains an unsupported tag shape")]
     InvalidTags,
     #[error("poll type is unsupported")]
     InvalidPollType,
@@ -142,21 +144,35 @@ pub fn parse_poll(event: &MarmotAppEvent) -> Result<PollDefinition, PollError> {
     let mut ends_at = None;
     for tag in &event.tags {
         match tag.first().map(String::as_str) {
-            Some(POLL_OPTION_TAG) if tag.len() == 3 => options.push(PollOptionDefinition {
-                id: tag[1].clone(),
-                label: tag[2].clone(),
-            }),
-            Some(POLL_TYPE_TAG) if tag.len() == 2 && poll_type.is_none() => {
+            Some(POLL_OPTION_TAG) => {
+                if tag.len() != 3 {
+                    return Err(PollError::InvalidTags);
+                }
+                options.push(PollOptionDefinition {
+                    id: tag[1].clone(),
+                    label: tag[2].clone(),
+                });
+            }
+            Some(POLL_TYPE_TAG) => {
+                if tag.len() != 2 || poll_type.is_some() {
+                    return Err(PollError::InvalidTags);
+                }
                 poll_type = Some(match tag[1].as_str() {
                     "singlechoice" => PollType::SingleChoice,
                     "multiplechoice" => PollType::MultipleChoice,
                     _ => return Err(PollError::InvalidPollType),
                 });
             }
-            Some(POLL_ENDS_AT_TAG) if tag.len() == 2 && ends_at.is_none() => {
+            Some(POLL_ENDS_AT_TAG) => {
+                if tag.len() != 2 || ends_at.is_some() {
+                    return Err(PollError::InvalidTags);
+                }
                 ends_at = Some(tag[1].parse().map_err(|_| PollError::InvalidDeadline)?);
             }
-            _ => return Err(PollError::InvalidTags),
+            // Marmot does not use NIP-88 relay hints for routing. Ignore them,
+            // and other bounded extension tags, so newer senders degrade
+            // forward-compatibly without weakening validation of known tags.
+            _ => {}
         }
     }
     validate_question(&event.content)?;
@@ -173,7 +189,7 @@ pub fn parse_poll(event: &MarmotAppEvent) -> Result<PollDefinition, PollError> {
 pub fn parse_poll_response(event: &MarmotAppEvent) -> Result<(String, Vec<String>), PollError> {
     if event.kind != MARMOT_APP_EVENT_KIND_POLL_RESPONSE
         || !event.content.is_empty()
-        || event.tags.len() > POLL_MAX_OPTIONS + 1
+        || event.tags.len() > POLL_MAX_TAGS
     {
         return Err(PollError::InvalidTags);
     }
@@ -181,12 +197,20 @@ pub fn parse_poll_response(event: &MarmotAppEvent) -> Result<(String, Vec<String
     let mut selections = Vec::new();
     for tag in &event.tags {
         match tag.first().map(String::as_str) {
-            Some(EVENT_REF_TAG) if tag.len() == 2 && target.is_none() => {
+            Some(EVENT_REF_TAG) => {
+                if tag.len() != 2 || target.is_some() {
+                    return Err(PollError::InvalidTags);
+                }
                 validate_event_id(&tag[1])?;
                 target = Some(tag[1].clone());
             }
-            Some(POLL_RESPONSE_TAG) if tag.len() == 2 => selections.push(tag[1].clone()),
-            _ => return Err(PollError::InvalidTags),
+            Some(POLL_RESPONSE_TAG) => {
+                if tag.len() != 2 {
+                    return Err(PollError::InvalidTags);
+                }
+                selections.push(tag[1].clone());
+            }
+            _ => {}
         }
     }
     let target = target.ok_or(PollError::InvalidTarget)?;
@@ -355,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relay_tags_duplicate_choices_and_bidi_text() {
+    fn ignores_bounded_extension_tags_but_keeps_known_tags_strict() {
         let mut tags = poll_tags(
             100,
             "Drink?",
@@ -365,10 +389,26 @@ mod tests {
         )
         .unwrap();
         tags.push(vec!["relay".to_owned(), "wss://example.test".to_owned()]);
+        tags.push(vec!["future-extension".to_owned(), "value".to_owned()]);
+        assert!(parse_poll(&event(MARMOT_APP_EVENT_KIND_POLL, 100, tags, "Drink?")).is_ok());
+
+        let malformed_known = vec![
+            vec![POLL_OPTION_TAG.into(), "0".into()],
+            vec![POLL_OPTION_TAG.into(), "1".into(), "Coffee".into()],
+        ];
         assert_eq!(
-            parse_poll(&event(MARMOT_APP_EVENT_KIND_POLL, 100, tags, "Drink?")),
+            parse_poll(&event(
+                MARMOT_APP_EVENT_KIND_POLL,
+                100,
+                malformed_known,
+                "Drink?"
+            )),
             Err(PollError::InvalidTags)
         );
+    }
+
+    #[test]
+    fn send_side_rejects_duplicate_choices_and_bidi_text() {
         assert!(
             poll_tags(
                 100,
@@ -380,6 +420,25 @@ mod tests {
             .is_err()
         );
         assert!(poll_response_tags(&"22".repeat(32), &["0".into(), "0".into()]).is_err());
+    }
+
+    #[test]
+    fn response_parser_ignores_bounded_extension_tags() {
+        let poll_id = "22".repeat(32);
+        let response = event(
+            MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+            150,
+            vec![
+                vec![EVENT_REF_TAG.into(), poll_id.clone()],
+                vec!["p".into(), "33".repeat(32)],
+                vec![POLL_RESPONSE_TAG.into(), "0".into()],
+            ],
+            "",
+        );
+        assert_eq!(
+            parse_poll_response(&response),
+            Ok((poll_id, vec!["0".into()]))
+        );
     }
 
     #[test]

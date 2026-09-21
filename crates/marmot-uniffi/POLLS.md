@@ -18,6 +18,15 @@ participating authenticated identities, the account's effective sent selection, 
 state. Kind-1018 responses do not form timeline rows. For each authenticated author MDK selects the response with the
 greatest `(created_at, canonical event id)`; ordinary author deletion or retention expiry falls back to the newest
 retained valid response. Projection work considers at most the newest 64 retained responses per author.
+That bound is applied before full response validation: if one author publishes 64 newer malformed or out-of-window
+replacements, an older valid response is no longer counted. This is an intentional per-author work bound and cannot
+change another participant's vote. Deletion and retention can therefore also change a projected tally after `endsAt`.
+
+If `kind == 1068` while `poll == nil`, the event used unsupported or invalid poll semantics. Render a localized
+unsupported-poll state rather than presenting the raw question as a usable poll. Chat-list previews carry `kind` but
+not the full poll projection; for kind 1068, hosts should render a localized poll label instead of the bare plaintext
+question. Receive-side parsing ignores bounded unknown extension tags (including NIP-88 relay hints), while keeping
+known tag shapes and the profile's question, option, and deadline limits strict.
 
 `open` is recomputed whenever the timeline row is read or reprojected. A host that keeps a row on screen across its
 deadline should also close its controls from the `endsAt` timestamp instead of waiting for another message. Local block
