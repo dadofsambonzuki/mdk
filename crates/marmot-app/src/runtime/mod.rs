@@ -2391,7 +2391,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create an encrypted in-group NIP-88 poll.
+    /// Create an encrypted NIP-88 poll in a conversation with at least three members.
     pub async fn create_poll(
         &self,
         account_ref: &str,
@@ -2406,7 +2406,8 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Cast or replace this account's current selection for a poll.
+    /// Cast or replace this account's current selection for a poll in a
+    /// conversation with at least three members.
     pub async fn cast_poll_vote(
         &self,
         account_ref: &str,

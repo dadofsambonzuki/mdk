@@ -3702,6 +3702,15 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
+        if matches!(
+            &intent,
+            AppMessageIntent::Poll { .. } | AppMessageIntent::PollResponse { .. }
+        ) && self.runtime.members(group_id)?.len() < 3
+        {
+            return Err(AppError::InvalidAppMessagePayload(
+                "polls require a group conversation with at least three members".into(),
+            ));
+        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.

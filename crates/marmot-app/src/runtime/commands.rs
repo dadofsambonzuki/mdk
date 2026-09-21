@@ -1729,7 +1729,7 @@ impl AccountManager {
         cgka_traits::validate_poll_selection(poll.poll_type, &option_ids_in_poll, &option_ids)
             .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
         self.send_app_event(
-            &account.account_id_hex,
+            &account.label,
             group_id,
             AppMessageIntent::PollResponse {
                 poll_event_id,

@@ -8,7 +8,7 @@ use super::subscriptions::{chat_list_mute_expiries, message_kind_filter_allows};
 use super::*;
 use crate::AppMessageProjection;
 use crate::publish_endpoints_from_bootstrap;
-use crate::tests::ScriptedPushRelayClient;
+use crate::tests::{ScriptedPushRelayClient, remember_test_member_inbox};
 
 #[tokio::test]
 async fn worker_lookup_skips_reconcile() {
@@ -236,6 +236,126 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
         .poll
         .unwrap();
     assert_eq!(projected.local_selection, ["1"]);
+
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn poll_commands_reject_direct_chats_and_round_trip_in_group_chats() {
+    let root = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(root.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let carol = home.create_account("carol").unwrap();
+    let dave = home.create_account("dave").unwrap();
+    let app = MarmotApp::with_relay(root.path(), "wss://polls.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    for member in [&bob, &carol, &dave] {
+        remember_test_member_inbox(&app, &member.account_id_hex, "wss://polls.example");
+        app.client(&member.label)
+            .await
+            .unwrap()
+            .publish_key_package()
+            .await
+            .unwrap();
+    }
+    let (direct, group) = {
+        let mut alice = app.client("alice").await.unwrap();
+        let direct = alice
+            .create_group("", &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let group = alice
+            .create_group(
+                "Poll group",
+                &[carol.account_id_hex.as_str(), dave.account_id_hex.as_str()],
+            )
+            .await
+            .unwrap();
+        (direct, group)
+    };
+
+    let runtime = app.runtime();
+    let direct_error = runtime
+        .create_poll(
+            "alice",
+            &direct,
+            "Tea?".into(),
+            vec!["Yes".into(), "No".into()],
+            cgka_traits::PollType::SingleChoice,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three members")),
+        "unexpected error: {direct_error:?}"
+    );
+    let direct_poll_id = "88".repeat(32);
+    let now = crate::unix_now_seconds();
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: direct_poll_id.clone(),
+            source_message_id_hex: None,
+            direction: "received".into(),
+            group_id_hex: hex::encode(direct.as_slice()),
+            sender: bob.account_id_hex.clone(),
+            plaintext: "Tea?".into(),
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+            tags: cgka_traits::poll_tags(
+                now,
+                "Tea?",
+                &["Yes".into(), "No".into()],
+                cgka_traits::PollType::SingleChoice,
+                None,
+            )
+            .unwrap(),
+            source_epoch: Some(0),
+            retention: None,
+            recorded_at: Some(now),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    let direct_vote_error = runtime
+        .cast_poll_vote("alice", &direct, direct_poll_id, vec!["0".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&direct_vote_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three members")),
+        "unexpected error: {direct_vote_error:?}"
+    );
+
+    let poll = runtime
+        .create_poll(
+            "alice",
+            &group,
+            "Tea?".into(),
+            vec!["Yes".into(), "No".into()],
+            cgka_traits::PollType::SingleChoice,
+            None,
+        )
+        .await
+        .unwrap();
+    let poll_id = poll.message_ids[0].clone();
+    runtime
+        .cast_poll_vote("alice", &group, poll_id.clone(), vec!["1".into()])
+        .await
+        .unwrap();
+
+    let projected = runtime
+        .timeline_message("alice", &hex::encode(group.as_slice()), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.local_selection, ["1"]);
+    assert_eq!(projected.participants, 1);
+    assert_eq!(projected.options[0].votes, 0);
+    assert_eq!(projected.options[1].votes, 1);
 
     runtime.shutdown_and_close().await.unwrap();
 }
