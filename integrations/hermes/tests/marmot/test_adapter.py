@@ -8063,6 +8063,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 if adapter.events:
                     break
                 await asyncio.sleep(0.01)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
 
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
