@@ -132,16 +132,44 @@ pub(super) fn create_generation_directory(path: &Path) -> Result<(), AuditDelive
 pub(super) fn open_journal_directories(
     path: &Path,
 ) -> Result<JournalDirectories, AuditDeliveryError> {
-    let root = fs_private::open_existing_directory_path(
-        path,
-        fs_private::PRIVATE_DIR_MODE,
-        fs_private::ExistingDirectoryMode::Enforce,
-    )
-    .map_err(map_generation_directory_error)?;
+    let root = open_generation_directory(path)?;
     let segments = root
         .open_existing_private_subdirectory(OsStr::new("segments"))
         .map_err(map_generation_directory_error)?;
     Ok(JournalDirectories { root, segments })
+}
+
+pub(super) fn open_or_recover_empty_journal_directories(
+    path: &Path,
+) -> Result<JournalDirectories, AuditDeliveryError> {
+    let root = open_generation_directory(path)?;
+    let segments = match root.open_existing_private_subdirectory(OsStr::new("segments")) {
+        Ok(segments) => segments,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            let root_empty = root
+                .is_empty()
+                .map_err(|source| AuditDeliveryError::Filesystem {
+                    operation: "inspect incomplete generation root",
+                    source,
+                })?;
+            if !root_empty {
+                return Err(AuditDeliveryError::IncompleteState);
+            }
+            root.create_private_subdirectory(OsStr::new("segments"))
+                .map_err(map_generation_directory_error)?
+        }
+        Err(source) => return Err(map_generation_directory_error(source)),
+    };
+    Ok(JournalDirectories { root, segments })
+}
+
+fn open_generation_directory(path: &Path) -> Result<PreparedDirectory, AuditDeliveryError> {
+    fs_private::open_existing_directory_path(
+        path,
+        fs_private::PRIVATE_DIR_MODE,
+        fs_private::ExistingDirectoryMode::Enforce,
+    )
+    .map_err(map_generation_directory_error)
 }
 
 fn map_generation_directory_error(source: io::Error) -> AuditDeliveryError {

@@ -360,7 +360,7 @@ fn contains_tracing_macro(line: &str) -> bool {
             line[..start]
                 .chars()
                 .next_back()
-                .is_none_or(|previous| previous != '_' && !unicode_ident::is_xid_continue(previous))
+                .is_none_or(|previous| !unicode_ident::is_xid_continue(previous))
         })
     })
 }

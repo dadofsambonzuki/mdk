@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use super::recovery::{
     FaultPoint, Faults, JournalDirectories, atomic_replace, create_generation_directory,
-    create_private_directory, open_journal_directories, open_segment_read, open_segment_sync,
-    read_bounded, validate_single_component,
+    create_private_directory, open_journal_directories, open_or_recover_empty_journal_directories,
+    open_segment_read, open_segment_sync, read_bounded, validate_single_component,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -408,8 +408,49 @@ impl AuditDeliveryStore {
             .join("v1")
             .join(journal_id.as_str());
         destination_profile.validate()?;
-        let directories = open_journal_directories(&root)?;
-        let manifest: Manifest = decode_metadata(&directories.root, MANIFEST_FILE)?;
+        let directories = open_or_recover_empty_journal_directories(&root)?;
+        let manifest: Manifest = match decode_metadata(&directories.root, MANIFEST_FILE) {
+            Ok(manifest) => manifest,
+            Err(AuditDeliveryError::IncompleteState) => {
+                match decode_metadata::<DurableState>(&directories.root, STATE_FILE) {
+                    Err(AuditDeliveryError::IncompleteState) => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(AuditDeliveryError::IncompleteState),
+                }
+                let segments_empty = directories.segments.is_empty().map_err(|source| {
+                    AuditDeliveryError::Filesystem {
+                        operation: "inspect incomplete generation segments",
+                        source,
+                    }
+                })?;
+                if !segments_empty {
+                    return Err(AuditDeliveryError::IncompleteState);
+                }
+
+                let manifest = Manifest {
+                    version: FORMAT_VERSION,
+                    journal_id: journal_id.clone(),
+                    segments: Vec::new(),
+                };
+                let mut state = initial_state(journal_id.clone(), destination_profile.clone());
+                state.health.recovery_events = 1;
+                let mut store = Self {
+                    root,
+                    directories,
+                    manifest,
+                    state,
+                    owner_epoch: random_epoch(),
+                    closed: false,
+                    recovery_required: false,
+                    faults: Faults::default(),
+                };
+                store.publish_manifest()?;
+                store.publish_state()?;
+                store.validate_all()?;
+                return Ok(store);
+            }
+            Err(error) => return Err(error),
+        };
         if manifest.version != FORMAT_VERSION {
             return Err(AuditDeliveryError::UnknownVersion);
         }
@@ -496,9 +537,7 @@ impl AuditDeliveryStore {
         let file_name = segment_file_name(&segment_id);
         let file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
         let (length, digest) = file_length_and_digest(&file)?;
-        if status == SegmentStatus::Sealed {
-            validate_complete_sealed_payload(&file, length)?;
-        }
+        validate_payload_framing(&file, length, status == SegmentStatus::Sealed)?;
         sync_payload(&file, &mut self.faults)?;
         let relative_name = format!("{SEGMENTS_DIR}/{}.jsonl", segment_id.as_str());
         let mut manifest = self.manifest.clone();
@@ -551,7 +590,7 @@ impl AuditDeliveryStore {
         validate_live_segment(&file, entry)?;
         let (length, digest) = file_length_and_digest(&file)?;
         validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
-        validate_complete_sealed_payload(&file, length)?;
+        validate_payload_framing(&file, length, true)?;
         sync_payload(&file, &mut self.faults)?;
 
         let mut manifest = self.manifest.clone();
@@ -972,28 +1011,73 @@ fn sync_payload(file: &File, faults: &mut Faults) -> Result<(), AuditDeliveryErr
         })
 }
 
-fn validate_complete_sealed_payload(file: &File, length: u64) -> Result<(), AuditDeliveryError> {
-    if length == 0 {
-        return Ok(());
-    }
+fn validate_payload_framing(
+    file: &File,
+    length: u64,
+    require_final_newline: bool,
+) -> Result<(), AuditDeliveryError> {
     let mut file = file
         .try_clone()
         .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "clone sealed payload handle",
+            operation: "clone payload framing handle",
             source,
         })?;
-    file.seek(SeekFrom::End(-1))
+    file.seek(SeekFrom::Start(0))
         .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "seek sealed payload tail",
+            operation: "seek payload framing range",
             source,
         })?;
-    let mut final_byte = [0u8; 1];
-    file.read_exact(&mut final_byte)
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "read sealed payload tail",
-            source,
+
+    let mut remaining = length;
+    let mut buffer = [0u8; 16 * 1024];
+    let mut body = Vec::new();
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| AuditDeliveryError::RangeTooLarge)?;
+        file.read_exact(&mut buffer[..amount]).map_err(|source| {
+            AuditDeliveryError::Filesystem {
+                operation: "read payload framing range",
+                source,
+            }
         })?;
-    if final_byte != *b"\n" {
+        let mut body_start = 0usize;
+        for (index, byte) in buffer[..amount].iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let body_length = body
+                .len()
+                .checked_add(index - body_start)
+                .ok_or(AuditDeliveryError::RangeTooLarge)?;
+            if body_length
+                .checked_add(1)
+                .ok_or(AuditDeliveryError::RangeTooLarge)?
+                > MAX_RANGE_BYTES
+            {
+                return Err(AuditDeliveryError::RangeTooLarge);
+            }
+            body.extend_from_slice(&buffer[body_start..index]);
+            std::str::from_utf8(&body).map_err(|_| AuditDeliveryError::InvalidJsonl)?;
+            body.clear();
+            body_start = index + 1;
+        }
+        if body_start < amount {
+            let body_length = body
+                .len()
+                .checked_add(amount - body_start)
+                .ok_or(AuditDeliveryError::RangeTooLarge)?;
+            if body_length > MAX_RANGE_BYTES {
+                return Err(AuditDeliveryError::RangeTooLarge);
+            }
+            body.extend_from_slice(&buffer[body_start..amount]);
+        }
+        remaining -= amount as u64;
+    }
+
+    if !body.is_empty() {
+        std::str::from_utf8(&body).map_err(|_| AuditDeliveryError::InvalidJsonl)?;
+    }
+    if require_final_newline && !body.is_empty() {
         return Err(AuditDeliveryError::InvalidJsonl);
     }
     Ok(())
@@ -1016,27 +1100,16 @@ fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), A
     if hex::encode(digest_range(file, 0, entry.registered_length)?) != entry.registered_digest {
         return Err(AuditDeliveryError::CorruptState);
     }
-    if entry.status == SegmentStatus::Sealed {
-        validate_complete_sealed_payload(file, length)?;
-    }
+    validate_payload_framing(
+        file,
+        entry.registered_length,
+        entry.status == SegmentStatus::Sealed,
+    )?;
     Ok(())
 }
 
 fn validate_live_segment(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {
-    validate_file_identity(file, &entry.file_identity)?;
-    let length = file
-        .metadata()
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "inspect live payload identity",
-            source,
-        })?
-        .len();
-    if length < entry.registered_length
-        || (entry.status == SegmentStatus::Sealed && length != entry.registered_length)
-    {
-        return Err(AuditDeliveryError::CorruptState);
-    }
-    Ok(())
+    validate_registered_prefix(file, entry)
 }
 
 fn file_identity(file: &File) -> Result<FileIdentity, AuditDeliveryError> {

@@ -148,6 +148,88 @@ impl PreparedDirectory {
         self.created
     }
 
+    /// Return whether this verified directory contains no entries.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        use std::ffi::CStr;
+        use std::os::fd::AsRawFd;
+
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_context(
+                "open verified directory for enumeration",
+                &self.path,
+                io::Error::last_os_error(),
+            ));
+        }
+        let stream = unsafe { libc::fdopendir(descriptor) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { libc::close(descriptor) };
+            return Err(io_context(
+                "enumerate verified directory",
+                &self.path,
+                error,
+            ));
+        }
+
+        let mut empty = true;
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe {
+                CStr::from_ptr((*entry).d_name.as_ptr().cast::<libc::c_char>()).to_bytes()
+            };
+            if name != b"." && name != b".." {
+                empty = false;
+                break;
+            }
+        }
+        if unsafe { libc::closedir(stream) } != 0 {
+            return Err(io_context(
+                "close verified directory enumeration",
+                &self.path,
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(empty)
+    }
+
+    /// Create and open one owner-only subdirectory beneath this verified directory.
+    pub fn create_private_subdirectory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<PreparedDirectory> {
+        use std::os::fd::AsRawFd;
+
+        let name_c = relative_component_c_string(name)?;
+        let mode = libc::mode_t::try_from(PRIVATE_DIR_MODE).expect("0700 fits mode_t");
+        if unsafe { libc::mkdirat(self.directory.as_raw_fd(), name_c.as_ptr(), mode) } != 0 {
+            return Err(io_context(
+                "create verified-directory subdirectory",
+                &self.path.join(name),
+                io::Error::last_os_error(),
+            ));
+        }
+        self.sync_all().map_err(|error| {
+            io_context(
+                "sync verified directory after subdirectory creation",
+                &self.path,
+                error,
+            )
+        })?;
+        let mut directory = self.open_existing_private_subdirectory(name)?;
+        directory.created = true;
+        Ok(directory)
+    }
+
     /// Open an existing regular file directly beneath this verified directory.
     pub fn open_existing_regular_file(
         &self,
@@ -1571,6 +1653,42 @@ mod unix_tests {
             .open_existing_regular_file(fifo_name, ExistingFileAccess::Read)
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn prepared_directory_empty_check_uses_the_verified_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        let prepared =
+            prepare_directory_path(&private, 0o700, ExistingDirectoryMode::Enforce).unwrap();
+        assert!(prepared.is_empty().unwrap());
+        drop(
+            prepared
+                .create_new_private_file(std::ffi::OsStr::new("payload"))
+                .unwrap(),
+        );
+        assert!(!prepared.is_empty().unwrap());
+    }
+
+    #[test]
+    fn prepared_directory_creates_private_subdirectory_from_verified_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        let prepared =
+            prepare_directory_path(&private, 0o700, ExistingDirectoryMode::Enforce).unwrap();
+        let child = prepared
+            .create_private_subdirectory(std::ffi::OsStr::new("segments"))
+            .unwrap();
+
+        assert!(child.was_created());
+        assert!(child.is_empty().unwrap());
+        assert_eq!(
+            std::fs::metadata(private.join("segments")).unwrap().mode() & MAX_MODE,
+            PRIVATE_DIR_MODE
+        );
+        assert!(!prepared.is_empty().unwrap());
     }
 
     fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {

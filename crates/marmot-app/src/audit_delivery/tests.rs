@@ -165,13 +165,8 @@ fn publication_faults_recover_only_unambiguous_create_and_registration_gaps() {
             AuditDeliveryStore::create_failing(root.path(), journal.clone(), profile(), fault)
                 .is_err()
         );
-        let reopened = AuditDeliveryStore::open(root.path(), journal.clone(), profile());
-        if fault == FaultPoint::DirectorySync {
-            drop(reopened.unwrap());
-            assert_eq!(persisted_recovery_events(&root, &journal), 1);
-        } else {
-            assert!(matches!(reopened, Err(AuditDeliveryError::IncompleteState)));
-        }
+        drop(AuditDeliveryStore::open(root.path(), journal.clone(), profile()).unwrap());
+        assert_eq!(persisted_recovery_events(&root, &journal), 1);
     }
 
     for fault in publication_faults {
@@ -204,6 +199,58 @@ fn publication_faults_recover_only_unambiguous_create_and_registration_gaps() {
             assert!(reopened.recover_prepared().unwrap().is_some());
         }
     }
+}
+
+#[test]
+fn manifestless_generation_with_payload_evidence_still_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    assert!(
+        AuditDeliveryStore::create_failing(
+            root.path(),
+            journal.clone(),
+            profile(),
+            FaultPoint::Write,
+        )
+        .is_err()
+    );
+    let generation = root.path().join("audit-delivery/v1").join(journal.as_str());
+    fs_private::write_private(&generation.join("segments/orphan.jsonl"), b"one\n").unwrap();
+
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::IncompleteState)
+    ));
+    assert!(!generation.join("manifest.json").exists());
+    assert!(!generation.join("state.json").exists());
+}
+
+#[test]
+fn empty_generation_without_segments_recovers_the_create_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let generation = root.path().join("audit-delivery/v1").join(journal.as_str());
+    fs_private::create_dir_all_private(&generation).unwrap();
+
+    drop(AuditDeliveryStore::open(root.path(), journal.clone(), profile()).unwrap());
+
+    assert!(generation.join("segments").is_dir());
+    assert_eq!(persisted_recovery_events(&root, &journal), 1);
+}
+
+#[test]
+fn nonempty_generation_without_segments_still_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let generation = root.path().join("audit-delivery/v1").join(journal.as_str());
+    fs_private::create_dir_all_private(&generation).unwrap();
+    fs_private::write_private(&generation.join("unknown"), b"evidence").unwrap();
+
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::IncompleteState)
+    ));
+    assert!(!generation.join("segments").exists());
 }
 
 #[test]
@@ -363,6 +410,57 @@ fn live_prepare_and_seal_reject_replaced_segment_identity() {
 }
 
 #[test]
+fn live_prepare_and_seal_reject_same_inode_registered_prefix_rewrite() {
+    let (_root, _journal, segment, mut store) = store_with_segment(b"one\n");
+    let path = store.segment_path(&segment).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    let generation = path.parent().unwrap().parent().unwrap();
+    let manifest_before = fs::read(generation.join("manifest.json")).unwrap();
+    let state_before = fs::read(generation.join("state.json")).unwrap();
+    fs_private::write_private(&path, b"two\n").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+    assert!(matches!(
+        store.seal_active_segment(&segment),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert!(matches!(
+        store.prepare_next(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read(generation.join("state.json")).unwrap(),
+        state_before
+    );
+
+    let (_root, _journal, segment, mut store) = store_with_segment(b"one\n");
+    store.seal_active_segment(&segment).unwrap();
+    let path = store.segment_path(&segment).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    let generation = path.parent().unwrap().parent().unwrap();
+    let manifest_before = fs::read(generation.join("manifest.json")).unwrap();
+    let state_before = fs::read(generation.join("state.json")).unwrap();
+    fs_private::write_private(&path, b"two\n").unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert!(matches!(
+        store.prepare_next(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(
+        fs::read(generation.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read(generation.join("state.json")).unwrap(),
+        state_before
+    );
+}
+
+#[test]
 fn empty_registered_segment_replacement_fails_recovery() {
     let (root, journal, segment, store) = store_with_segment(b"");
     let path = store.segment_path(&segment).unwrap();
@@ -452,9 +550,13 @@ fn j10_incomplete_tail_and_missing_newline_are_bounded_without_repair() {
     );
 
     let huge = vec![b'x'; 1024 * 1024 + 1];
-    let (_root, _journal, _segment, mut store) = store_with_segment(&huge);
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), &huge).unwrap();
     assert!(matches!(
-        store.prepare_next(),
+        store.register_segment(segment, SegmentStatus::Active),
         Err(AuditDeliveryError::RangeTooLarge)
     ));
 
@@ -489,6 +591,34 @@ fn j10_incomplete_tail_and_missing_newline_are_bounded_without_repair() {
     reopened.seal_active_segment(&segment).unwrap();
     let prepared = reopened.prepare_next().unwrap().unwrap();
     assert_eq!(prepared.bodies(), &[b"incomplete".to_vec()]);
+
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), &[0xf0, 0x9f]).unwrap();
+    assert!(matches!(
+        store.register_segment(segment.clone(), SegmentStatus::Active),
+        Err(AuditDeliveryError::InvalidJsonl)
+    ));
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), b"repaired\n").unwrap();
+    store
+        .register_segment(segment.clone(), SegmentStatus::Sealed)
+        .unwrap();
+    assert_eq!(
+        store.prepare_next().unwrap().unwrap().bodies(),
+        &[b"repaired".to_vec()]
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), &[0xff, b'\n']).unwrap();
+    assert!(matches!(
+        store.register_segment(segment, SegmentStatus::Sealed),
+        Err(AuditDeliveryError::InvalidJsonl)
+    ));
 }
 
 #[test]
