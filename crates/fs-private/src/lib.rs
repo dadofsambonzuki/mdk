@@ -180,8 +180,18 @@ impl PreparedDirectory {
 
         let mut empty = true;
         loop {
+            clear_errno();
             let entry = unsafe { libc::readdir(stream) };
             if entry.is_null() {
+                let source = io::Error::last_os_error();
+                if source.raw_os_error() != Some(0) {
+                    unsafe { libc::closedir(stream) };
+                    return Err(io_context(
+                        "read verified directory entry",
+                        &self.path,
+                        source,
+                    ));
+                }
                 break;
             }
             let name = unsafe {
@@ -431,6 +441,63 @@ impl PreparedDirectory {
         let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
         finish_private_exclusive_file_lease(file, &path, libc::LOCK_EX | libc::LOCK_NB)
     }
+}
+
+#[cfg(unix)]
+fn clear_errno() {
+    unsafe { *errno_location() = 0 };
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", target_os = "freebsd")))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "android", target_os = "netbsd", target_os = "openbsd")
+))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno() }
+}
+
+#[cfg(all(unix, any(target_os = "solaris", target_os = "illumos")))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::___errno() }
+}
+
+#[cfg(all(unix, target_os = "aix"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::_Errno() }
+}
+
+#[cfg(all(unix, target_os = "haiku"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::_errnop() }
+}
+
+#[cfg(all(unix, target_os = "nto"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__get_errno_ptr() }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix",
+        target_os = "haiku",
+        target_os = "nto"
+    ))
+))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
 }
 
 #[cfg(unix)]

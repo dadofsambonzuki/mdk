@@ -360,7 +360,7 @@ fn contains_tracing_macro(line: &str) -> bool {
             line[..start]
                 .chars()
                 .next_back()
-                .is_none_or(|previous| !unicode_ident::is_xid_continue(previous))
+                .is_none_or(|previous| previous != ':' && !unicode_ident::is_xid_continue(previous))
         })
     })
 }
@@ -370,12 +370,15 @@ fn tracing_macro_scan_does_not_treat_compile_error_as_error() {
     let contents = r#"
 compile_error!("unsupported platform");
 compiléerror!("unsupported platform");
+other::error!("not a tracing macro");
+tracing::error!(target: "audit", method = "test", "expected qualified tracing call");
 error!(target: "audit", method = "test", "expected tracing call");
 "#;
 
     let invocations = tracing_invocations(contents);
-    assert_eq!(invocations.len(), 1);
-    assert_eq!(invocations[0].line, 4);
+    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations[0].line, 5);
+    assert_eq!(invocations[1].line, 6);
 }
 
 #[test]

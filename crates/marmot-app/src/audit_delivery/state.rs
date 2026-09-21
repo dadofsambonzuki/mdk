@@ -784,6 +784,11 @@ impl AuditDeliveryStore {
             let file_name = segment_file_name(&entry.segment_id);
             let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
             validate_registered_prefix(&file, entry)?;
+            validate_payload_framing(
+                &file,
+                entry.registered_length,
+                entry.status == SegmentStatus::Sealed,
+            )?;
             validate_acknowledged_boundary(&file, cursor)?;
         }
         match self.state.health.status {
@@ -1100,11 +1105,6 @@ fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), A
     if hex::encode(digest_range(file, 0, entry.registered_length)?) != entry.registered_digest {
         return Err(AuditDeliveryError::CorruptState);
     }
-    validate_payload_framing(
-        file,
-        entry.registered_length,
-        entry.status == SegmentStatus::Sealed,
-    )?;
     Ok(())
 }
 
