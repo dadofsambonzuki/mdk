@@ -110,6 +110,14 @@ pub enum ExistingDirectoryMode {
     Enforce,
 }
 
+/// Access requested for an existing regular file beneath a verified directory.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingFileAccess {
+    Read,
+    ReadWrite,
+}
+
 /// An opened directory returned by [`prepare_directory_path`]. Keeping this
 /// value alive keeps the verified leaf open while a caller creates an artifact
 /// beneath it.
@@ -138,6 +146,153 @@ impl PreparedDirectory {
     #[must_use]
     pub fn was_created(&self) -> bool {
         self.created
+    }
+
+    /// Open an existing regular file directly beneath this verified directory.
+    pub fn open_existing_regular_file(
+        &self,
+        name: &std::ffi::OsStr,
+        access: ExistingFileAccess,
+    ) -> io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let name_c = relative_component_c_string(name)?;
+        let access = match access {
+            ExistingFileAccess::Read => libc::O_RDONLY,
+            ExistingFileAccess::ReadWrite => libc::O_RDWR,
+        };
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name_c.as_ptr(),
+                access | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let source = io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ELOOP) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "verified-directory entry is a symbolic link",
+                ));
+            }
+            return Err(io_context(
+                "open verified-directory file",
+                &self.path.join(name),
+                source,
+            ));
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        if !file.metadata()?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "verified-directory entry is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Open an existing private subdirectory without following its name.
+    pub fn open_existing_private_subdirectory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<PreparedDirectory> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        let name_c = relative_component_c_string(name)?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_context(
+                "open verified-directory subdirectory",
+                &self.path.join(name),
+                io::Error::last_os_error(),
+            ));
+        }
+        let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let mode = libc::mode_t::try_from(PRIVATE_DIR_MODE).expect("0700 fits mode_t");
+        if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
+            return Err(io_context(
+                "set verified subdirectory mode",
+                &self.path.join(name),
+                io::Error::last_os_error(),
+            ));
+        }
+        let metadata = directory.metadata()?;
+        Ok(PreparedDirectory {
+            path: self.path.join(name),
+            mode: metadata.mode() & MAX_MODE,
+            uid: metadata.uid(),
+            created: false,
+            directory,
+        })
+    }
+
+    /// Create a new private regular file directly beneath this directory.
+    pub fn create_new_private_file(&self, name: &std::ffi::OsStr) -> io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let name_c = relative_component_c_string(name)?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::c_uint::try_from(PRIVATE_FILE_MODE).expect("0600 fits c_uint"),
+            )
+        };
+        if descriptor < 0 {
+            return Err(io_context(
+                "create verified-directory private file",
+                &self.path.join(name),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+    }
+
+    /// Atomically replace one entry with another inside this directory.
+    pub fn replace_entry(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let from_c = relative_component_c_string(from)?;
+        let to_c = relative_component_c_string(to)?;
+        if unsafe {
+            libc::renameat(
+                self.directory.as_raw_fd(),
+                from_c.as_ptr(),
+                self.directory.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Remove one non-directory entry directly beneath this directory.
+    pub fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let name_c = relative_component_c_string(name)?;
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name_c.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Synchronize this directory descriptor.
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.directory.sync_all()
     }
 
     /// Try to acquire a private lease file directly beneath this verified
@@ -188,6 +343,28 @@ impl PreparedDirectory {
     }
 }
 
+#[cfg(unix)]
+fn relative_component_c_string(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut components = Path::new(name).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name must be one non-empty path component",
+        ));
+    }
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry name contains a NUL byte",
+        )
+    })
+}
+
 /// Open or create `path` while refusing symlinks.
 ///
 /// Missing components are created at `mode` (subject only to a temporarily
@@ -206,6 +383,30 @@ pub fn prepare_directory_path(
     path: &Path,
     mode: u32,
     policy: ExistingDirectoryMode,
+) -> io::Result<PreparedDirectory> {
+    open_directory_path(path, mode, policy, true)
+}
+
+/// Open an existing directory path without following symlinks or creating a
+/// missing component.
+///
+/// The returned descriptor remains anchored to the verified directory even if
+/// its pathname is subsequently replaced.
+#[cfg(unix)]
+pub fn open_existing_directory_path(
+    path: &Path,
+    mode: u32,
+    policy: ExistingDirectoryMode,
+) -> io::Result<PreparedDirectory> {
+    open_directory_path(path, mode, policy, false)
+}
+
+#[cfg(unix)]
+fn open_directory_path(
+    path: &Path,
+    mode: u32,
+    policy: ExistingDirectoryMode,
+    create_missing: bool,
 ) -> io::Result<PreparedDirectory> {
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -328,7 +529,7 @@ pub fn prepare_directory_path(
         let mut created = false;
         let next = match open_directory_at(current.as_raw_fd(), &component) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create_missing => {
                 let result = unsafe {
                     libc::mkdirat(current.as_raw_fd(), component.as_ptr(), platform_mode)
                 };
@@ -1322,6 +1523,22 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
         assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn open_existing_directory_path_never_creates_missing_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing").join("leaf");
+        assert!(
+            open_existing_directory_path(&missing, 0o700, ExistingDirectoryMode::Enforce).is_err()
+        );
+        assert!(!dir.path().join("missing").exists());
+
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let opened =
+            open_existing_directory_path(&existing, 0o700, ExistingDirectoryMode::Enforce).unwrap();
+        assert!(!opened.was_created());
     }
 
     fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {

@@ -1,5 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -293,6 +294,58 @@ fn j08_missing_truncated_unknown_and_replaced_state_fail_closed() {
 }
 
 #[test]
+fn live_prepare_and_seal_reject_replaced_segment_identity() {
+    let (_root, _journal, segment, mut store) = store_with_segment(b"one\n");
+    let path = store.segment_path(&segment).unwrap();
+    let displaced = path.with_extension("original");
+    fs::rename(&path, &displaced).unwrap();
+    fs_private::write_private(&path, b"two\n").unwrap();
+    assert!(matches!(
+        store.prepare_next(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert!(matches!(
+        store.seal_active_segment(&segment),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+    assert_eq!(fs::read(displaced).unwrap(), b"one\n");
+}
+
+#[test]
+fn empty_registered_segment_replacement_fails_recovery() {
+    let (root, journal, segment, store) = store_with_segment(b"");
+    let path = store.segment_path(&segment).unwrap();
+    drop(store);
+    let displaced = path.with_extension("original");
+    fs::rename(&path, &displaced).unwrap();
+    fs_private::write_private(&path, b"").unwrap();
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
+fn sealed_segment_growth_is_rejected_live_and_on_reopen() {
+    let (_root, _journal, segment, mut store) = store_with_segment(b"one\n");
+    store.seal_active_segment(&segment).unwrap();
+    append(&store, &segment, b"two\n");
+    assert!(matches!(
+        store.prepare_next(),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+
+    let (root, journal, segment, mut store) = store_with_segment(b"one\n");
+    store.seal_active_segment(&segment).unwrap();
+    append(&store, &segment, b"two\n");
+    drop(store);
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
 fn j09_middle_change_in_prepared_range_is_detected() {
     let (_root, _journal, segment, mut store) = store_with_segment(b"aaaa\nbbbb\ncccc\n");
     store.prepare_next().unwrap().unwrap();
@@ -440,6 +493,44 @@ fn j12_paths_collisions_and_modes_are_private() {
 }
 
 #[test]
+fn generation_and_segments_directory_symlinks_are_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let (root, journal, _segment, store) = store_with_segment(b"one\n");
+    let generation = root.path().join("audit-delivery/v1").join(journal.as_str());
+    drop(store);
+    let outside_generation = root.path().join("outside-generation");
+    fs::rename(&generation, &outside_generation).unwrap();
+    let manifest_before = fs::read(outside_generation.join("manifest.json")).unwrap();
+    symlink(&outside_generation, &generation).unwrap();
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::UnsafePath)
+    ));
+    assert_eq!(
+        fs::read(outside_generation.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+
+    let (root, journal, _segment, store) = store_with_segment(b"one\n");
+    let generation = root.path().join("audit-delivery/v1").join(journal.as_str());
+    drop(store);
+    let segments = generation.join("segments");
+    let outside_segments = root.path().join("outside-segments");
+    fs::rename(&segments, &outside_segments).unwrap();
+    let payload_before = fs::read_dir(&outside_segments).unwrap().count();
+    symlink(&outside_segments, &segments).unwrap();
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::UnsafePath)
+    ));
+    assert_eq!(
+        fs::read_dir(&outside_segments).unwrap().count(),
+        payload_before
+    );
+}
+
+#[test]
 fn j13_metadata_size_is_bounded_before_decode() {
     let (root, journal, _segment, _store) = store_with_segment(b"one\n");
     let manifest = root
@@ -467,13 +558,19 @@ fn j13_metadata_size_is_bounded_before_decode() {
     for index in 0..256 {
         let id = format!("segment-{index}");
         let segment_id = SegmentId::parse(id.clone()).unwrap();
-        fs_private::create_new_private(&store.segment_path(&segment_id).unwrap()).unwrap();
+        let segment_path = store.segment_path(&segment_id).unwrap();
+        fs_private::create_new_private(&segment_path).unwrap();
+        let metadata = fs::metadata(&segment_path).unwrap();
         segments.push(serde_json::json!({
             "segment_id": id,
             "relative_name": format!("segments/segment-{index}.jsonl"),
             "status": "sealed",
             "registered_length": 0,
             "registered_digest": empty_digest.clone(),
+            "file_identity": {
+                "device": metadata.dev(),
+                "inode": metadata.ino(),
+            },
         }));
         cursors.push(serde_json::json!({
             "segment_id": format!("segment-{index}"),

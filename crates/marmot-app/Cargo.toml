@@ -7,8 +7,8 @@ publish.workspace = true
 
 [features]
 default = []
-# Inactive audit journal delivery metadata foundation. This feature adds no
-# network transport and does not enable forensic recording or export.
+# Inactive Unix audit journal delivery metadata foundation. This feature adds
+# no network transport and does not enable forensic recording or export.
 audit-delivery = []
 product-analytics-export = []
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.

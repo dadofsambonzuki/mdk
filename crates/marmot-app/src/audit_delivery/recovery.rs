@@ -1,12 +1,19 @@
-use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use fs_private::{ExistingFileAccess, PreparedDirectory};
 
 use super::state::{AuditDeliveryError, MAX_METADATA_BYTES};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(super) struct JournalDirectories {
+    pub(super) root: PreparedDirectory,
+    pub(super) segments: PreparedDirectory,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FaultPoint {
@@ -92,39 +99,25 @@ pub(super) fn validate_single_component(value: &str) -> Result<(), AuditDelivery
 }
 
 pub(super) fn create_private_directory(path: &Path) -> Result<(), AuditDeliveryError> {
-    #[cfg(unix)]
-    {
-        fs_private::prepare_directory_path(
-            path,
-            fs_private::PRIVATE_DIR_MODE,
-            fs_private::ExistingDirectoryMode::Enforce,
-        )
-        .map(|_| ())
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "create private journal directory",
-            source,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        fs_private::create_dir_all_private(path).map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "create private journal directory",
-            source,
-        })
-    }
+    fs_private::prepare_directory_path(
+        path,
+        fs_private::PRIVATE_DIR_MODE,
+        fs_private::ExistingDirectoryMode::Enforce,
+    )
+    .map(|_| ())
+    .map_err(|source| AuditDeliveryError::Filesystem {
+        operation: "create private journal directory",
+        source,
+    })
 }
 
 pub(super) fn create_generation_directory(path: &Path) -> Result<(), AuditDeliveryError> {
     let parent = path.parent().ok_or(AuditDeliveryError::UnsafePath)?;
     create_private_directory(parent)?;
     let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(fs_private::PRIVATE_DIR_MODE);
-    }
-    let result = builder.create(path);
-    match result {
+    use std::os::unix::fs::DirBuilderExt;
+    builder.mode(fs_private::PRIVATE_DIR_MODE);
+    match builder.create(path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
             Err(AuditDeliveryError::GenerationCollision)
@@ -136,43 +129,66 @@ pub(super) fn create_generation_directory(path: &Path) -> Result<(), AuditDelive
     }
 }
 
-pub(super) fn open_regular_read(path: &Path) -> Result<File, AuditDeliveryError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(AuditDeliveryError::UnsafePath);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(AuditDeliveryError::Filesystem {
-                operation: "inspect journal artifact path",
-                source,
-            });
-        }
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    fs_private::set_private_file_mode(&mut options);
-    let file = options
-        .open(path)
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "open journal artifact",
-            source,
-        })?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "inspect journal artifact",
-            source,
-        })?;
-    if !metadata.file_type().is_file() {
-        return Err(AuditDeliveryError::UnsafePath);
-    }
-    Ok(file)
+pub(super) fn open_journal_directories(
+    path: &Path,
+) -> Result<JournalDirectories, AuditDeliveryError> {
+    let root = fs_private::open_existing_directory_path(
+        path,
+        fs_private::PRIVATE_DIR_MODE,
+        fs_private::ExistingDirectoryMode::Enforce,
+    )
+    .map_err(map_generation_directory_error)?;
+    let segments = root
+        .open_existing_private_subdirectory(OsStr::new("segments"))
+        .map_err(map_generation_directory_error)?;
+    Ok(JournalDirectories { root, segments })
 }
 
-pub(super) fn open_segment_read(path: &Path) -> Result<File, AuditDeliveryError> {
-    match open_regular_read(path) {
+fn map_generation_directory_error(source: io::Error) -> AuditDeliveryError {
+    if source.kind() == io::ErrorKind::NotFound {
+        AuditDeliveryError::IncompleteState
+    } else {
+        AuditDeliveryError::UnsafePath
+    }
+}
+
+pub(super) fn open_segment_read(
+    segments: &PreparedDirectory,
+    name: &OsStr,
+) -> Result<File, AuditDeliveryError> {
+    map_missing_segment(
+        segments
+            .open_existing_regular_file(name, ExistingFileAccess::Read)
+            .map_err(open_artifact_error),
+    )
+}
+
+pub(super) fn open_segment_sync(
+    segments: &PreparedDirectory,
+    name: &OsStr,
+) -> Result<File, AuditDeliveryError> {
+    map_missing_segment(
+        segments
+            .open_existing_regular_file(name, ExistingFileAccess::ReadWrite)
+            .map_err(open_artifact_error),
+    )
+}
+
+fn open_artifact_error(source: io::Error) -> AuditDeliveryError {
+    if source.kind() == io::ErrorKind::InvalidInput {
+        AuditDeliveryError::UnsafePath
+    } else {
+        AuditDeliveryError::Filesystem {
+            operation: "open journal artifact",
+            source,
+        }
+    }
+}
+
+fn map_missing_segment(
+    result: Result<File, AuditDeliveryError>,
+) -> Result<File, AuditDeliveryError> {
+    match result {
         Err(AuditDeliveryError::Filesystem { source, .. })
             if source.kind() == io::ErrorKind::NotFound =>
         {
@@ -182,8 +198,13 @@ pub(super) fn open_segment_read(path: &Path) -> Result<File, AuditDeliveryError>
     }
 }
 
-pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, AuditDeliveryError> {
-    let file = open_regular_read(path)?;
+pub(super) fn read_bounded(
+    root: &PreparedDirectory,
+    name: &OsStr,
+) -> Result<Vec<u8>, AuditDeliveryError> {
+    let file = root
+        .open_existing_regular_file(name, ExistingFileAccess::Read)
+        .map_err(open_artifact_error)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -208,17 +229,16 @@ pub(super) fn read_bounded(path: &Path) -> Result<Vec<u8>, AuditDeliveryError> {
 }
 
 pub(super) fn atomic_replace(
-    path: &Path,
+    root: &PreparedDirectory,
+    target: &OsStr,
     bytes: &[u8],
     faults: &mut Faults,
 ) -> Result<(), AuditDeliveryError> {
     if bytes.len() > MAX_METADATA_BYTES {
         return Err(AuditDeliveryError::MetadataTooLarge);
     }
-    let parent = path.parent().ok_or(AuditDeliveryError::UnsafePath)?;
-    validate_existing_target(path)?;
-    let file_name = path.file_name().ok_or(AuditDeliveryError::UnsafePath)?;
-    let (mut file, temporary) = create_temporary(parent, file_name)?;
+    validate_existing_target(root, target)?;
+    let (mut file, temporary) = create_temporary(root, target)?;
     let result = (|| {
         faults.check(FaultPoint::Write)?;
         file.write_all(bytes)
@@ -234,43 +254,44 @@ pub(super) fn atomic_replace(
             })?;
         drop(file);
         faults.check(FaultPoint::Rename)?;
-        fs::rename(&temporary, path).map_err(|source| AuditDeliveryError::Filesystem {
-            operation: "publish metadata",
-            source,
+        root.replace_entry(&temporary, target).map_err(|source| {
+            AuditDeliveryError::Filesystem {
+                operation: "publish metadata",
+                source,
+            }
         })?;
         faults.check(FaultPoint::DirectorySync)?;
-        sync_directory(parent).map_err(|source| AuditDeliveryError::UncertainPublication { source })
+        root.sync_all()
+            .map_err(|source| AuditDeliveryError::UncertainPublication { source })
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = root.remove_file(&temporary);
     }
     result
 }
 
-fn validate_existing_target(path: &Path) -> Result<(), AuditDeliveryError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(AuditDeliveryError::UnsafePath),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(AuditDeliveryError::Filesystem {
-            operation: "inspect metadata target",
-            source,
-        }),
+fn validate_existing_target(
+    root: &PreparedDirectory,
+    target: &OsStr,
+) -> Result<(), AuditDeliveryError> {
+    match root.open_existing_regular_file(target, ExistingFileAccess::Read) {
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(open_artifact_error(source)),
     }
 }
 
 fn create_temporary(
-    parent: &Path,
-    target: &std::ffi::OsStr,
-) -> Result<(File, PathBuf), AuditDeliveryError> {
+    root: &PreparedDirectory,
+    target: &OsStr,
+) -> Result<(File, OsString), AuditDeliveryError> {
     for _ in 0..32 {
         let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut name = OsString::from(".");
         name.push(target);
         name.push(format!(".tmp-{}-{nonce}", std::process::id()));
-        let path = parent.join(name);
-        match fs_private::create_new_private(&path) {
-            Ok(file) => return Ok((file, path)),
+        match root.create_new_private_file(&name) {
+            Ok(file) => return Ok((file, name)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(AuditDeliveryError::Filesystem {
@@ -281,14 +302,4 @@ fn create_temporary(
         }
     }
     Err(AuditDeliveryError::TemporaryNameExhausted)
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
 }

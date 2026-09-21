@@ -4,7 +4,8 @@
 //! private JSONL journal. It neither creates audit bodies nor sends them. The
 //! existing recorder and runtime do not call this module; enabling the Cargo
 //! feature only makes the Rust API available for integration work in a later
-//! change.
+//! change. The foundation is currently Unix-only so its payload identity and
+//! descriptor-relative confinement contracts have one explicit platform model.
 //!
 //! This state is intentionally separate from the existing lossy upload
 //! checkpoint: it supports exact prepared-range recovery rather than merely
@@ -16,7 +17,8 @@
 //! and directory sync. A directory-sync failure fences that owner until the
 //! store is reopened because publication may already have committed.
 //! A cursor's boundary digest covers at most the final 64 KiB before its byte
-//! offset; sealed-segment identity is validated separately over the full file.
+//! offset; stable device/inode identity detects pathname replacement, and a
+//! sealed segment is validated separately at its exact final length and digest.
 
 mod recovery;
 mod state;

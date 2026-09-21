@@ -82,7 +82,9 @@ mod app_telemetry;
 mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;
-#[cfg(feature = "audit-delivery")]
+#[cfg(all(feature = "audit-delivery", not(unix)))]
+compile_error!("the experimental audit-delivery foundation currently requires Unix");
+#[cfg(all(feature = "audit-delivery", unix))]
 pub mod audit_delivery;
 mod audit_log;
 mod chat_presentation;

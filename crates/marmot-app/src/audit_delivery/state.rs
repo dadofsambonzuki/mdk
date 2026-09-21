@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rand::RngCore;
@@ -10,8 +12,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::recovery::{
-    FaultPoint, Faults, atomic_replace, create_generation_directory, create_private_directory,
-    open_segment_read, read_bounded, validate_single_component,
+    FaultPoint, Faults, JournalDirectories, atomic_replace, create_generation_directory,
+    create_private_directory, open_journal_directories, open_segment_read, open_segment_sync,
+    read_bounded, validate_single_component,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -253,6 +256,14 @@ struct SegmentEntry {
     status: SegmentStatus,
     registered_length: u64,
     registered_digest: String,
+    file_identity: FileIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +323,7 @@ enum HealthStatus {
 /// payload data.
 pub struct AuditDeliveryStore {
     root: PathBuf,
+    directories: JournalDirectories,
     manifest: Manifest,
     state: DurableState,
     owner_epoch: [u8; 16],
@@ -363,6 +375,7 @@ impl AuditDeliveryStore {
             .join(journal_id.as_str());
         create_generation_directory(&root)?;
         create_private_directory(&root.join(SEGMENTS_DIR))?;
+        let directories = open_journal_directories(&root)?;
         let manifest = Manifest {
             version: FORMAT_VERSION,
             journal_id: journal_id.clone(),
@@ -383,6 +396,7 @@ impl AuditDeliveryStore {
         };
         let mut store = Self {
             root,
+            directories,
             manifest,
             state,
             owner_epoch: random_epoch(),
@@ -408,8 +422,9 @@ impl AuditDeliveryStore {
             .join("audit-delivery")
             .join("v1")
             .join(journal_id.as_str());
-        let manifest: Manifest = decode_metadata(&root.join(MANIFEST_FILE))?;
-        let state: DurableState = decode_metadata(&root.join(STATE_FILE))?;
+        let directories = open_journal_directories(&root)?;
+        let manifest: Manifest = decode_metadata(&directories.root, MANIFEST_FILE)?;
+        let state: DurableState = decode_metadata(&directories.root, STATE_FILE)?;
         if manifest.version != FORMAT_VERSION || state.version != FORMAT_VERSION {
             return Err(AuditDeliveryError::UnknownVersion);
         }
@@ -421,6 +436,7 @@ impl AuditDeliveryStore {
         }
         let store = Self {
             root,
+            directories,
             manifest,
             state,
             owner_epoch: random_epoch(),
@@ -475,8 +491,9 @@ impl AuditDeliveryStore {
         {
             return Err(AuditDeliveryError::InvalidSegmentOrder);
         }
-        let path = self.segment_path(&segment_id)?;
-        let (length, digest) = file_length_and_digest(&path)?;
+        let file_name = segment_file_name(&segment_id);
+        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        let (length, digest) = file_length_and_digest(&file)?;
         let relative_name = format!("{SEGMENTS_DIR}/{}.jsonl", segment_id.as_str());
         let mut manifest = self.manifest.clone();
         manifest.segments.push(SegmentEntry {
@@ -485,6 +502,7 @@ impl AuditDeliveryStore {
             status,
             registered_length: length,
             registered_digest: hex::encode(digest),
+            file_identity: file_identity(&file)?,
         });
         self.publish_manifest_value(&manifest)?;
         self.manifest = manifest;
@@ -522,9 +540,10 @@ impl AuditDeliveryStore {
         {
             return Err(AuditDeliveryError::InvalidSegmentOrder);
         }
-        let path = self.root.join(&entry.relative_name);
-        let (length, digest) = file_length_and_digest(&path)?;
-        let file = open_segment_read(&path)?;
+        let file_name = segment_file_name(segment_id);
+        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        validate_live_segment(&file, entry)?;
+        let (length, digest) = file_length_and_digest(&file)?;
         validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
 
         let mut manifest = self.manifest.clone();
@@ -550,8 +569,9 @@ impl AuditDeliveryStore {
         }
         for entry in &self.manifest.segments {
             let cursor = self.cursor(&entry.segment_id)?;
-            let path = self.root.join(&entry.relative_name);
-            let mut file = open_segment_read(&path)?;
+            let file_name = segment_file_name(&entry.segment_id);
+            let mut file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
+            validate_live_segment(&file, entry)?;
             validate_acknowledged_boundary(&file, cursor)?;
             let (bodies, end_offset) =
                 read_complete_range(&mut file, cursor.acknowledged_end, None)?;
@@ -618,8 +638,9 @@ impl AuditDeliveryStore {
         validate_single_component(&prepared.attempt_id)?;
         self.validate_prepared_cursor(&prepared)?;
         let entry = self.segment(&prepared.segment_id)?;
-        let path = self.root.join(&entry.relative_name);
-        let mut file = open_segment_read(&path)?;
+        let file_name = segment_file_name(&entry.segment_id);
+        let mut file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        validate_live_segment(&file, entry)?;
         let (bodies, end_offset) =
             read_complete_range(&mut file, prepared.start_offset, Some(prepared.end_offset))?;
         if end_offset != prepared.end_offset
@@ -655,7 +676,9 @@ impl AuditDeliveryStore {
         // Re-verify the complete in-flight bytes immediately before advancing.
         self.recover_prepared()?;
         let entry = self.segment(&prepared.segment_id)?;
-        let file = open_segment_read(&self.root.join(&entry.relative_name))?;
+        let file_name = segment_file_name(&entry.segment_id);
+        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        validate_live_segment(&file, entry)?;
         let boundary_digest = digest_boundary(&file, prepared.end_offset)?;
         let mut state = self.state.clone();
         state.revision = next_revision(state.revision)?;
@@ -719,7 +742,8 @@ impl AuditDeliveryStore {
                 return Err(AuditDeliveryError::InvalidSegmentOrder);
             }
             let cursor = self.cursor(&entry.segment_id)?;
-            let file = open_segment_read(&self.root.join(&entry.relative_name))?;
+            let file_name = segment_file_name(&entry.segment_id);
+            let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
             validate_registered_prefix(&file, entry)?;
             validate_acknowledged_boundary(&file, cursor)?;
         }
@@ -800,7 +824,12 @@ impl AuditDeliveryStore {
         value: &impl Serialize,
     ) -> Result<(), AuditDeliveryError> {
         let bytes = encode_metadata(value)?;
-        let result = atomic_replace(&self.root.join(file_name), &bytes, &mut self.faults);
+        let result = atomic_replace(
+            &self.directories.root,
+            OsStr::new(file_name),
+            &bytes,
+            &mut self.faults,
+        );
         if matches!(result, Err(AuditDeliveryError::UncertainPublication { .. })) {
             self.recovery_required = true;
         }
@@ -838,8 +867,11 @@ fn encode_metadata(value: &impl Serialize) -> Result<Vec<u8>, AuditDeliveryError
     Ok(bytes)
 }
 
-fn decode_metadata<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, AuditDeliveryError> {
-    let bytes = match read_bounded(path) {
+fn decode_metadata<T: for<'de> Deserialize<'de>>(
+    root: &fs_private::PreparedDirectory,
+    file_name: &str,
+) -> Result<T, AuditDeliveryError> {
+    let bytes = match read_bounded(root, OsStr::new(file_name)) {
         Ok(bytes) => bytes,
         Err(AuditDeliveryError::Filesystem { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -869,8 +901,7 @@ fn next_revision(revision: u64) -> Result<u64, AuditDeliveryError> {
         .ok_or(AuditDeliveryError::CorruptState)
 }
 
-fn file_length_and_digest(path: &Path) -> Result<(u64, [u8; 32]), AuditDeliveryError> {
-    let file = open_segment_read(path)?;
+fn file_length_and_digest(file: &File) -> Result<(u64, [u8; 32]), AuditDeliveryError> {
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -878,10 +909,11 @@ fn file_length_and_digest(path: &Path) -> Result<(u64, [u8; 32]), AuditDeliveryE
             source,
         })?
         .len();
-    Ok((length, digest_range(&file, 0, length)?))
+    Ok((length, digest_range(file, 0, length)?))
 }
 
 fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {
+    validate_file_identity(file, &entry.file_identity)?;
     let length = file
         .metadata()
         .map_err(|source| AuditDeliveryError::Filesystem {
@@ -889,13 +921,56 @@ fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), A
             source,
         })?
         .len();
-    if length < entry.registered_length {
+    if length < entry.registered_length
+        || (entry.status == SegmentStatus::Sealed && length != entry.registered_length)
+    {
         return Err(AuditDeliveryError::CorruptState);
     }
     if hex::encode(digest_range(file, 0, entry.registered_length)?) != entry.registered_digest {
         return Err(AuditDeliveryError::CorruptState);
     }
     Ok(())
+}
+
+fn validate_live_segment(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {
+    validate_file_identity(file, &entry.file_identity)?;
+    let length = file
+        .metadata()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "inspect live payload identity",
+            source,
+        })?
+        .len();
+    if length < entry.registered_length
+        || (entry.status == SegmentStatus::Sealed && length != entry.registered_length)
+    {
+        return Err(AuditDeliveryError::CorruptState);
+    }
+    Ok(())
+}
+
+fn file_identity(file: &File) -> Result<FileIdentity, AuditDeliveryError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "inspect payload file identity",
+            source,
+        })?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn validate_file_identity(file: &File, expected: &FileIdentity) -> Result<(), AuditDeliveryError> {
+    if file_identity(file)? != *expected {
+        return Err(AuditDeliveryError::CorruptState);
+    }
+    Ok(())
+}
+
+fn segment_file_name(segment_id: &SegmentId) -> String {
+    format!("{}.jsonl", segment_id.as_str())
 }
 
 fn validate_acknowledged_boundary(
