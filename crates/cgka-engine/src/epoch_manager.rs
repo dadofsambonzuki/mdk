@@ -79,16 +79,17 @@ impl EpochManager {
     /// Drop a group's in-memory epoch entry: the retraction path for the
     /// session-open cheap pass's provisional `Stable` seed (mdk#1161).
     ///
-    /// Two callers only. `ensure_hydrated` retracts the seed immediately
+    /// Three callers. `ensure_hydrated` retracts the seed immediately
     /// before running full per-group hydration, so hydration derives the real
     /// entry (`set_stable` / `restore_pending` / `restore_unrecoverable`)
     /// from exactly the entry-absent conditions the open-time loop always
     /// had — a projected-forward record mirror must not become the
-    /// `begin_pending` base. And `quarantine_stored_group_on_hydrate` clears
-    /// whatever entry remains when hydration fails, because a quarantined
-    /// group must have no epoch entry: `live_group_ids` filters on entry
-    /// presence, and every convergence/ingest gate treats "no state" as "not
-    /// live". Durable halt markers are unaffected:
+    /// `begin_pending` base. And `quarantine_stored_group_on_hydrate` plus
+    /// `retry_hydrate_quarantined_group`'s failure arm clear whatever entry
+    /// remains when hydration fails, because a quarantined group must have no
+    /// epoch entry: `live_group_ids` filters on entry presence (over and above
+    /// the durable terminal markers), and every convergence/ingest gate treats
+    /// "no state" as "not live". Durable halt markers are unaffected:
     /// `sync_unrecoverable_halt_from_storage` re-syncs them on demand.
     pub(crate) fn clear_group_state(&mut self, group_id: &GroupId) {
         self.states.remove(group_id);

@@ -447,7 +447,10 @@ impl AppClient {
     /// mutation whose trailing app-state write failed, and hydrate the durable
     /// roster-count projection introduced for chat-list classification.
     /// Quarantined groups are absent from `live_group_ids` and retain their
-    /// dedicated recovery path.
+    /// dedicated recovery path. So is a copy this device was removed from: its
+    /// add-missing leg no longer re-adds one, and its roster repair no longer
+    /// reaches one — a departed copy's projection is whatever the removal left,
+    /// until a re-add puts the group back in the listing.
     pub(crate) fn reconcile_live_engine_groups(&mut self) -> Result<bool, AppError> {
         let projected = self
             .state

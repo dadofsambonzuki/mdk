@@ -497,8 +497,9 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
 - **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
   `hydrate_stable_groups_from_storage` is the cheap seed pass: per stored group it reads only the durable record —
   no MLS load, snapshot list, or message scan — seeds a provisional `Stable(record.epoch)` entry so `live_group_ids`
-  keeps listing the group, restores disband/unrecoverable terminal state, seeds the inbound routing index from the
-  durable `transport_group_routes` table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
+  keeps listing the group (unless this device was removed from it, which that listing drops regardless), restores
+  disband/unrecoverable terminal state, seeds the inbound routing index from the durable `transport_group_routes`
+  table, and adds the group to `unhydrated_groups`. An unhydrated group fails closed
   through the same `ensure_group_live` chokepoint with the retryable `GroupNotHydrated` (never a partial view);
   `&mut` entry points (send, ingest, convergence drains) call `ensure_hydrated` first, which retracts the provisional
   seed, runs the full per-group hydration, and on failure quarantines with exact open-time parity (including removing
@@ -512,6 +513,31 @@ epoch visibility through `support::epoch_sealed_peeler`), plus the `convergence-
   amplification stays closed), removing an id only on successful indexing or the terminal no-routing-component
   disposition; MLS-load failures stay owned by hydration/quarantine. Route refreshes also retire durable rows the
   retained-history window (pinned v1 `max_rewind_commits`) has moved past, per routing-v1's overlap rule.
+- **A removed copy is seeded, audited apart, and is not a live member.** `Group.removed` is terminal for outbound work
+  but NOT inert like a disband tombstone: the re-add path (`group_lifecycle::retry_rejoins_after_trusted_removal`)
+  calls `ensure_hydrated` before `do_join_welcome`, #1858 keeps the copy's refused rows `Retryable`, and the #1840
+  ingest gate answers `Removed` off the durable record — so the cheap pass seeds a departed copy exactly like a live
+  one, epoch entry and routing included, and full hydration still promotes it. Only two things differ. Its hydration
+  rows carry `hydrate_removed_group` (cheap pass and promotion alike) rather than `hydrate_seed_group` /
+  `hydrate_stable_group`, because every *other* row a departed copy emits is indistinguishable from a live copy's and
+  the classifier needs to tell one device's every-open seed from the other's — except that a copy which is removed
+  *and* unrecoverable takes the `unrecoverable` arm first, so `hydrate_unrecoverable_group` outranks the removed
+  reason: the halt is the stronger fact. And it is absent from `live_group_ids`, which answers "groups this device is
+  a live member of" — both terminal reasons excluded, not just `Disbanded`: a copy that cannot send, rotate a leaf, or
+  converge owes no periodic maintenance, and the account sweep would otherwise mint a rotation obligation the
+  removed-copy send gate is guaranteed to refuse. So the app's `reconcile_live_engine_groups` no longer re-adds an
+  unprojected removed copy on its add-missing leg, and no longer repairs that copy's roster projection either; such a
+  copy surfaces again on re-add and nowhere else.
+- **Both legs of the account maintenance sweep skip a group the engine will not serve.** In
+  `marmot-account::run_due_maintenance`, the per-group rotation pass over `live_group_ids` and the account-wide
+  obligation pass (which has no liveness filter) both *skip* rather than abort on `GroupNotHydrated` from a
+  seeded-but-unhydrated copy under `defer_group_hydration` and `UnknownGroup` from a quarantined one: both are
+  retryable on a later tick, and one dead group must not stop key-package and periodic work for every group behind it
+  in the listing. The obligation pass additionally fails an obligation terminally with `local_member_removed` when the
+  durable record has gone terminal under it, and `schedule_manual_self_update` refuses a terminal record outright.
+  Obligations are minted while the copy is live and disenrollment is event-driven only, so a lost removal event
+  otherwise leaves the pass driving a `SelfUpdate` the send gate refuses, uncapped, every tick forever — the field's
+  `UseAfterEviction` self-update loop.
 - **The durable `Group::epoch` is a mirror of the epoch manager, and hydration seeds the epoch manager from it.**
   Because those two stores read each other across a restart, every mirror write belongs to the same durable unit as the
   MLS state change it projects, and every mirror failure propagates — never best-effort. Write the record inside the

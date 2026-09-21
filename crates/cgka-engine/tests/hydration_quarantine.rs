@@ -399,6 +399,7 @@ struct FlakyGroupRecordStorage {
     fail_disband_tombstone: Arc<AtomicBool>,
     fail_mark_disband_tombstone_announced: Arc<AtomicBool>,
     fail_list_queued_outbound_intents: Arc<AtomicBool>,
+    fail_disband_request: Arc<AtomicBool>,
 }
 
 impl FlakyGroupRecordStorage {
@@ -409,6 +410,7 @@ impl FlakyGroupRecordStorage {
             fail_disband_tombstone: Arc::new(AtomicBool::new(false)),
             fail_mark_disband_tombstone_announced: Arc::new(AtomicBool::new(false)),
             fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
+            fail_disband_request: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -423,6 +425,12 @@ impl FlakyGroupRecordStorage {
     fn set_fail_mark_disband_tombstone_announced(&self, fail: bool) {
         self.fail_mark_disband_tombstone_announced
             .store(fail, Ordering::SeqCst);
+    }
+
+    /// Faults the last fallible read in `hydrate_one_stored_group`, which
+    /// runs *after* the epoch entry is written.
+    fn set_fail_disband_request(&self, fail: bool) {
+        self.fail_disband_request.store(fail, Ordering::SeqCst);
     }
 
     fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
@@ -446,6 +454,18 @@ impl GroupStorage for FlakyGroupRecordStorage {
     }
     fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
         self.inner.list_groups()
+    }
+    // Forwarded, not inherited — but under the same fault as `get_group`. The
+    // inherited default builds records one `get_group` at a time, so the bulk
+    // read has to fail wherever the per-group read would; hydration falls back
+    // to `get_group` only when this call fails.
+    fn list_group_records(&self) -> StorageResult<Vec<Group>> {
+        if self.fail_get_group.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected list_group_records failure".into(),
+            ));
+        }
+        self.inner.list_group_records()
     }
 }
 
@@ -634,6 +654,11 @@ impl DisbandRequestStorage for FlakyGroupRecordStorage {
         self.inner.put_disband_request(request)
     }
     fn disband_request(&self, group_id: &GroupId) -> StorageResult<Option<DisbandRequest>> {
+        if self.fail_disband_request.load(Ordering::SeqCst) {
+            return Err(StorageError::Backend(
+                "injected disband_request failure".into(),
+            ));
+        }
         self.inner.disband_request(group_id)
     }
     fn clear_disband_request(&self, group_id: &GroupId) -> StorageResult<()> {
@@ -1347,6 +1372,45 @@ async fn retry_keeps_group_quarantined_when_still_unhealthy() {
             .iter()
             .any(|event| matches!(event, GroupEvent::GroupHydrationRecovered { .. })),
         "no recovery event should be emitted on a failed retry: {events:?}"
+    );
+}
+
+/// A retry that fails *after* hydration wrote the epoch entry must leave none
+/// behind. `live_group_ids` filters on entry presence, so a surviving entry
+/// projects a still-quarantined group as healthy and the account maintenance
+/// sweep reaches it. The open-time path clears the entry inside
+/// `quarantine_stored_group_on_hydrate`; the retry arm has to clear it itself,
+/// because it deliberately skips that path's quarantine event.
+#[tokio::test]
+async fn failed_retry_clears_the_epoch_entry_hydration_already_wrote() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    drop(initial);
+
+    storage.set_fail_get_group(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydration quarantines the unreadable group");
+    reopened.drain_events();
+
+    // The record reads fine now, so hydration gets as far as writing the epoch
+    // entry before failing on the disband-request probe that follows it.
+    storage.set_fail_get_group(false);
+    assert!(reopened.live_group_ids().unwrap().is_empty());
+    storage.set_fail_disband_request(true);
+    assert!(
+        !reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("a late per-group failure re-quarantines, it does not error")
+    );
+    storage.set_fail_disband_request(false);
+
+    assert_eq!(reopened.quarantined_groups().len(), 1);
+    assert!(
+        reopened.live_group_ids().unwrap().is_empty(),
+        "a group that stayed quarantined must hold no epoch entry"
     );
 }
 

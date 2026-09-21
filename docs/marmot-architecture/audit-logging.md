@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-18
+updated: 2026-09-21
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -587,6 +587,7 @@ Emitted when the engine's per-group `EpochState` changes or is re-established du
 
 Current `new_state` values:
 
+- `seeded`
 - `stable`
 - `pending_publish`
 - `recovering`
@@ -595,7 +596,9 @@ Current `new_state` values:
 Current `reason` values found in production call sites:
 
 - `founding_create`
+- `hydrate_seed_group`
 - `hydrate_stable_group`
+- `hydrate_removed_group`
 - `hydrate_unrecoverable_group`
 - `hydrate_durable_group_evolution`
 - `join_welcome`
@@ -619,6 +622,14 @@ Metadata notes:
   unless a later `new_state = "stable"` row with `reason = "join_welcome_repair"` (the one legal exit, emitted by
   `repair_to_stable`) shows the verified repair completed for that `(engine_id, group_ref)`.
   Goggles derives its error-severity `epoch_state_transition` projection row from exactly this state.
+- `reason = "hydrate_removed_group"` marks the session open (`seeded` from the cheap pass, then `stable` or
+  `pending_publish` from the per-group promotion, whichever that copy's recovered lifecycle calls for) of a local copy
+  this device was *removed* from. A copy that is removed *and* halted takes `hydrate_unrecoverable_group` instead:
+  the halt outranks the departure. Such a copy is deliberately still hydrated — an
+  authenticated re-add Welcome needs it — and every other row it emits looks like a live group's, so this reason is
+  the only signal that a group's repeated opens belong to a departed copy rather than an active conversation. It is
+  not an error and needs no repair; a re-join clears the marker and the reason reverts to
+  `hydrate_seed_group` / `hydrate_stable_group`.
 - `reason = "missing_retained_anchor"` has exactly one emission site: the convergence coordinator's
   materialization-time halt, paired with a `convergence_run_state` row carrying the same `error_kind`. Direct ingest
   never emits it. Ingest reaches the same missing-anchor condition through OpenMLS's `WrongEpoch` framing check, which
@@ -1006,8 +1017,8 @@ metadata keys for indexing.
 | `human_action.action` | local/observed action labels such as `create_group`, `invite_members`, `remove_members`, `leave_group`, `send_message`, `reply_message`, `edit_message`, `react`, `unreact`, `delete_message`, `send_media`, `decline_group_invite`, `promote_admin`, `demote_admin`, `self_demote_admin`, `update_admin_policy`, `update_message_retention`, `replace_encrypted_media_blob_endpoints`, `update_group_avatar_url`, `update_group_profile`, `group_joined`, `update_group_image`, `epoch_changed`; `system` rows use the audit event kind tag as the action. |
 | `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `avatar`, `image`, `message_retention`, `encrypted_media` |
 | `pending_kind` | `create_group`, `group_evolution` |
-| `epoch_state.new_state` | `stable`, `pending_publish`, `recovering`, `unrecoverable` |
-| `epoch_state.reason` | `hydrate_stable_group`, `join_welcome`, `begin_pending`, `publish_confirmed`, `publish_failed`, `fork_detected`, `missing_retained_anchor` |
+| `epoch_state.new_state` | `seeded`, `stable`, `pending_publish`, `recovering`, `unrecoverable` |
+| `epoch_state.reason` | `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_removed_group`, `join_welcome`, `begin_pending`, `publish_confirmed`, `publish_failed`, `fork_detected`, `missing_retained_anchor` |
 | `group_state.change_kind` | `member_added`, `member_removed`, `member_left`, `admin_added`, `admin_removed`, `group_renamed`, `group_avatar_changed`, `message_retention_changed` |
 | `group_state.fields` | `members`, `membership`, `admins`, `name`, `avatar`, `message_retention` |
 | `convergence error_kinds` | `unsupported_policy`, `missing_retained_anchor`, `candidate_state_unavailable`, `mls_validation_failed`, `outbound_intent_stale`, `storage_unavailable` |

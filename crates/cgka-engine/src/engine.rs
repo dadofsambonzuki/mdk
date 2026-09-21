@@ -275,9 +275,10 @@ pub struct Engine<S: StorageProvider> {
     /// Groups seeded by the session-open cheap pass whose full per-group
     /// hydration (MLS load, validation, pending-commit recovery) has not run
     /// yet (mdk#1161). The seed grants each group a provisional
-    /// `Stable(record.epoch)` epoch entry — so `live_group_ids` and the app
-    /// projection keep listing it — while [`Self::ensure_group_live`] fails
-    /// closed with [`EngineError::GroupNotHydrated`] on every gated surface.
+    /// `Stable(record.epoch)` epoch entry — so `live_group_ids` (which drops a
+    /// copy this device was removed from regardless) and the app projection
+    /// keep listing it — while [`Self::ensure_group_live`] fails closed with
+    /// [`EngineError::GroupNotHydrated`] on every gated surface.
     /// Membership leaves this set only through [`Self::ensure_hydrated`]:
     /// success promotes the group to live, failure moves it to
     /// [`Self::quarantined_groups`] exactly like an open-time quarantine.
@@ -1513,12 +1514,22 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
             // Provisional seed: the durable record's epoch mirror keeps
-            // `live_group_ids` and the app projection listing this group
-            // while full hydration is outstanding. A crash mid-probe may
-            // have left the record rewound; the interrupted-probe rollback
-            // runs inside `ensure_hydrated` before any gated read, and the
-            // only pre-rollback reads are these display-provisional record
-            // fields, which full hydration re-derives.
+            // `live_group_ids` (a removed copy excepted) and the app
+            // projection listing this group while full hydration is
+            // outstanding. A crash mid-probe may have left the record rewound;
+            // the interrupted-probe rollback runs inside `ensure_hydrated`
+            // before any gated read, and the only pre-rollback reads are these
+            // display-provisional record fields, which full hydration
+            // re-derives.
+            //
+            // A removed copy seeds exactly like a live one and differs only in
+            // the audit reason; see AGENTS.md, "A removed copy is seeded,
+            // audited apart, and is not a live member".
+            let reason = if group.removed {
+                "hydrate_removed_group"
+            } else {
+                "hydrate_seed_group"
+            };
             self.epoch_manager.set_stable(group.id.clone(), group.epoch);
             self.audit_group(
                 &group.id,
@@ -1526,7 +1537,7 @@ impl<S: StorageProvider> Engine<S> {
                     None,
                     "seeded",
                     group.epoch,
-                    "hydrate_seed_group",
+                    reason,
                     None,
                     None,
                 ),
@@ -1602,19 +1613,35 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Group ids that successfully hydrated into this live engine session.
-    /// Stored records quarantined during open are intentionally omitted: they
-    /// use the separate recovery surface and must not be projected as healthy.
+    /// Group ids this device is a live member of in this engine session.
+    ///
+    /// Both terminal reasons are omitted, because neither is a group this
+    /// device can still send to, rotate a leaf in, or converge
+    /// ([`cgka_traits::group::Group::is_terminal`]): a disbanded group is gone
+    /// for everyone, and a copy this device was *removed* from goes on without
+    /// it. A removed copy is nonetheless still seeded and still hydratable —
+    /// the re-add path needs that — so it keeps its epoch entry and every
+    /// routing/ingest surface; it is only not a *member*. In-engine callers
+    /// that want every stored group, departed ones included (local history, the
+    /// re-add replay), read the durable records; a departed copy surfaces to
+    /// the app again only on re-add.
+    ///
+    /// Stored records quarantined during open are also omitted: they use the
+    /// separate recovery surface and must not be projected as healthy.
     pub fn live_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        // One listing, not `list_groups` plus a per-group record read: the
+        // backend answers id order and terminal marker in a single query.
         Ok(self
             .storage
-            .list_groups()?
+            .list_group_records()?
             .into_iter()
-            .filter(|group_id| {
-                self.epoch_manager.state(group_id).is_some_and(|state| {
-                    !matches!(state, cgka_traits::engine_state::EpochState::Disbanded(_))
-                })
+            .filter(|group| {
+                !group.removed
+                    && self.epoch_manager.state(&group.id).is_some_and(|state| {
+                        !matches!(state, cgka_traits::engine_state::EpochState::Disbanded(_))
+                    })
             })
+            .map(|group| group.id)
             .collect())
     }
 
@@ -2069,6 +2096,15 @@ impl<S: StorageProvider> Engine<S> {
             .iter()
             .any(|record| record.state == MessageState::PeelDeferred);
 
+        // Same distinction the cheap pass draws: promoting a copy this device
+        // was removed from is not a live group's promotion. The `unrecoverable`
+        // arm below outranks it on purpose — a halt is the stronger fact.
+        let promotion_reason = if group.removed {
+            "hydrate_removed_group"
+        } else {
+            "hydrate_stable_group"
+        };
+
         // Do not expose any recovered pending state until every fallible
         // hydration read and validation above has succeeded. If a later step
         // quarantines the group, neither runtime fanout resumption nor direct
@@ -2107,12 +2143,12 @@ impl<S: StorageProvider> Engine<S> {
             if let Some(message_id) = message_id {
                 self.track_pending_origin_commit(pending_ref, message_id);
             }
-            ("pending_publish", "hydrate_stable_group")
+            ("pending_publish", promotion_reason)
         } else if restored_durable_evolution {
-            ("pending_publish", "hydrate_stable_group")
+            ("pending_publish", promotion_reason)
         } else {
             self.epoch_manager.set_stable(group_id.clone(), group.epoch);
-            ("stable", "hydrate_stable_group")
+            ("stable", promotion_reason)
         };
         if let Some(request) = leave_request {
             self.leave_requests.insert(group_id.clone(), request);
@@ -2744,6 +2780,12 @@ impl<S: StorageProvider> Engine<S> {
                     reason = reason_tag,
                     "retry did not recover the quarantined stored group"
                 );
+                // Hydration may already have written an epoch entry before a
+                // later fallible step failed, and a quarantined group must
+                // hold none (`live_group_ids` filters on entry presence).
+                // `quarantine_stored_group_on_hydrate` would clear it too, but
+                // also re-emits the quarantine event this arm suppresses.
+                self.epoch_manager.clear_group_state(group_id);
                 self.enter_hydration_quarantine(group_id, reason);
                 Ok(false)
             }
