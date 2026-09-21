@@ -65,10 +65,11 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 
 The default `NostrRelayClient::subscribe_detailed` implementation preserves source compatibility for existing relay
 clients by delegating to `subscribe`, but it reports endpoint coverage as `Unknown` rather than inventing successful
-registrations. Ordinary subscription delivery remains available. When such a client is used through `marmot-app`,
-durable replay obligations cannot be retired from unknown endpoint evidence, explicit full-history repair reports
-incomplete coverage, and epoch backfill remains armed. Relay clients used for completion-grade replay and repair must
-override `subscribe_detailed` and return exact endpoint outcomes; the optional SDK client does so.
+registrations. Ordinary subscription delivery remains available. When such a client is used through `marmot-app`, its
+host-facing transport health remains degraded until exact registration evidence exists, but direct EOSE from every
+endpoint-scoped attempt can still retire that route's replay obligation and complete repair. Override
+`subscribe_detailed` when the host also needs exact registration status before EOSE arrives; the optional SDK client
+does so.
 
 The app-runtime layer now projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.

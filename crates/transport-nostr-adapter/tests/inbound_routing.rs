@@ -13,9 +13,9 @@ use cgka_traits::{
 use nostr::RelayUrl;
 use tokio::sync::{Barrier, Notify};
 use transport_nostr_adapter::{
-    NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
-    NostrSubscriptionRegistration, NostrSubscriptionRegistrationRequest, NostrTransportAdapter,
-    RelayExportConsent, RelayIndex, SubscriptionEndpointRegistration,
+    AccountSubscriptionEose, NostrPublishOutcome, NostrRelayClient, NostrRelayEvent,
+    NostrSubscription, NostrSubscriptionRegistration, NostrSubscriptionRegistrationRequest,
+    NostrTransportAdapter, RelayExportConsent, RelayIndex, SubscriptionEndpointRegistration,
     SubscriptionEndpointRegistrationState, SubscriptionRegistrationDetail,
 };
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
@@ -1215,6 +1215,17 @@ async fn activation_with_only_empty_routes_is_unavailable_without_dialing() {
             && snapshot.endpoints.is_empty()
             && snapshot.detail == SubscriptionRegistrationDetail::Unknown
     }));
+    assert_eq!(
+        adapter.account_subscription_eose(&account_id).await,
+        AccountSubscriptionEose::default(),
+        "routes that issued no relay attempt cannot hold the EOSE gate open"
+    );
+    assert!(
+        adapter
+            .account_subscription_replay_eose(&account_id)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -3827,6 +3838,14 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
         !progress.complete(),
         "the group subscription has not been served"
     );
+    let route_progress = adapter.account_subscription_replay_eose(&account_id).await;
+    assert_eq!(route_progress.len(), 2);
+    assert!(route_progress.iter().any(|route| {
+        route.complete && matches!(&route.subscription, NostrSubscription::AccountInbox { .. })
+    }));
+    assert!(route_progress.iter().any(|route| {
+        !route.complete && matches!(&route.subscription, NostrSubscription::Group { .. })
+    }));
 
     adapter
         .handle_relay_eose(group_endpoint(1), group_id_for(1, first))

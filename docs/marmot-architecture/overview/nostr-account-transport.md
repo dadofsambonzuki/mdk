@@ -147,10 +147,15 @@ the variable-length MLS group id, the 32-byte Nostr routing handle, current/hist
 endpoint scope. Repeated preparation keeps the earliest floor; an unfloored obligation dominates. Replacements
 transfer unfinished floors before retiring superseded generations.
 
-Registration alone never clears this durable work. The runtime freezes the obligation generations associated with a
-full activation and clears only that frozen set after endpoint-complete EOSE and a durable delivery checkpoint. A
-stale activation, route replacement, delivery-overflow marker, or missing endpoint coverage therefore leaves repair
-incomplete. A crash after checkpointing but before clear can replay duplicates, but cannot skip the protected gap.
+Registration alone never clears this durable work. The runtime freezes each route generation, replay floor and admitted
+endpoint scope associated with a full activation, then completes routes independently after endpoint-complete EOSE and
+a durable delivery checkpoint. Fully covered routes clear. A route with policy-excluded requested coverage retains its
+original gap but records that the current admitted scope settled; that dormant gap no longer makes healthy routes
+unfloored, and any later admission-scope or replay-floor change reopens it. Static exclusions also settle an automatic
+epoch-backfill intent instead of scheduling an account-wide replay forever, while explicit repair still reports
+incomplete requested coverage. A stale activation, route replacement, delivery-overflow marker, or missing admitted
+EOSE therefore cannot clear or settle newer work. A crash after checkpointing but before completion can replay
+duplicates, but cannot skip the protected gap.
 
 Rust and native bindings expose read-only account transport snapshots with separate inbox/current/historical routes,
 typed admission and registration outcomes, pending replay, and coalescing process-local revisions. Reading or

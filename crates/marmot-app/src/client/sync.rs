@@ -9,14 +9,15 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, TransportEndpoint};
 use storage_sqlite::{
-    SubscriptionReplayCompletionFence, SubscriptionReplayGeneration, SubscriptionReplayGroupRole,
-    SubscriptionReplayObligation, SubscriptionReplayPreparation, SubscriptionReplayReplacement,
-    SubscriptionReplayRoute, TransportReconciliationItem, TransportReconciliationRoute,
-    clamp_to_max_future_skew,
+    SubscriptionReplayCompletion, SubscriptionReplayCompletionResult, SubscriptionReplayGeneration,
+    SubscriptionReplayGroupRole, SubscriptionReplayObligation, SubscriptionReplayPreparation,
+    SubscriptionReplayReplacement, SubscriptionReplayRoute, TransportReconciliationItem,
+    TransportReconciliationRoute, clamp_to_max_future_skew,
 };
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrReconciliationItem as AdapterReconciliationItem,
+    NostrSubscription, NostrSubscriptionReplayEose,
 };
 
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
@@ -604,12 +605,50 @@ fn subscription_replay_lineage_matches(
     }
 }
 
+fn same_endpoint_scope(left: &[TransportEndpoint], right: &[TransportEndpoint]) -> bool {
+    left.len() == right.len() && left.iter().all(|endpoint| right.contains(endpoint))
+}
+
+fn replay_eose_matches_obligation(
+    replay: &NostrSubscriptionReplayEose,
+    obligation: &SubscriptionReplayObligation,
+) -> bool {
+    if !replay.complete
+        || !same_endpoint_scope(
+            replay.subscription.endpoints(),
+            &obligation.admitted_endpoints,
+        )
+    {
+        return false;
+    }
+    match (&replay.subscription, &obligation.route) {
+        (NostrSubscription::AccountInbox { .. }, SubscriptionReplayRoute::Inbox { .. }) => true,
+        (
+            NostrSubscription::Group {
+                group_id,
+                transport_group_id,
+                ..
+            },
+            SubscriptionReplayRoute::Group {
+                group_id: obligation_group_id,
+                transport_group_id: obligation_transport_group_id,
+                ..
+            },
+        ) => group_id == obligation_group_id && transport_group_id == obligation_transport_group_id,
+        _ => false,
+    }
+}
+
 fn active_subscription_replay_floor(
     obligations: &[SubscriptionReplayObligation],
+    requested_floor: Option<cgka_traits::transport::Timestamp>,
 ) -> Option<cgka_traits::transport::Timestamp> {
     let active = obligations
         .iter()
         .filter(|obligation| {
+            if obligation.admitted_scope_settled {
+                return false;
+            }
             matches!(
                 obligation.route,
                 SubscriptionReplayRoute::Inbox { .. }
@@ -620,6 +659,9 @@ fn active_subscription_replay_floor(
             )
         })
         .collect::<Vec<_>>();
+    if active.is_empty() {
+        return requested_floor;
+    }
     if active
         .iter()
         .any(|obligation| obligation.replay_floor.is_none())
@@ -647,13 +689,16 @@ impl AppClient {
     ) -> Result<Option<cgka_traits::transport::Timestamp>, AppError> {
         let routing = self.routing.snapshot();
         let mut preparations = Vec::with_capacity(1 + routing.group_routes.len());
+        let inbox_scope = subscription_replay_endpoint_scope(&routing.local_inbox_endpoints);
         preparations.push(SubscriptionReplayPreparation {
             route: SubscriptionReplayRoute::Inbox {
-                normalized_endpoints: subscription_replay_endpoint_scope(
-                    &routing.local_inbox_endpoints,
-                ),
+                normalized_endpoints: inbox_scope.clone(),
             },
             replay_floor: requested_floor,
+            admitted_endpoints: self
+                .adapter
+                .admitted_subscription_replay_endpoints(&inbox_scope),
+            reset_admitted_settlement: requested_floor.is_none(),
         });
 
         let mut seen_groups = HashSet::new();
@@ -663,17 +708,22 @@ impl AppClient {
             } else {
                 SubscriptionReplayGroupRole::Historical
             };
+            let endpoint_scope = subscription_replay_endpoint_scope(&group.endpoints);
             preparations.push(SubscriptionReplayPreparation {
                 route: SubscriptionReplayRoute::Group {
                     group_id: group.group_id,
                     transport_group_id: group.transport_group_id,
                     role,
-                    normalized_endpoints: subscription_replay_endpoint_scope(&group.endpoints),
+                    normalized_endpoints: endpoint_scope.clone(),
                 },
                 replay_floor: match role {
                     SubscriptionReplayGroupRole::Current => requested_floor,
                     SubscriptionReplayGroupRole::Historical => None,
                 },
+                admitted_endpoints: self
+                    .adapter
+                    .admitted_subscription_replay_endpoints(&endpoint_scope),
+                reset_admitted_settlement: requested_floor.is_none(),
             });
         }
 
@@ -710,42 +760,78 @@ impl AppClient {
             })
             .collect::<Vec<_>>();
         let prepared = storage.replace_subscription_replay_obligations(&replacements, &retire)?;
-        Ok(active_subscription_replay_floor(&prepared))
+        Ok(active_subscription_replay_floor(&prepared, requested_floor))
     }
 
     pub(super) fn freeze_subscription_replay_snapshot(&mut self) -> Result<(), AppError> {
         self.subscription_replay_snapshot = self
             .app
             .account_storage(&self.state.label)?
-            .subscription_replay_obligations()?
-            .into_iter()
-            .map(|obligation| SubscriptionReplayCompletionFence {
-                generation: obligation.generation,
-                replay_floor: obligation.replay_floor,
-            })
-            .collect();
+            .subscription_replay_obligations()?;
+        self.subscription_replay_requested_scope_complete =
+            !self.subscription_replay_snapshot.is_empty()
+                && self.subscription_replay_snapshot.iter().all(|obligation| {
+                    same_endpoint_scope(
+                        obligation.route.normalized_endpoints(),
+                        &obligation.admitted_endpoints,
+                    )
+                });
         Ok(())
     }
 
-    /// Clear only after the delivered prefix is durable and the adapter's
-    /// frozen activation snapshot has endpoint-complete EOSE. A crash between
-    /// checkpoint and this compare-and-clear merely causes duplicate replay.
-    fn clear_completed_subscription_replay_obligations(&mut self) -> Result<bool, AppError> {
+    /// Complete each frozen route independently after its admitted endpoints
+    /// reach EOSE and the delivered prefix is durable. Fully covered routes
+    /// clear; excluded routes retain their requested-scope gap while settling
+    /// the current admitted scope. A crash before this compare-and-apply merely
+    /// causes duplicate replay.
+    async fn complete_ready_subscription_replay_obligations(&mut self) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
-        let fences = self.subscription_replay_snapshot.clone();
-        if fences.is_empty() {
+        if self.subscription_replay_snapshot.is_empty() {
             return Ok(false);
         }
-        match storage.clear_subscription_replay_obligations(&self.state.label, &fences)? {
-            storage_sqlite::SubscriptionReplayClearResult::Cleared { .. } => {
-                self.subscription_replay_snapshot.clear();
+        let replay_eose = self.adapter.account_subscription_replay_eose().await;
+        let mut completed_generations = HashSet::new();
+        let mut cleared_routes = Vec::new();
+        let completions = self
+            .subscription_replay_snapshot
+            .iter()
+            .filter_map(|obligation| {
+                let admitted_complete = obligation.admitted_endpoints.is_empty()
+                    || replay_eose
+                        .iter()
+                        .any(|replay| replay_eose_matches_obligation(replay, obligation));
+                if !admitted_complete {
+                    return None;
+                }
+                let fence = obligation.completion_fence();
+                completed_generations.insert(obligation.generation);
+                if same_endpoint_scope(
+                    obligation.route.normalized_endpoints(),
+                    &obligation.admitted_endpoints,
+                ) {
+                    cleared_routes.push(obligation.route.clone());
+                    Some(SubscriptionReplayCompletion::Clear(fence))
+                } else {
+                    Some(SubscriptionReplayCompletion::SettleAdmittedScope(fence))
+                }
+            })
+            .collect::<Vec<_>>();
+        if completions.is_empty() {
+            return Ok(false);
+        }
+        match storage.complete_subscription_replay_obligations(&self.state.label, &completions)? {
+            SubscriptionReplayCompletionResult::Completed { .. } => {
+                self.subscription_replay_snapshot
+                    .retain(|obligation| !completed_generations.contains(&obligation.generation));
+                self.adapter
+                    .mark_subscription_replay_routes_complete(&cleared_routes);
                 Ok(true)
             }
-            storage_sqlite::SubscriptionReplayClearResult::StaleGeneration => {
+            SubscriptionReplayCompletionResult::StaleGeneration => {
                 self.subscription_replay_snapshot.clear();
                 Ok(false)
             }
-            storage_sqlite::SubscriptionReplayClearResult::DeliveryOverflowPending => Ok(false),
+            SubscriptionReplayCompletionResult::DeliveryOverflowPending => Ok(false),
         }
     }
 
@@ -2155,9 +2241,8 @@ impl AppClient {
                 self.adapter.finish_delivery_overflow_recovery(attempt)
         {
             match self.clear_delivery_overflow_recovery(attempt.marker_token) {
-                Ok(true) => match self.clear_completed_subscription_replay_obligations() {
+                Ok(true) => match self.complete_ready_subscription_replay_obligations().await {
                     Ok(true) => {
-                        self.adapter.mark_subscription_replay_complete();
                         self.adapter
                             .record_delivery_overflow_recovery_success(recovery_elapsed_ms);
                     }
@@ -2345,9 +2430,7 @@ impl AppClient {
     /// account's current end-of-stored-events progress.
     async fn backfill_drain_verdict(&self) -> DrainVerdict {
         let verdict = backfill_drain_verdict(self.adapter.account_subscription_eose().await);
-        if verdict == DrainVerdict::Complete
-            && !self.adapter.subscription_replay_coverage_complete()
-        {
+        if verdict == DrainVerdict::Complete && !self.subscription_replay_requested_scope_complete {
             DrainVerdict::CoverageIncomplete
         } else {
             verdict
@@ -2683,22 +2766,17 @@ impl AppClient {
             );
             return Err(ClassifiedSyncFailure::at_stage(summary, source, stage));
         }
-        if self.adapter.account_subscription_eose().await.complete()
-            && self.adapter.subscription_replay_coverage_complete()
-        {
-            match self.clear_completed_subscription_replay_obligations() {
-                Ok(true) => self.adapter.mark_subscription_replay_complete(),
-                Ok(false) => {}
-                Err(source) => {
-                    // The checkpoint already committed, while the obligation
-                    // did not. Restart will replay a duplicate prefix rather
-                    // than skipping history.
-                    return Err(ClassifiedSyncFailure::at_stage(
-                        summary,
-                        source,
-                        SyncFailureStage::StatePersist,
-                    ));
-                }
+        match self.complete_ready_subscription_replay_obligations().await {
+            Ok(_) => {}
+            Err(source) => {
+                // The checkpoint already committed, while the route-scoped
+                // obligation updates did not. Restart will replay a duplicate
+                // prefix rather than skipping history.
+                return Err(ClassifiedSyncFailure::at_stage(
+                    summary,
+                    source,
+                    SyncFailureStage::StatePersist,
+                ));
             }
         }
         self.record_sync_drain(
@@ -4109,6 +4187,7 @@ impl AppClient {
         } else {
             error_kind
         };
+        let retryable = error_kind.as_deref() != DrainVerdict::CoverageIncomplete.error_kind();
         self.record_epoch_backfill_terminal_rows(
             &execution.pending,
             execution.retry_ordinal,
@@ -4124,6 +4203,9 @@ impl AppClient {
             },
         );
         if !succeeded {
+            if !retryable {
+                return false;
+            }
             // Every error exit of `run_pending_epoch_backfill` lands here
             // without ever producing a drain verdict, so none of the
             // verdict-derived pacing rules in that function runs for it. Pace
@@ -4419,6 +4501,7 @@ impl AppClient {
                 // disarm the detector, so it is recorded as a failed attempt
                 // and its intent stays queued for the next seam.
                 let error_kind = verdict.error_kind();
+                let terminal_incomplete = verdict == DrainVerdict::CoverageIncomplete;
                 if verdict.spends_eose_attempt() {
                     execution.pending.eose_unconfirmed_attempts = execution
                         .pending
@@ -4431,7 +4514,7 @@ impl AppClient {
                 } else {
                     execution.pending.no_progress_attempts = 0;
                 }
-                if error_kind.is_none()
+                if (error_kind.is_none() || terminal_incomplete)
                     && let Err(error) = self.clear_epoch_backfill_intent(&execution.pending)
                 {
                     let terminal_error = error.privacy_safe_kind().to_string();
@@ -4455,6 +4538,20 @@ impl AppClient {
                     error_kind.is_none(),
                 );
                 if let Some(error_kind) = error_kind {
+                    if terminal_incomplete {
+                        self.epoch_backfill_retry_not_before = None;
+                        tracing::warn!(
+                            target: "marmot_app::epoch_stall",
+                            method = "run_pending_epoch_backfill",
+                            error_kind,
+                            retry_ordinal,
+                            deliveries = counts.deliveries,
+                            skipped = counts.skipped,
+                            eose_unconfirmed_ordinal,
+                            "epoch-gap backfill settled after all locally admitted coverage reached end-of-stored-events"
+                        );
+                        return Ok(EpochBackfillRunOutcome::Incomplete(summary));
+                    }
                     tracing::warn!(
                         target: "marmot_app::epoch_stall",
                         method = "run_pending_epoch_backfill",
@@ -4729,9 +4826,7 @@ impl AppClient {
             }
         };
         summary.merge(drained);
-        if verdict == DrainVerdict::Complete
-            && !self.adapter.subscription_replay_coverage_complete()
-        {
+        if verdict == DrainVerdict::Complete && !self.subscription_replay_requested_scope_complete {
             verdict = DrainVerdict::CoverageIncomplete;
         }
         if verdict == DrainVerdict::Complete {

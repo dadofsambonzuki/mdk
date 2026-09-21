@@ -1751,6 +1751,7 @@ impl MarmotApp {
             pending_transport_registration_retry: false,
             transport_subscription_connectivity_wake_used: false,
             subscription_replay_snapshot: Vec::new(),
+            subscription_replay_requested_scope_complete: false,
             checkpointed_transport_timestamp,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
             delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,

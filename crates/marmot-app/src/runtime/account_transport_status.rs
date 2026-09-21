@@ -218,24 +218,6 @@ impl AccountTransportStatusRegistry {
             .remove(account_id);
     }
 
-    pub(crate) fn mark_replay_complete(&self, account_id: &MemberId) {
-        let mut snapshot = self.snapshot(account_id);
-        if snapshot.state == AccountTransportState::Inactive {
-            return;
-        }
-        if let Some(inbox) = &mut snapshot.inbox {
-            inbox.pending_replay = false;
-        }
-        for route in snapshot
-            .current_group_routes
-            .iter_mut()
-            .chain(snapshot.historical_group_routes.iter_mut())
-        {
-            route.pending_replay = false;
-        }
-        let _ = self.publish(account_id, snapshot);
-    }
-
     fn subscribe(
         &self,
         account_id: &MemberId,

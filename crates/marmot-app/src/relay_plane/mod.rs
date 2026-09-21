@@ -2060,7 +2060,7 @@ fn finalize_transport_snapshot(
         .iter()
         .filter(|route| route.state == crate::AccountTransportRouteState::Registered)
         .count();
-    let completely_available = requested_subscription_coverage_complete(&snapshot);
+    let completely_available = transport_snapshot_completely_available(&snapshot);
     snapshot.state = if registered == 0 {
         crate::AccountTransportState::Unavailable
     } else if completely_available {
@@ -2082,13 +2082,7 @@ fn finalize_transport_snapshot(
     snapshot
 }
 
-/// Whether the current snapshot proves complete registration for the exact
-/// requested endpoint scope. This is deliberately a separate predicate from
-/// the host-facing account state: future health-reporting changes must not
-/// silently loosen or tighten durable replay-obligation retirement.
-fn requested_subscription_coverage_complete(
-    snapshot: &crate::AccountTransportStatusSnapshot,
-) -> bool {
+fn requested_subscription_scope_admitted(snapshot: &crate::AccountTransportStatusSnapshot) -> bool {
     let mut routes = snapshot
         .inbox
         .iter()
@@ -2097,17 +2091,33 @@ fn requested_subscription_coverage_complete(
         .peekable();
     routes.peek().is_some()
         && routes.all(|route| {
-            route.state == crate::AccountTransportRouteState::Registered
-                && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
-                && route.endpoints.iter().all(|endpoint| {
-                    matches!(
-                        endpoint.admission,
-                        crate::EndpointAdmissionOutcome::Allowed
-                            | crate::EndpointAdmissionOutcome::Duplicate
-                    )
-                })
-                && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
+            route.endpoints.iter().all(|endpoint| {
+                matches!(
+                    endpoint.admission,
+                    crate::EndpointAdmissionOutcome::Allowed
+                        | crate::EndpointAdmissionOutcome::Duplicate
+                )
+            })
         })
+}
+
+/// Strict host-health predicate. Replay retirement uses route-scoped direct
+/// EOSE evidence instead, so future health-signal changes cannot silently
+/// widen durable storage behavior.
+fn transport_snapshot_completely_available(
+    snapshot: &crate::AccountTransportStatusSnapshot,
+) -> bool {
+    requested_subscription_scope_admitted(snapshot)
+        && snapshot
+            .inbox
+            .iter()
+            .chain(snapshot.current_group_routes.iter())
+            .chain(snapshot.historical_group_routes.iter())
+            .all(|route| {
+                route.state == crate::AccountTransportRouteState::Registered
+                    && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
+                    && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
+            })
 }
 
 fn canonicalize_transport_route_statuses(routes: &mut [crate::AccountTransportRouteStatus]) {
@@ -2206,27 +2216,73 @@ impl MarmotRelayPlaneAccountAdapter {
         )
     }
 
-    pub(crate) fn mark_subscription_replay_complete(&self) {
-        self.relay_plane
-            .inner
-            .transport_statuses
-            .mark_replay_complete(&self.account_id);
+    pub(crate) fn mark_subscription_replay_routes_complete(
+        &self,
+        completed: &[storage_sqlite::SubscriptionReplayRoute],
+    ) {
+        if completed.is_empty() {
+            return;
+        }
+        let registry = &self.relay_plane.inner.transport_statuses;
+        let mut snapshot = registry.snapshot(&self.account_id);
+        if snapshot.state == crate::AccountTransportState::Inactive {
+            return;
+        }
+        if completed
+            .iter()
+            .any(|route| matches!(route, storage_sqlite::SubscriptionReplayRoute::Inbox { .. }))
+            && let Some(inbox) = &mut snapshot.inbox
+        {
+            inbox.pending_replay = false;
+        }
+        for status in snapshot
+            .current_group_routes
+            .iter_mut()
+            .chain(snapshot.historical_group_routes.iter_mut())
+        {
+            let status_role = match status.role {
+                crate::AccountTransportRouteRole::CurrentGroup => {
+                    storage_sqlite::SubscriptionReplayGroupRole::Current
+                }
+                crate::AccountTransportRouteRole::HistoricalGroup => {
+                    storage_sqlite::SubscriptionReplayGroupRole::Historical
+                }
+                crate::AccountTransportRouteRole::Inbox => continue,
+            };
+            let matches = completed.iter().any(|route| match route {
+                storage_sqlite::SubscriptionReplayRoute::Group {
+                    group_id,
+                    transport_group_id,
+                    role,
+                    ..
+                } => {
+                    *role == status_role
+                        && status.group_id_hex.as_deref()
+                            == Some(hex::encode(group_id.as_slice()).as_str())
+                        && status.transport_group_id_hex.as_deref()
+                            == Some(hex::encode(transport_group_id).as_str())
+                }
+                storage_sqlite::SubscriptionReplayRoute::Inbox { .. } => false,
+            });
+            if matches {
+                status.pending_replay = false;
+            }
+        }
+        let _ = registry.publish(&self.account_id, snapshot);
     }
 
-    /// Replay can complete only when every requested endpoint is admitted or
-    /// canonically duplicated by an admitted endpoint, and registration is
-    /// known to be complete. Adapter EOSE alone covers only admitted endpoints
-    /// and must not silently forgive policy-excluded or compatibility-unknown
-    /// coverage. This is intentionally stricter than route usability: the
-    /// explicit repair contract keeps excluded requested coverage visible as
-    /// incomplete until routing or policy changes.
-    pub(crate) fn subscription_replay_coverage_complete(&self) -> bool {
-        let snapshot = self
-            .relay_plane
+    /// Canonical endpoints admitted by the same subscription policy used by
+    /// activation. Persisting this scope lets replay settlement reopen only
+    /// when local policy admits different coverage later.
+    pub(crate) fn admitted_subscription_replay_endpoints(
+        &self,
+        endpoints: &[TransportEndpoint],
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
             .inner
-            .transport_statuses
-            .snapshot(&self.account_id);
-        requested_subscription_coverage_complete(&snapshot)
+            .relay_safety
+            .admit_subscription_endpoints(endpoints.to_vec())
+            .admitted_endpoints
     }
 
     fn admit_activation(
@@ -2537,6 +2593,17 @@ impl MarmotRelayPlaneAccountAdapter {
             eose.with_eose = 0;
         }
         eose
+    }
+
+    pub(crate) async fn account_subscription_replay_eose(
+        &self,
+    ) -> Vec<transport_nostr_adapter::NostrSubscriptionReplayEose> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_replay_eose(&self.account_id)
+            .await
     }
 
     pub(crate) async fn receive_account_delivery(

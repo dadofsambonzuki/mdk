@@ -35,18 +35,17 @@ fn prepare(
     replay_floor: Option<u64>,
 ) -> SubscriptionReplayPreparation {
     SubscriptionReplayPreparation {
+        admitted_endpoints: route.normalized_endpoints().to_vec(),
         route,
         replay_floor: replay_floor.map(Timestamp),
+        reset_admitted_settlement: replay_floor.is_none(),
     }
 }
 
 fn completion_fence(
     obligation: &SubscriptionReplayObligation,
 ) -> SubscriptionReplayCompletionFence {
-    SubscriptionReplayCompletionFence {
-        generation: obligation.generation,
-        replay_floor: obligation.replay_floor,
-    }
+    obligation.completion_fence()
 }
 
 #[test]
@@ -86,6 +85,104 @@ fn prepare_is_idempotent_widens_earliest_floor_and_unfloored_dominates() {
     assert_eq!(bounded_again.generation, first.generation);
     assert_eq!(bounded_again.replay_floor, None);
     assert_eq!(store.subscription_replay_obligations().unwrap().len(), 1);
+}
+
+#[test]
+fn admitted_scope_settlement_persists_and_policy_expansion_reopens_original_floor() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let route = inbox(&["wss://one.example", "wss://blocked.example"]);
+    let mut initial = prepare(route.clone(), None);
+    initial.admitted_endpoints = endpoints(&["wss://one.example"]);
+    let obligation = store
+        .prepare_subscription_replay_obligations(&[initial])
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(
+        store
+            .complete_subscription_replay_obligations(
+                "alice",
+                &[SubscriptionReplayCompletion::SettleAdmittedScope(
+                    completion_fence(&obligation),
+                )],
+            )
+            .unwrap(),
+        SubscriptionReplayCompletionResult::Completed {
+            cleared: 0,
+            settled: 1,
+        }
+    );
+    let settled = store.subscription_replay_obligations().unwrap().remove(0);
+    assert!(settled.admitted_scope_settled);
+    assert_eq!(
+        settled.admitted_endpoints,
+        endpoints(&["wss://one.example"])
+    );
+    assert!(settled.replay_floor.is_none());
+
+    let mut unchanged = prepare(route.clone(), Some(100));
+    unchanged.admitted_endpoints = endpoints(&["wss://one.example"]);
+    let unchanged = store
+        .prepare_subscription_replay_obligations(&[unchanged])
+        .unwrap()
+        .remove(0);
+    assert!(unchanged.admitted_scope_settled);
+    let stale_scope_fence = unchanged.completion_fence();
+
+    let expanded = store
+        .prepare_subscription_replay_obligations(&[prepare(route, Some(200))])
+        .unwrap()
+        .remove(0);
+    assert!(!expanded.admitted_scope_settled);
+    assert!(expanded.replay_floor.is_none());
+    assert_eq!(
+        expanded.admitted_endpoints,
+        endpoints(&["wss://one.example", "wss://blocked.example"])
+    );
+    assert_eq!(
+        store
+            .complete_subscription_replay_obligations(
+                "alice",
+                &[SubscriptionReplayCompletion::SettleAdmittedScope(
+                    stale_scope_fence,
+                )],
+            )
+            .unwrap(),
+        SubscriptionReplayCompletionResult::StaleGeneration,
+        "EOSE for the old admitted scope must not settle newly admitted coverage"
+    );
+}
+
+#[test]
+fn admitted_scope_settlement_reopens_when_the_replay_floor_widens() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let route = inbox(&["wss://one.example", "wss://blocked.example"]);
+    let mut initial = prepare(route.clone(), Some(100));
+    initial.admitted_endpoints = endpoints(&["wss://one.example"]);
+    let obligation = store
+        .prepare_subscription_replay_obligations(&[initial])
+        .unwrap()
+        .remove(0);
+    store
+        .complete_subscription_replay_obligations(
+            "alice",
+            &[SubscriptionReplayCompletion::SettleAdmittedScope(
+                obligation.completion_fence(),
+            )],
+        )
+        .unwrap();
+
+    let mut widened = prepare(route, Some(50));
+    widened.admitted_endpoints = endpoints(&["wss://one.example"]);
+    let widened = store
+        .prepare_subscription_replay_obligations(&[widened])
+        .unwrap()
+        .remove(0);
+    assert_eq!(widened.replay_floor, Some(Timestamp(50)));
+    assert!(
+        !widened.admitted_scope_settled,
+        "settlement for a later floor cannot cover newly requested history"
+    );
 }
 
 #[test]
@@ -239,6 +336,7 @@ fn clear_is_generation_conditional_and_fenced_by_delivery_overflow() {
                     SubscriptionReplayCompletionFence {
                         generation: SubscriptionReplayGeneration::from_bytes([0xaa; 16]),
                         replay_floor: Some(Timestamp(10)),
+                        admitted_scope_digest: [0; 32],
                     },
                 ],
             )

@@ -877,7 +877,7 @@ async fn mixed_inbox_admission_keeps_damus_and_reports_exclusions() {
     let status = relay_plane.account_transport_status(&account_id);
     assert_eq!(status.state, crate::AccountTransportState::Degraded);
     assert!(
-        !adapter.subscription_replay_coverage_complete(),
+        !requested_subscription_scope_admitted(&status),
         "admitted-endpoint EOSE must not make excluded requested coverage complete"
     );
     let inbox = status.inbox.unwrap();
@@ -1024,7 +1024,7 @@ async fn entirely_blocked_activation_retains_unavailable_status_without_empty_re
 
     let status = relay_plane.account_transport_status(&account_id);
     assert_eq!(status.state, crate::AccountTransportState::Unavailable);
-    assert!(!adapter.subscription_replay_coverage_complete());
+    assert!(!requested_subscription_scope_admitted(&status));
     let inbox = status.inbox.unwrap();
     assert_eq!(
         inbox.state,
@@ -1188,7 +1188,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
 
     let status = relay_plane.account_transport_status(&alice);
     assert_eq!(status.state, crate::AccountTransportState::Available);
-    assert!(alice_adapter.subscription_replay_coverage_complete());
+    assert!(requested_subscription_scope_admitted(&status));
     for route in status
         .inbox
         .iter()

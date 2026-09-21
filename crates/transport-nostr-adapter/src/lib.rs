@@ -580,6 +580,15 @@ pub struct AccountSubscriptionEose {
     pub relay_subscription_attempts_with_eose: usize,
 }
 
+/// Route-scoped EOSE proof from an account activation's immutable replay
+/// snapshot. The subscription carries only caller-owned routing identity; the
+/// endpoint booleans remain internal to the adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrSubscriptionReplayEose {
+    pub subscription: NostrSubscription,
+    pub complete: bool,
+}
+
 impl AccountSubscriptionEose {
     /// Whether every issued subscription has been reported end-of-stored-events.
     ///
@@ -609,19 +618,20 @@ pub trait NostrRelayClient: Send + Sync {
     /// Register a logical subscription and, when supported, report exact
     /// endpoint outcomes. The compatibility default preserves source and
     /// registration compatibility for existing injected clients without
-    /// inventing endpoint successes. Its coverage remains `Unknown`, so a
-    /// client that participates in endpoint-complete replay or repair must
-    /// override this method and report detailed outcomes.
+    /// inventing endpoint successes. Its registration coverage remains
+    /// `Unknown`; direct endpoint-scoped EOSE can still provide independent
+    /// replay-completion evidence.
     ///
     /// # Compatibility
     ///
     /// Existing implementations remain source-compatible, and ordinary
     /// subscription delivery still uses [`NostrRelayClient::subscribe`]. In a
-    /// `marmot-app` relay plane, however, `Unknown` cannot prove endpoint-level
-    /// EOSE coverage: durable subscription-replay obligations remain pending,
-    /// explicit full-history repair reports incomplete coverage, and epoch
-    /// backfill remains armed. Implementations used there must override this
-    /// method to restore those completion capabilities.
+    /// `marmot-app` relay plane, `Unknown` keeps host transport health degraded
+    /// because registration success is not known endpoint by endpoint. Replay
+    /// completion remains evidence-driven rather than permanently disabled:
+    /// direct EOSE from every endpoint-scoped attempt can retire that route's
+    /// replay obligation. Override this method when the host also needs exact
+    /// registration status before EOSE arrives.
     async fn subscribe_detailed(
         &self,
         request: NostrSubscriptionRegistrationRequest,
@@ -1038,6 +1048,20 @@ impl NostrTransportAdapter {
             .read()
             .await
             .account_subscription_eose(account_id)
+    }
+
+    /// Route-scoped EOSE results for the same frozen activation snapshot as
+    /// [`Self::account_subscription_eose`]. This lets an orchestrator retire
+    /// completed route obligations independently without letting one excluded
+    /// route widen every healthy route's replay forever.
+    pub async fn account_subscription_replay_eose(
+        &self,
+        account_id: &MemberId,
+    ) -> Vec<NostrSubscriptionReplayEose> {
+        self.state
+            .read()
+            .await
+            .account_subscription_replay_eose(account_id)
     }
 
     /// The route generation of an account's live inbox subscription, or
@@ -1741,7 +1765,13 @@ struct RouteRegistrationState {
 /// change from shrinking the proof obligation of the already-issued replay.
 #[derive(Clone, Default)]
 struct AccountReplayCoverage {
-    subscriptions: HashMap<String, HashMap<RelayIndex, bool>>,
+    subscriptions: HashMap<String, RouteReplayCoverage>,
+}
+
+#[derive(Clone)]
+struct RouteReplayCoverage {
+    subscription: NostrSubscription,
+    relays: HashMap<RelayIndex, bool>,
 }
 
 impl AccountReplayCoverage {
@@ -1750,14 +1780,17 @@ impl AccountReplayCoverage {
         let with_eose = self
             .subscriptions
             .values()
-            .filter(|relays| relays.values().any(|eose_seen| *eose_seen))
+            .filter(|coverage| coverage.relays.values().any(|eose_seen| *eose_seen))
             .count();
-        let relay_subscription_attempts =
-            self.subscriptions.values().map(HashMap::len).sum::<usize>();
+        let relay_subscription_attempts = self
+            .subscriptions
+            .values()
+            .map(|coverage| coverage.relays.len())
+            .sum::<usize>();
         let relay_subscription_attempts_with_eose = self
             .subscriptions
             .values()
-            .flat_map(HashMap::values)
+            .flat_map(|coverage| coverage.relays.values())
             .filter(|eose_seen| **eose_seen)
             .count();
         AccountSubscriptionEose {
@@ -1772,10 +1805,24 @@ impl AccountReplayCoverage {
         if let Some(eose_seen) = self
             .subscriptions
             .get_mut(subscription_id)
-            .and_then(|relays| relays.get_mut(&relay))
+            .and_then(|coverage| coverage.relays.get_mut(&relay))
         {
             *eose_seen = true;
         }
+    }
+
+    fn route_snapshots(&self) -> Vec<NostrSubscriptionReplayEose> {
+        let mut snapshots = self
+            .subscriptions
+            .values()
+            .map(|coverage| NostrSubscriptionReplayEose {
+                subscription: coverage.subscription.clone(),
+                complete: !coverage.relays.is_empty()
+                    && coverage.relays.values().all(|eose_seen| *eose_seen),
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.subscription.subscription_id());
+        snapshots
     }
 }
 
@@ -2258,13 +2305,20 @@ impl AdapterState {
     ) {
         let subscriptions = subscriptions
             .iter()
+            .filter(|subscription| !subscription.endpoints().is_empty())
             .map(|subscription| {
                 let relays = subscription
                     .endpoints()
                     .iter()
                     .map(|endpoint| (self.relay_index.index_for(endpoint), false))
                     .collect();
-                (subscription.subscription_id(), relays)
+                (
+                    subscription.subscription_id(),
+                    RouteReplayCoverage {
+                        subscription: subscription.clone(),
+                        relays,
+                    },
+                )
             })
             .collect();
         self.account_replay_coverage
@@ -2354,6 +2408,16 @@ impl AdapterState {
         self.account_replay_coverage
             .get(account_id)
             .map(AccountReplayCoverage::snapshot)
+            .unwrap_or_default()
+    }
+
+    fn account_subscription_replay_eose(
+        &self,
+        account_id: &MemberId,
+    ) -> Vec<NostrSubscriptionReplayEose> {
+        self.account_replay_coverage
+            .get(account_id)
+            .map(AccountReplayCoverage::route_snapshots)
             .unwrap_or_default()
     }
 

@@ -19,6 +19,7 @@ CREATE TABLE subscription_replay_obligations (
         typeof(generation) = 'blob' AND length(generation) = 16
     ),
     replay_floor           INTEGER CHECK(replay_floor IS NULL OR replay_floor >= 0),
+    admitted_scope_settled INTEGER NOT NULL DEFAULT 0 CHECK(admitted_scope_settled IN (0, 1)),
     PRIMARY KEY (
         route_kind,
         route_role,
@@ -36,6 +37,15 @@ CREATE TABLE subscription_replay_obligations (
 ) WITHOUT ROWID;
 
 CREATE TABLE subscription_replay_endpoints (
+    generation  BLOB NOT NULL REFERENCES subscription_replay_obligations(generation)
+        ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL CHECK(ordinal >= 0),
+    endpoint    TEXT NOT NULL CHECK(length(CAST(endpoint AS BLOB)) BETWEEN 1 AND 4096),
+    PRIMARY KEY (generation, ordinal),
+    UNIQUE (generation, endpoint)
+) WITHOUT ROWID;
+
+CREATE TABLE subscription_replay_admitted_endpoints (
     generation  BLOB NOT NULL REFERENCES subscription_replay_obligations(generation)
         ON DELETE CASCADE,
     ordinal     INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -64,28 +74,40 @@ mod tests {
 
         let transaction = connection.transaction().unwrap();
         apply(&transaction).unwrap();
-        assert!(
-            transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'subscription_replay_obligations')",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        );
+        for table in [
+            "subscription_replay_obligations",
+            "subscription_replay_endpoints",
+            "subscription_replay_admitted_endpoints",
+        ] {
+            assert!(
+                transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1)",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
         transaction.rollback().unwrap();
 
-        assert!(
-            !connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'subscription_replay_obligations')",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        );
+        for table in [
+            "subscription_replay_obligations",
+            "subscription_replay_endpoints",
+            "subscription_replay_admitted_endpoints",
+        ] {
+            assert!(
+                !connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1)",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            );
+        }
 
         run(&mut connection, MIGRATIONS).unwrap();
         assert_eq!(

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Migration 90 persists generation-fenced subscription replay obligations so route failures cannot lose missed history while healthy routes advance. ([#1955](https://github.com/marmot-protocol/mdk/pull/1955))
+- Migration 90 persists generation-fenced subscription replay obligations and each route's admitted-scope settlement, so excluded coverage remains durable without forcing unrelated healthy routes to replay unfloored forever. ([#1955](https://github.com/marmot-protocol/mdk/pull/1955))
 
 ## 0.10.4 - 2026-09-20
 

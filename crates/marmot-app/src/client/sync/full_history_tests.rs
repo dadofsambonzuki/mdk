@@ -419,6 +419,10 @@ async fn retired_requested_endpoint_keeps_repair_and_unfloored_obligation_incomp
         .find(|obligation| matches!(obligation.route, SubscriptionReplayRoute::Inbox { .. }))
         .expect("inbox replay obligation");
     assert!(inbox.replay_floor.is_none());
+    assert!(
+        inbox.admitted_scope_settled,
+        "the safe admitted endpoint reached EOSE even though requested coverage remains incomplete"
+    );
     let SubscriptionReplayRoute::Inbox {
         normalized_endpoints,
     } = &inbox.route
@@ -432,11 +436,99 @@ async fn retired_requested_endpoint_keeps_repair_and_unfloored_obligation_incomp
             TransportEndpoint::from("wss://relay.nostr.band"),
         ]
     );
-    assert!(
+    assert_eq!(
         client
             .prepare_subscription_replay_obligations(Some(cgka_traits::transport::Timestamp(7)))
-            .unwrap()
-            .is_none(),
-        "a later cursor floor must not narrow an unfinished full-history obligation"
+            .unwrap(),
+        Some(cgka_traits::transport::Timestamp(7)),
+        "a settled excluded scope must not force unrelated future subscriptions unfloored"
+    );
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn blocked_group_does_not_keep_healthy_routes_unfloored() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://inbox.example".to_owned(),
+        MarmotAppConfig::default().with_dev_epoch_backfill_execution_quantum_ms(10),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let healthy_group = GroupId::new(vec![0x41; 16]);
+    let blocked_group = GroupId::new(vec![0x42; 16]);
+    client.routing.replace_group_routes(
+        &healthy_group,
+        vec![cgka_traits::transport_adapter::TransportGroupSubscription {
+            group_id: healthy_group.clone(),
+            transport_group_id: vec![0x51; 32],
+            endpoints: vec![TransportEndpoint::from("wss://group.example")],
+        }],
+    );
+    client.routing.replace_group_routes(
+        &blocked_group,
+        vec![cgka_traits::transport_adapter::TransportGroupSubscription {
+            group_id: blocked_group.clone(),
+            transport_group_id: vec![0x52; 32],
+            endpoints: vec![TransportEndpoint::from("ws://10.0.0.1")],
+        }],
+    );
+
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let failure = client
+        .repair_full_history_with_control(&FullHistoryRepairControl {
+            started: Instant::now(),
+            timeout: Duration::from_secs(2),
+            cancelled: &|| false,
+        })
+        .await
+        .expect_err("the excluded group keeps requested coverage incomplete");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("subscription_coverage_incomplete"),
+        "unexpected repair failure: {}",
+        failure.source
+    );
+
+    let obligations = app
+        .account_storage("alice")
+        .unwrap()
+        .subscription_replay_obligations()
+        .unwrap();
+    assert_eq!(
+        obligations.len(),
+        1,
+        "healthy inbox/group obligations clear"
+    );
+    let blocked = &obligations[0];
+    assert!(matches!(
+        &blocked.route,
+        SubscriptionReplayRoute::Group { group_id, .. } if group_id == &blocked_group
+    ));
+    assert!(blocked.replay_floor.is_none());
+    assert!(blocked.admitted_endpoints.is_empty());
+    assert!(blocked.admitted_scope_settled);
+    assert_eq!(
+        client
+            .prepare_subscription_replay_obligations(Some(cgka_traits::transport::Timestamp(9)))
+            .unwrap(),
+        Some(cgka_traits::transport::Timestamp(9)),
+        "the durable excluded-route gap must not widen healthy replay"
+    );
+    assert!(
+        relay
+            .accepted_subscriptions()
+            .iter()
+            .all(|subscription| !subscription
+                .endpoints()
+                .contains(&TransportEndpoint::from("ws://10.0.0.1"))),
+        "the unsafe group endpoint must never reach the relay client"
     );
 }

@@ -178,9 +178,11 @@ See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules
 ## Explicit full-history repair
 
 `MarmotAppRuntime::repair_full_history` keeps one unfloored relay activation and its frozen endpoint EOSE coverage
-across checkpointed drain quanta. A quantum yield alone does not fail or resubscribe the repair. All required relay
-endpoints must confirm completion; silence, a fast subset, and EOSE from a superseded attempt cannot satisfy it.
-Explicit overflow recovery uses the same continuation and retains generation-checked durable marker clearing.
+across checkpointed drain quanta. A quantum yield alone does not fail or resubscribe the repair. Every locally admitted
+endpoint must confirm completion; silence, a fast subset, and EOSE from a superseded attempt cannot satisfy it.
+Policy-excluded requested coverage remains an explicit incomplete result, but its settled admitted scope does not keep
+unrelated routes unfloored. Explicit overflow recovery uses the same continuation and retains generation-, floor-, and
+admitted-scope-checked durable marker clearing.
 
 The explicit attempt has a 60-second overall cooperative budget, including setup, reconciliation, and overflow
 recovery. A started ingest/checkpoint always finishes before observing the deadline or caller/runtime cancellation;

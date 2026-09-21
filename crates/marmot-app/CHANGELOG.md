@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add account transport-status snapshots and subscriptions, isolate failed or policy-blocked routes from healthy subscriptions, and retain durable replay obligations until requested endpoint coverage completes. ([#1955](https://github.com/marmot-protocol/mdk/pull/1955))
+- Add account transport-status snapshots and subscriptions, isolate failed or policy-blocked routes from healthy subscriptions and replay floors, and retain excluded requested coverage as a durable per-route gap. ([#1955](https://github.com/marmot-protocol/mdk/pull/1955))
 
 ## 0.10.4 - 2026-09-20
 

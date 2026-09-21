@@ -1831,6 +1831,63 @@ async fn armed_epoch_backfill(
     (app, client, group_id)
 }
 
+#[cfg(feature = "test-policy-overrides")]
+#[test]
+fn policy_excluded_coverage_settles_automatic_backfill_without_clearing_its_gap() {
+    run_composed_app_runtime_test("backfill-policy-excluded-terminal", || async {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, group_id) =
+            armed_epoch_backfill(&dir, &relay, backfill_drain_test_config()).await;
+        let mut route = client
+            .routing
+            .snapshot()
+            .group_routes
+            .into_iter()
+            .find(|route| route.group_id == group_id)
+            .expect("armed group route");
+        route
+            .endpoints
+            .push(TransportEndpoint::from("ws://10.0.0.1"));
+        assert!(client.routing.replace_group_routes(&group_id, vec![route]));
+        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+
+        let outcome = client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .expect("locally admitted replay must run");
+        assert!(matches!(
+            outcome,
+            crate::EpochBackfillRunOutcome::Incomplete(_)
+        ));
+        assert!(
+            !client.has_pending_epoch_backfill(),
+            "static policy exclusion must not requeue an automatic full-history replay forever"
+        );
+        assert!(
+            app.account_storage("alice")
+                .unwrap()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty(),
+            "the terminally incomplete automatic intent must also clear durably"
+        );
+        let obligations = app
+            .account_storage("alice")
+            .unwrap()
+            .subscription_replay_obligations()
+            .unwrap();
+        assert!(obligations.iter().any(|obligation| {
+            matches!(
+                &obligation.route,
+                storage_sqlite::SubscriptionReplayRoute::Group { group_id: stored, .. }
+                    if stored == &group_id
+            ) && obligation.admitted_scope_settled
+                && obligation.replay_floor.is_none()
+        }));
+    });
+}
+
 /// Every audit row this app has recorded so far.
 fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
     app.audit_log_files()

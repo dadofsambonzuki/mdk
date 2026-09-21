@@ -421,7 +421,11 @@ pub struct AppClient {
     /// Storage generation/floor fences frozen by the most recent full account
     /// activation. Group-only replacement or a widened replay range cannot be
     /// cleared by stale EOSE from the older activation.
-    pub(crate) subscription_replay_snapshot: Vec<storage_sqlite::SubscriptionReplayCompletionFence>,
+    pub(crate) subscription_replay_snapshot: Vec<storage_sqlite::SubscriptionReplayObligation>,
+    /// Whether the frozen activation admitted every endpoint in its requested
+    /// route scopes. This verdict stays tied to the same activation as the
+    /// replay fences instead of following a later transport-status rebuild.
+    pub(crate) subscription_replay_requested_scope_complete: bool,
     /// Last transport cursor promoted by a completed drain checkpoint. Live
     /// one-at-a-time worker ingests may advance `state` for diagnostics, but
     /// they persist this older safe floor until a drain has observed any
