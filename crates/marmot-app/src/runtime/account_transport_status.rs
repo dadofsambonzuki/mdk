@@ -97,6 +97,8 @@ pub struct AccountTransportRouteStatus {
     pub registration_detail: RegistrationDetailCompleteness,
     pub endpoints: Vec<AccountTransportEndpointStatus>,
     pub pending_registration: bool,
+    /// Requested history coverage remains open. For a policy-excluded route
+    /// this can describe a dormant durable gap, not active network replay.
     pub pending_replay: bool,
     /// Selected retry delay, not a live countdown.
     pub retry_delay_ms: Option<u64>,
@@ -197,7 +199,13 @@ impl AccountTransportStatusRegistry {
         account_id: &MemberId,
         mut snapshot: AccountTransportStatusSnapshot,
     ) -> bool {
-        let sender = self.sender(account_id);
+        let mut entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sender = entries
+            .entry(account_id.clone())
+            .or_insert_with(|| watch::channel(AccountTransportStatusSnapshot::inactive()).0);
         let current = sender.borrow().clone();
         if current.semantic_eq(&snapshot) {
             return false;
@@ -205,6 +213,63 @@ impl AccountTransportStatusRegistry {
         snapshot.revision = current.revision.saturating_add(1);
         sender.send_replace(snapshot);
         true
+    }
+
+    /// Apply a status-only mutation while the registry entry remains active.
+    /// Holding the registry lock across the read/modify/write prevents a stale
+    /// snapshot from overwriting a concurrent terminal `Inactive` transition.
+    pub(crate) fn update_active(
+        &self,
+        account_id: &MemberId,
+        update: impl FnOnce(&mut AccountTransportStatusSnapshot),
+    ) -> bool {
+        let entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sender) = entries.get(account_id) else {
+            return false;
+        };
+        let current = sender.borrow().clone();
+        if current.state == AccountTransportState::Inactive {
+            return false;
+        }
+        let mut next = current.clone();
+        update(&mut next);
+        if current.semantic_eq(&next) {
+            return false;
+        }
+        next.revision = current.revision.saturating_add(1);
+        sender.send_replace(next);
+        true
+    }
+
+    /// Publish a snapshot only if no other status transition has advanced the
+    /// entry since the caller took its source snapshot. The current snapshot
+    /// is returned on a stale compare so callers can preserve terminal state.
+    pub(crate) fn publish_if_revision(
+        &self,
+        account_id: &MemberId,
+        expected_revision: u64,
+        mut snapshot: AccountTransportStatusSnapshot,
+    ) -> Result<bool, Box<AccountTransportStatusSnapshot>> {
+        let mut entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sender = entries
+            .entry(account_id.clone())
+            .or_insert_with(|| watch::channel(AccountTransportStatusSnapshot::inactive()).0);
+        let current = sender.borrow().clone();
+        if current.revision != expected_revision {
+            return Err(Box::new(current));
+        }
+        if current.semantic_eq(&snapshot) {
+            return Ok(false);
+        }
+        snapshot.revision = current.revision.saturating_add(1);
+        sender.send_replace(snapshot);
+        Ok(true)
     }
 
     pub(crate) fn mark_inactive(&self, account_id: &MemberId) {
@@ -377,6 +442,47 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn active_update_cannot_resurrect_a_newer_inactive_state() {
+        let registry = AccountTransportStatusRegistry::default();
+        let account_id = MemberId::new(vec![0xDD; 32]);
+        let mut available = AccountTransportStatusSnapshot::inactive();
+        available.state = AccountTransportState::Available;
+        assert!(registry.publish(&account_id, available));
+
+        registry.mark_inactive(&account_id);
+        assert!(!registry.update_active(&account_id, |snapshot| {
+            snapshot.state = AccountTransportState::Available;
+        }));
+        assert_eq!(
+            registry.snapshot(&account_id).state,
+            AccountTransportState::Inactive
+        );
+    }
+
+    #[test]
+    fn revision_fenced_publish_cannot_overwrite_newer_inactive_state() {
+        let registry = AccountTransportStatusRegistry::default();
+        let account_id = MemberId::new(vec![0xEE; 32]);
+        let mut unavailable = AccountTransportStatusSnapshot::inactive();
+        unavailable.state = AccountTransportState::Unavailable;
+        assert!(registry.publish(&account_id, unavailable));
+        let stale = registry.snapshot(&account_id);
+        let mut active = stale.clone();
+        active.state = AccountTransportState::Available;
+
+        registry.mark_inactive(&account_id);
+        assert!(
+            registry
+                .publish_if_revision(&account_id, stale.revision, active)
+                .is_err()
+        );
+        assert_eq!(
+            registry.snapshot(&account_id).state,
+            AccountTransportState::Inactive
         );
     }
 }

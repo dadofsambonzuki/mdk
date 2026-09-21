@@ -838,6 +838,36 @@ async fn cancelled_reactivation_marks_transport_status_inactive_after_cleanup() 
 }
 
 #[tokio::test]
+async fn activation_after_deactivation_publishes_a_fresh_transport_status() {
+    let relay = Arc::new(RecordingRelayClient {
+        exact_registration: true,
+        ..RecordingRelayClient::default()
+    });
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account_id = MemberId::new(vec![0xD9; 32]);
+    let adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+    let activation = || TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint::from("wss://inbox.example")],
+        group_subscriptions: Vec::new(),
+        since: None,
+    };
+
+    adapter.activate_account(activation()).await.unwrap();
+    adapter.deactivate_account(&account_id).await.unwrap();
+    assert_eq!(
+        relay_plane.account_transport_status(&account_id).state,
+        crate::AccountTransportState::Inactive
+    );
+
+    adapter.activate_account(activation()).await.unwrap();
+    assert_eq!(
+        relay_plane.account_transport_status(&account_id).state,
+        crate::AccountTransportState::Available
+    );
+}
+
+#[tokio::test]
 async fn mixed_inbox_admission_keeps_damus_and_reports_exclusions() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());

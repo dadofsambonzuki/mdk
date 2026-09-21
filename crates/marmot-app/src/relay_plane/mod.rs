@@ -2224,51 +2224,48 @@ impl MarmotRelayPlaneAccountAdapter {
             return;
         }
         let registry = &self.relay_plane.inner.transport_statuses;
-        let mut snapshot = registry.snapshot(&self.account_id);
-        if snapshot.state == crate::AccountTransportState::Inactive {
-            return;
-        }
-        if completed
-            .iter()
-            .any(|route| matches!(route, storage_sqlite::SubscriptionReplayRoute::Inbox { .. }))
-            && let Some(inbox) = &mut snapshot.inbox
-        {
-            inbox.pending_replay = false;
-        }
-        for status in snapshot
-            .current_group_routes
-            .iter_mut()
-            .chain(snapshot.historical_group_routes.iter_mut())
-        {
-            let status_role = match status.role {
-                crate::AccountTransportRouteRole::CurrentGroup => {
-                    storage_sqlite::SubscriptionReplayGroupRole::Current
-                }
-                crate::AccountTransportRouteRole::HistoricalGroup => {
-                    storage_sqlite::SubscriptionReplayGroupRole::Historical
-                }
-                crate::AccountTransportRouteRole::Inbox => continue,
-            };
-            let matches = completed.iter().any(|route| match route {
-                storage_sqlite::SubscriptionReplayRoute::Group {
-                    group_id,
-                    transport_group_id,
-                    role,
-                    ..
-                } => {
-                    *role == status_role
-                        && status.group_id_hex.as_deref()
-                            == Some(hex::encode(group_id.as_slice()).as_str())
-                        && status.transport_group_id_hex.as_deref()
-                            == Some(hex::encode(transport_group_id).as_str())
-                }
-                storage_sqlite::SubscriptionReplayRoute::Inbox { .. } => false,
-            });
-            if matches {
-                status.pending_replay = false;
+        registry.update_active(&self.account_id, |snapshot| {
+            if completed
+                .iter()
+                .any(|route| matches!(route, storage_sqlite::SubscriptionReplayRoute::Inbox { .. }))
+                && let Some(inbox) = &mut snapshot.inbox
+            {
+                inbox.pending_replay = false;
             }
-        }
-        let _ = registry.publish(&self.account_id, snapshot);
+            for status in snapshot
+                .current_group_routes
+                .iter_mut()
+                .chain(snapshot.historical_group_routes.iter_mut())
+            {
+                let status_role = match status.role {
+                    crate::AccountTransportRouteRole::CurrentGroup => {
+                        storage_sqlite::SubscriptionReplayGroupRole::Current
+                    }
+                    crate::AccountTransportRouteRole::HistoricalGroup => {
+                        storage_sqlite::SubscriptionReplayGroupRole::Historical
+                    }
+                    crate::AccountTransportRouteRole::Inbox => continue,
+                };
+                let matches = completed.iter().any(|route| match route {
+                    storage_sqlite::SubscriptionReplayRoute::Group {
+                        group_id,
+                        transport_group_id,
+                        role,
+                        ..
+                    } => {
+                        *role == status_role
+                            && status.group_id_hex.as_deref()
+                                == Some(hex::encode(group_id.as_slice()).as_str())
+                            && status.transport_group_id_hex.as_deref()
+                                == Some(hex::encode(transport_group_id).as_str())
+                    }
+                    storage_sqlite::SubscriptionReplayRoute::Inbox { .. } => false,
+                });
+                if matches {
+                    status.pending_replay = false;
+                }
+            }
+        });
     }
 
     /// Canonical endpoints admitted by the same subscription policy used by
@@ -2292,6 +2289,12 @@ impl MarmotRelayPlaneAccountAdapter {
         TransportAccountActivation,
         crate::AccountTransportStatusSnapshot,
     ) {
+        let current_revision = self
+            .relay_plane
+            .inner
+            .transport_statuses
+            .snapshot(&self.account_id)
+            .revision;
         let inbox_admission = self
             .relay_plane
             .inner
@@ -2310,7 +2313,7 @@ impl MarmotRelayPlaneAccountAdapter {
         (
             activation,
             crate::AccountTransportStatusSnapshot {
-                revision: 0,
+                revision: current_revision,
                 state: crate::AccountTransportState::Unavailable,
                 inbox: Some(inbox),
                 current_group_routes,
@@ -2357,6 +2360,7 @@ impl MarmotRelayPlaneAccountAdapter {
         desired: crate::AccountTransportStatusSnapshot,
         retry_delay_ms: Option<u64>,
     ) -> bool {
+        let expected_revision = desired.revision;
         let registrations = self
             .relay_plane
             .inner
@@ -2371,11 +2375,20 @@ impl MarmotRelayPlaneAccountAdapter {
             .chain(snapshot.current_group_routes.iter())
             .chain(snapshot.historical_group_routes.iter())
             .any(|route| route.pending_registration);
-        self.relay_plane
+        match self
+            .relay_plane
             .inner
             .transport_statuses
-            .publish(&self.account_id, snapshot);
-        pending
+            .publish_if_revision(&self.account_id, expected_revision, snapshot)
+        {
+            Ok(_) => pending,
+            Err(current) => current
+                .inbox
+                .iter()
+                .chain(current.current_group_routes.iter())
+                .chain(current.historical_group_routes.iter())
+                .any(|route| route.pending_registration),
+        }
     }
 
     pub(crate) async fn reconcile_pending_registrations(&self, retry_delay: Duration) -> bool {

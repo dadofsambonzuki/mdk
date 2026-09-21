@@ -462,10 +462,12 @@ impl NostrSubscriptionRegistration {
 
     fn has_confirmed_registration_for(&self, endpoints: &[TransportEndpoint]) -> bool {
         self.detail == SubscriptionRegistrationDetail::Unknown
-            || self
-                .endpoints
-                .iter()
-                .any(|outcome| outcome.registered && endpoints.contains(&outcome.endpoint))
+            || self.endpoints.iter().any(|outcome| {
+                outcome.registered
+                    && endpoints
+                        .iter()
+                        .any(|endpoint| transport_endpoints_match(endpoint, &outcome.endpoint))
+            })
     }
 
     fn failed_endpoints_for(&self, endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoint> {
@@ -476,15 +478,27 @@ impl NostrSubscriptionRegistration {
             SubscriptionRegistrationDetail::Exact => endpoints
                 .iter()
                 .filter(|endpoint| {
-                    !self
-                        .endpoints
-                        .iter()
-                        .any(|outcome| outcome.registered && outcome.endpoint == **endpoint)
+                    !self.endpoints.iter().any(|outcome| {
+                        outcome.registered && transport_endpoints_match(endpoint, &outcome.endpoint)
+                    })
                 })
                 .cloned()
                 .collect(),
             SubscriptionRegistrationDetail::Unknown => Vec::new(),
         }
+    }
+}
+
+fn transport_endpoints_match(left: &TransportEndpoint, right: &TransportEndpoint) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        RelayUrl::parse(left.as_str()).ok(),
+        RelayUrl::parse(right.as_str()).ok(),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -824,12 +838,13 @@ impl NostrTransportAdapter {
             return NostrRegistrationReconciliation::default();
         }
         let attempted = requests.len();
-        let outcomes = tokio::time::timeout(
-            REGISTRATION_RECONCILIATION_BUDGET,
-            self.register_all("reconcile_pending_registrations", &requests),
-        )
-        .await
-        .unwrap_or_default();
+        let outcomes = self
+            .register_all_with_timeout(
+                "reconcile_pending_registrations",
+                &requests,
+                REGISTRATION_RECONCILIATION_BUDGET,
+            )
+            .await;
         let mut registered = 0;
         let still_pending = {
             let mut state = self.state.write().await;
@@ -924,12 +939,47 @@ impl NostrTransportAdapter {
         NostrSubscriptionRegistrationRequest,
         Result<NostrSubscriptionRegistration, TransportAdapterError>,
     )> {
+        self.register_all_inner(caller, requests, None).await
+    }
+
+    async fn register_all_with_timeout(
+        &self,
+        caller: &'static str,
+        requests: &[NostrSubscriptionRegistrationRequest],
+        request_timeout: Duration,
+    ) -> Vec<(
+        NostrSubscriptionRegistrationRequest,
+        Result<NostrSubscriptionRegistration, TransportAdapterError>,
+    )> {
+        self.register_all_inner(caller, requests, Some(request_timeout))
+            .await
+    }
+
+    async fn register_all_inner(
+        &self,
+        caller: &'static str,
+        requests: &[NostrSubscriptionRegistrationRequest],
+        request_timeout: Option<Duration>,
+    ) -> Vec<(
+        NostrSubscriptionRegistrationRequest,
+        Result<NostrSubscriptionRegistration, TransportAdapterError>,
+    )> {
         let mut pending = requests.iter().cloned().enumerate();
         let mut tasks = JoinSet::new();
         for (sub_index, request) in pending.by_ref().take(MAX_CONCURRENT_REGISTRATIONS) {
             let relay_client = self.relay_client.clone();
             tasks.spawn(async move {
-                let outcome = relay_client.subscribe_detailed(request.clone()).await;
+                let registration = relay_client.subscribe_detailed(request.clone());
+                let outcome = match request_timeout {
+                    Some(request_timeout) => tokio::time::timeout(request_timeout, registration)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(TransportAdapterError::Subscription(
+                                "registration attempt timed out".to_owned(),
+                            ))
+                        }),
+                    None => registration.await,
+                };
                 (sub_index, request, outcome)
             });
         }
@@ -947,7 +997,19 @@ impl NostrTransportAdapter {
             if let Some((sub_index, request)) = pending.next() {
                 let relay_client = self.relay_client.clone();
                 tasks.spawn(async move {
-                    let outcome = relay_client.subscribe_detailed(request.clone()).await;
+                    let registration = relay_client.subscribe_detailed(request.clone());
+                    let outcome = match request_timeout {
+                        Some(request_timeout) => {
+                            tokio::time::timeout(request_timeout, registration)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(TransportAdapterError::Subscription(
+                                        "registration attempt timed out".to_owned(),
+                                    ))
+                                })
+                        }
+                        None => registration.await,
+                    };
                     (sub_index, request, outcome)
                 });
             }
@@ -2121,14 +2183,16 @@ impl AdapterState {
                     state.registered = true;
                     state.detail = registration.detail;
                     state.registered_endpoints.extend(
-                        registration
-                            .endpoints
+                        request
+                            .registration_endpoints
                             .iter()
-                            .filter(|outcome| {
-                                outcome.registered
-                                    && request.registration_endpoints.contains(&outcome.endpoint)
+                            .filter(|requested| {
+                                registration.endpoints.iter().any(|outcome| {
+                                    outcome.registered
+                                        && transport_endpoints_match(requested, &outcome.endpoint)
+                                })
                             })
-                            .map(|outcome| outcome.endpoint.clone()),
+                            .cloned(),
                     );
                     state.pending_endpoints =
                         registration.failed_endpoints_for(&request.registration_endpoints);

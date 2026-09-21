@@ -473,6 +473,7 @@ impl NostrRelayClient for FakeRelayClient {
 struct FlakySubscribeRelayClient {
     fail_subscribes: AtomicBool,
     hang_subscribes: AtomicBool,
+    hang_endpoint: Mutex<Option<TransportEndpoint>>,
     subscription_attempts: Mutex<Vec<NostrSubscription>>,
     subscriptions: Mutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: Mutex<Vec<MemberId>>,
@@ -481,6 +482,7 @@ struct FlakySubscribeRelayClient {
 #[derive(Default)]
 struct DetailedEndpointRelayClient {
     fail_second: AtomicBool,
+    canonicalize_outcomes: AtomicBool,
     requests: Mutex<Vec<NostrSubscriptionRegistrationRequest>>,
 }
 
@@ -502,7 +504,15 @@ impl NostrRelayClient for DetailedEndpointRelayClient {
             .registration_endpoints
             .iter()
             .map(|endpoint| SubscriptionEndpointRegistration {
-                endpoint: endpoint.clone(),
+                endpoint: if self.canonicalize_outcomes.load(Ordering::SeqCst) {
+                    TransportEndpoint(
+                        RelayUrl::parse(endpoint.as_str())
+                            .expect("test endpoint parses")
+                            .to_string(),
+                    )
+                } else {
+                    endpoint.clone()
+                },
                 registered: !(endpoint.as_str().contains("two")
                     && self.fail_second.load(Ordering::SeqCst)),
             })
@@ -542,6 +552,7 @@ impl Default for FlakySubscribeRelayClient {
         Self {
             fail_subscribes: AtomicBool::new(true),
             hang_subscribes: AtomicBool::new(false),
+            hang_endpoint: Mutex::default(),
             subscription_attempts: Mutex::default(),
             subscriptions: Mutex::default(),
             unsubscribed_accounts: Mutex::default(),
@@ -559,7 +570,13 @@ impl NostrRelayClient for FlakySubscribeRelayClient {
             .lock()
             .unwrap()
             .push(subscription.clone());
-        if self.hang_subscribes.load(Ordering::SeqCst) {
+        let hangs_for_endpoint = self
+            .hang_endpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|endpoint| subscription.endpoints().contains(endpoint));
+        if self.hang_subscribes.load(Ordering::SeqCst) || hangs_for_endpoint {
             std::future::pending::<()>().await;
         }
         if self.fail_subscribes.load(Ordering::SeqCst) {
@@ -1183,6 +1200,64 @@ async fn registration_reconciliation_round_expires_after_five_seconds() {
     assert_eq!(outcome.still_pending, 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn registration_reconciliation_keeps_successes_when_one_route_times_out() {
+    let relay = Arc::new(FlakySubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xAA; 32]);
+    let healthy = TransportEndpoint("wss://healthy.example".into());
+    let stalled = TransportEndpoint("wss://stalled.example".into());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![healthy.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0xAB; 16]),
+                transport_group_id: vec![0xAC; 32],
+                endpoints: vec![stalled.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .expect_err("initial failures retain both routes for reconciliation");
+
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    *relay.hang_endpoint.lock().unwrap() = Some(stalled);
+    let started = tokio::time::Instant::now();
+    let outcome = adapter
+        .reconcile_pending_registrations_for_account(&account_id)
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    assert_eq!(outcome.attempted, 2);
+    assert_eq!(outcome.registered, 1);
+    assert_eq!(outcome.still_pending, 1);
+
+    let snapshots = adapter.account_registration_snapshot(&account_id).await;
+    let inbox = snapshots
+        .iter()
+        .find(|snapshot| {
+            matches!(
+                snapshot.subscription,
+                NostrSubscription::AccountInbox { .. }
+            )
+        })
+        .expect("inbox route remains visible");
+    assert!(inbox.registered);
+    assert_eq!(
+        inbox.endpoints[0].state,
+        SubscriptionEndpointRegistrationState::Unknown
+    );
+    let group = snapshots
+        .iter()
+        .find(|snapshot| matches!(snapshot.subscription, NostrSubscription::Group { .. }))
+        .expect("group route remains visible");
+    assert!(!group.registered);
+    assert_eq!(
+        group.endpoints[0].state,
+        SubscriptionEndpointRegistrationState::RetryPending
+    );
+}
+
 #[tokio::test]
 async fn activation_with_only_empty_routes_is_unavailable_without_dialing() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -1302,6 +1377,40 @@ async fn endpoint_retry_keeps_original_subscription_id_and_targets_only_failure(
         "healthy endpoints must not be reinstalled"
     );
     assert_eq!(requests[1].subscription.endpoints().len(), 2);
+}
+
+#[tokio::test]
+async fn canonical_registration_outcome_matches_verbatim_requested_endpoint() {
+    let relay = Arc::new(DetailedEndpointRelayClient::default());
+    relay.canonicalize_outcomes.store(true, Ordering::SeqCst);
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0xA9; 32]);
+    let requested = TransportEndpoint("wss://Relay.Example:443/".into());
+    let canonical = TransportEndpoint(
+        RelayUrl::parse(requested.as_str())
+            .expect("test endpoint parses")
+            .to_string(),
+    );
+    assert_ne!(requested, canonical, "the test must cross normalization");
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![requested.clone()],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .expect("canonical outcome identifies the requested endpoint");
+
+    let snapshot = adapter.account_registration_snapshot(&account_id).await;
+    assert_eq!(snapshot.len(), 1);
+    assert!(snapshot[0].registered);
+    assert_eq!(snapshot[0].endpoints.len(), 1);
+    assert_eq!(
+        snapshot[0].endpoints[0].state,
+        SubscriptionEndpointRegistrationState::Registered
+    );
 }
 
 #[tokio::test]
