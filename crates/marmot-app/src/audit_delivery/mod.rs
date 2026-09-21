@@ -24,8 +24,8 @@ mod recovery;
 mod state;
 
 pub use state::{
-    AcknowledgeResult, AttemptToken, AuditDeliveryError, AuditDeliveryStore, DestinationProfile,
-    JournalId, PreparedRange, SegmentId, SegmentStatus,
+    AttemptToken, AuditDeliveryError, AuditDeliveryStore, DestinationProfile, JournalId,
+    PreparedRange, SegmentId, SegmentStatus,
 };
 
 #[cfg(test)]

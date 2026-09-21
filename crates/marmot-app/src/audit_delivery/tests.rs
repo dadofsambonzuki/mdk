@@ -38,6 +38,18 @@ fn reopen(root: &TempDir, journal: &JournalId) -> AuditDeliveryStore {
     AuditDeliveryStore::open(root.path(), journal.clone(), profile()).unwrap()
 }
 
+fn persisted_recovery_events(root: &TempDir, journal: &JournalId) -> u64 {
+    let state_path = root
+        .path()
+        .join("audit-delivery/v1")
+        .join(journal.as_str())
+        .join("state.json");
+    serde_json::from_slice::<serde_json::Value>(&fs::read(state_path).unwrap()).unwrap()["health"]
+        ["recovery_events"]
+        .as_u64()
+        .unwrap()
+}
+
 #[test]
 fn j01_growing_file_does_not_expand_prepared_token() {
     let (_root, _journal, segment, mut store) = store_with_segment(b"{\"n\":1}\n{\"n\":2}\n");
@@ -138,7 +150,7 @@ fn j05_j06_publication_faults_preserve_recoverable_state_and_fence_uncertainty()
 }
 
 #[test]
-fn every_create_register_and_ack_publication_stage_fails_closed() {
+fn publication_faults_recover_only_unambiguous_create_and_registration_gaps() {
     let publication_faults = [
         FaultPoint::Write,
         FaultPoint::FileSync,
@@ -153,10 +165,13 @@ fn every_create_register_and_ack_publication_stage_fails_closed() {
             AuditDeliveryStore::create_failing(root.path(), journal.clone(), profile(), fault)
                 .is_err()
         );
-        assert!(matches!(
-            AuditDeliveryStore::open(root.path(), journal, profile()),
-            Err(AuditDeliveryError::IncompleteState)
-        ));
+        let reopened = AuditDeliveryStore::open(root.path(), journal.clone(), profile());
+        if fault == FaultPoint::DirectorySync {
+            drop(reopened.unwrap());
+            assert_eq!(persisted_recovery_events(&root, &journal), 1);
+        } else {
+            assert!(matches!(reopened, Err(AuditDeliveryError::IncompleteState)));
+        }
     }
 
     for fault in publication_faults {
@@ -173,15 +188,7 @@ fn every_create_register_and_ack_publication_stage_fails_closed() {
                     .register_segment(segment, SegmentStatus::Active)
                     .is_err()
             );
-            let reopened = AuditDeliveryStore::open(root.path(), journal, profile());
-            let reopen_should_succeed = (fault == FaultPoint::DirectorySync
-                && matching_calls_to_skip == 1)
-                || (matching_calls_to_skip == 0 && fault != FaultPoint::DirectorySync);
-            if reopen_should_succeed {
-                assert!(reopened.is_ok());
-            } else {
-                assert!(matches!(reopened, Err(AuditDeliveryError::IncompleteState)));
-            }
+            assert!(AuditDeliveryStore::open(root.path(), journal, profile()).is_ok());
         }
     }
 
@@ -197,6 +204,28 @@ fn every_create_register_and_ack_publication_stage_fails_closed() {
             assert!(reopened.recover_prepared().unwrap().is_some());
         }
     }
+}
+
+#[test]
+fn registration_gap_recovers_zero_cursor_without_skipping_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(root.path(), journal.clone(), profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), b"one\n").unwrap();
+    store.fail_after(FaultPoint::Write, 1);
+    assert!(
+        store
+            .register_segment(segment, SegmentStatus::Active)
+            .is_err()
+    );
+    drop(store);
+
+    let mut reopened = reopen(&root, &journal);
+    assert_eq!(persisted_recovery_events(&root, &journal), 1);
+    let prepared = reopened.prepare_next().unwrap().unwrap();
+    assert_eq!(prepared.start_offset(), 0);
+    assert_eq!(prepared.bodies(), &[b"one".to_vec()]);
 }
 
 #[test]
@@ -435,15 +464,31 @@ fn j10_incomplete_tail_and_missing_newline_are_bounded_without_repair() {
     let temporary = tempfile::tempdir().unwrap();
     let journal = JournalId::generate();
     let segment = SegmentId::generate();
-    let mut store = AuditDeliveryStore::create(temporary.path(), journal, profile()).unwrap();
+    let mut store =
+        AuditDeliveryStore::create(temporary.path(), journal.clone(), profile()).unwrap();
     fs_private::write_private(&store.segment_path(&segment).unwrap(), b"incomplete").unwrap();
-    store
-        .register_segment(segment, SegmentStatus::Sealed)
-        .unwrap();
     assert!(matches!(
-        store.prepare_next(),
+        store.register_segment(segment.clone(), SegmentStatus::Sealed),
         Err(AuditDeliveryError::InvalidJsonl)
     ));
+    store
+        .register_segment(segment.clone(), SegmentStatus::Active)
+        .unwrap();
+    assert!(store.prepare_next().unwrap().is_none());
+    assert!(matches!(
+        store.seal_active_segment(&segment),
+        Err(AuditDeliveryError::InvalidJsonl)
+    ));
+    drop(store);
+    let mut reopened = reopen(&temporary, &journal);
+    assert!(matches!(
+        reopened.seal_active_segment(&segment),
+        Err(AuditDeliveryError::InvalidJsonl)
+    ));
+    append(&reopened, &segment, b"\n");
+    reopened.seal_active_segment(&segment).unwrap();
+    let prepared = reopened.prepare_next().unwrap().unwrap();
+    assert_eq!(prepared.bodies(), &[b"incomplete".to_vec()]);
 }
 
 #[test]

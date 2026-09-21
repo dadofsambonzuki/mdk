@@ -182,11 +182,6 @@ impl fmt::Debug for PreparedRange {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AcknowledgeResult {
-    Advanced,
-}
-
 #[derive(Debug, Error)]
 pub enum AuditDeliveryError {
     #[error("unsafe audit-delivery identifier")]
@@ -381,19 +376,7 @@ impl AuditDeliveryStore {
             journal_id: journal_id.clone(),
             segments: Vec::new(),
         };
-        let state = DurableState {
-            version: FORMAT_VERSION,
-            journal_id,
-            destination_profile,
-            revision: 0,
-            cursors: Vec::new(),
-            prepared: None,
-            health: HealthState {
-                status: HealthStatus::Clean,
-                recovery_events: 0,
-                corruption_events: 0,
-            },
-        };
+        let state = initial_state(journal_id, destination_profile);
         let mut store = Self {
             root,
             directories,
@@ -409,8 +392,10 @@ impl AuditDeliveryStore {
         Ok(store)
     }
 
-    /// Reopen and fully validate an existing generation. Missing, inconsistent,
-    /// unknown-version, or ambiguous state fails closed; it is never reset.
+    /// Reopen and fully validate an existing generation. A strictly safe
+    /// create/registration publication gap is completed conservatively with a
+    /// zero cursor; missing, inconsistent, unknown-version, or ambiguous state
+    /// otherwise fails closed and is never reset.
     pub fn open(
         account_root: impl AsRef<Path>,
         journal_id: JournalId,
@@ -422,19 +407,32 @@ impl AuditDeliveryStore {
             .join("audit-delivery")
             .join("v1")
             .join(journal_id.as_str());
+        destination_profile.validate()?;
         let directories = open_journal_directories(&root)?;
         let manifest: Manifest = decode_metadata(&directories.root, MANIFEST_FILE)?;
-        let state: DurableState = decode_metadata(&directories.root, STATE_FILE)?;
-        if manifest.version != FORMAT_VERSION || state.version != FORMAT_VERSION {
+        if manifest.version != FORMAT_VERSION {
             return Err(AuditDeliveryError::UnknownVersion);
         }
-        if manifest.journal_id != journal_id
-            || state.journal_id != journal_id
-            || state.destination_profile != destination_profile
-        {
+        if manifest.journal_id != journal_id {
             return Err(AuditDeliveryError::CorruptState);
         }
-        let store = Self {
+        let (state, recover_missing_initial_state) =
+            match decode_metadata(&directories.root, STATE_FILE) {
+                Ok(state) => (state, false),
+                Err(AuditDeliveryError::IncompleteState) if manifest.segments.is_empty() => {
+                    let mut state = initial_state(journal_id.clone(), destination_profile.clone());
+                    state.health.recovery_events = 1;
+                    (state, true)
+                }
+                Err(error) => return Err(error),
+            };
+        if state.version != FORMAT_VERSION {
+            return Err(AuditDeliveryError::UnknownVersion);
+        }
+        if state.journal_id != journal_id || state.destination_profile != destination_profile {
+            return Err(AuditDeliveryError::CorruptState);
+        }
+        let mut store = Self {
             root,
             directories,
             manifest,
@@ -444,6 +442,10 @@ impl AuditDeliveryStore {
             recovery_required: false,
             faults: Faults::default(),
         };
+        if recover_missing_initial_state {
+            store.publish_state()?;
+        }
+        store.recover_registration_gap()?;
         store.validate_all()?;
         Ok(store)
     }
@@ -461,14 +463,14 @@ impl AuditDeliveryStore {
     /// Register an already-created private payload segment.
     ///
     /// The manifest is published before its zero acknowledgement cursor. A
-    /// crash between those documents reopens as [`AuditDeliveryError::IncompleteState`]
-    /// rather than guessing that the segment was acknowledged.
+    /// crash between those documents recovers that cursor at zero rather than
+    /// guessing that any bytes were acknowledged.
     pub fn register_segment(
         &mut self,
         segment_id: SegmentId,
         status: SegmentStatus,
     ) -> Result<(), AuditDeliveryError> {
-        self.ensure_mutable()?;
+        self.ensure_open()?;
         if self.state.prepared.is_some() {
             return Err(AuditDeliveryError::PreparationPending);
         }
@@ -494,6 +496,9 @@ impl AuditDeliveryStore {
         let file_name = segment_file_name(&segment_id);
         let file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
         let (length, digest) = file_length_and_digest(&file)?;
+        if status == SegmentStatus::Sealed {
+            validate_complete_sealed_payload(&file, length)?;
+        }
         sync_payload(&file, &mut self.faults)?;
         let relative_name = format!("{SEGMENTS_DIR}/{}.jsonl", segment_id.as_str());
         let mut manifest = self.manifest.clone();
@@ -531,7 +536,7 @@ impl AuditDeliveryStore {
         &mut self,
         segment_id: &SegmentId,
     ) -> Result<(), AuditDeliveryError> {
-        self.ensure_mutable()?;
+        self.ensure_open()?;
         if self.state.prepared.is_some() {
             return Err(AuditDeliveryError::PreparationPending);
         }
@@ -546,6 +551,7 @@ impl AuditDeliveryStore {
         validate_live_segment(&file, entry)?;
         let (length, digest) = file_length_and_digest(&file)?;
         validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
+        validate_complete_sealed_payload(&file, length)?;
         sync_payload(&file, &mut self.faults)?;
 
         let mut manifest = self.manifest.clone();
@@ -565,7 +571,7 @@ impl AuditDeliveryStore {
     /// complete new line is available. An existing unresolved range must be
     /// recovered with [`Self::recover_prepared`] first.
     pub fn prepare_next(&mut self) -> Result<Option<PreparedRange>, AuditDeliveryError> {
-        self.ensure_mutable()?;
+        self.ensure_open()?;
         if self.state.prepared.is_some() {
             return Err(AuditDeliveryError::PreparationPending);
         }
@@ -650,11 +656,8 @@ impl AuditDeliveryStore {
     }
 
     /// Advance exactly the range proven by `token` and atomically clear it.
-    pub fn acknowledge(
-        &mut self,
-        token: &AttemptToken,
-    ) -> Result<AcknowledgeResult, AuditDeliveryError> {
-        self.ensure_mutable()?;
+    pub fn acknowledge(&mut self, token: &AttemptToken) -> Result<(), AuditDeliveryError> {
+        self.ensure_open()?;
         let prepared = self
             .state
             .prepared
@@ -689,7 +692,7 @@ impl AuditDeliveryStore {
         state.prepared = None;
         self.publish_state_value(&state)?;
         self.state = state;
-        Ok(AcknowledgeResult::Advanced)
+        Ok(())
     }
 
     /// Fence this owner. An unresolved range remains on disk for a newly
@@ -755,6 +758,45 @@ impl AuditDeliveryStore {
         Ok(())
     }
 
+    fn recover_registration_gap(&mut self) -> Result<(), AuditDeliveryError> {
+        if self.manifest.segments.len() == self.state.cursors.len() {
+            return Ok(());
+        }
+        if self.manifest.segments.len() != self.state.cursors.len().saturating_add(1)
+            || self.state.prepared.is_some()
+        {
+            return Err(AuditDeliveryError::IncompleteState);
+        }
+
+        let segment_id = self
+            .manifest
+            .segments
+            .last()
+            .ok_or(AuditDeliveryError::IncompleteState)?
+            .segment_id
+            .clone();
+        let mut recovered = self.state.clone();
+        recovered.revision = next_revision(recovered.revision)?;
+        recovered.health.recovery_events = recovered
+            .health
+            .recovery_events
+            .checked_add(1)
+            .ok_or(AuditDeliveryError::CorruptState)?;
+        recovered.cursors.push(SegmentCursor {
+            segment_id,
+            acknowledged_end: 0,
+            boundary_digest: hex::encode(Sha256::digest([])),
+        });
+
+        let previous = std::mem::replace(&mut self.state, recovered.clone());
+        let validation = self.validate_all();
+        self.state = previous;
+        validation?;
+        self.publish_state_value(&recovered)?;
+        self.state = recovered;
+        Ok(())
+    }
+
     fn validate_prepared_cursor(&self, prepared: &PreparedState) -> Result<(), AuditDeliveryError> {
         let cursor = self.cursor(&prepared.segment_id)?;
         if prepared.start_offset != cursor.acknowledged_end
@@ -791,10 +833,6 @@ impl AuditDeliveryStore {
         } else {
             Ok(())
         }
-    }
-
-    fn ensure_mutable(&self) -> Result<(), AuditDeliveryError> {
-        self.ensure_open()
     }
 
     fn publish_manifest(&mut self) -> Result<(), AuditDeliveryError> {
@@ -853,6 +891,22 @@ impl AuditDeliveryStore {
         let mut faults = Faults::default();
         faults.fail_next(point);
         Self::create_with_faults(account_root, journal_id, destination_profile, faults)
+    }
+}
+
+fn initial_state(journal_id: JournalId, destination_profile: DestinationProfile) -> DurableState {
+    DurableState {
+        version: FORMAT_VERSION,
+        journal_id,
+        destination_profile,
+        revision: 0,
+        cursors: Vec::new(),
+        prepared: None,
+        health: HealthState {
+            status: HealthStatus::Clean,
+            recovery_events: 0,
+            corruption_events: 0,
+        },
     }
 }
 
@@ -918,6 +972,33 @@ fn sync_payload(file: &File, faults: &mut Faults) -> Result<(), AuditDeliveryErr
         })
 }
 
+fn validate_complete_sealed_payload(file: &File, length: u64) -> Result<(), AuditDeliveryError> {
+    if length == 0 {
+        return Ok(());
+    }
+    let mut file = file
+        .try_clone()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "clone sealed payload handle",
+            source,
+        })?;
+    file.seek(SeekFrom::End(-1))
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "seek sealed payload tail",
+            source,
+        })?;
+    let mut final_byte = [0u8; 1];
+    file.read_exact(&mut final_byte)
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "read sealed payload tail",
+            source,
+        })?;
+    if final_byte != [b'\n'] {
+        return Err(AuditDeliveryError::InvalidJsonl);
+    }
+    Ok(())
+}
+
 fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {
     validate_file_identity(file, &entry.file_identity)?;
     let length = file
@@ -934,6 +1015,9 @@ fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), A
     }
     if hex::encode(digest_range(file, 0, entry.registered_length)?) != entry.registered_digest {
         return Err(AuditDeliveryError::CorruptState);
+    }
+    if entry.status == SegmentStatus::Sealed {
+        validate_complete_sealed_payload(file, length)?;
     }
     Ok(())
 }

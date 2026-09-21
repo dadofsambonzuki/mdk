@@ -49,6 +49,7 @@ libc.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
+unicode-ident.workspace = true
 # Byte-level conformance vectors for the agent text stream QUIC feature pin
 # the transport crates' key derivation, AAD, and broker control bytes.
 transport-quic-stream.workspace = true

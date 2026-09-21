@@ -165,7 +165,7 @@ impl PreparedDirectory {
             libc::openat(
                 self.directory.as_raw_fd(),
                 name_c.as_ptr(),
-                access | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                access | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         if descriptor < 0 {
@@ -274,7 +274,11 @@ impl PreparedDirectory {
         {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            Err(io_context(
+                "replace verified-directory entry",
+                &self.path.join(to),
+                io::Error::last_os_error(),
+            ))
         }
     }
 
@@ -286,7 +290,11 @@ impl PreparedDirectory {
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name_c.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
-            Err(io::Error::last_os_error())
+            Err(io_context(
+                "remove verified-directory file",
+                &self.path.join(name),
+                io::Error::last_os_error(),
+            ))
         }
     }
 
@@ -1539,6 +1547,30 @@ mod unix_tests {
         let opened =
             open_existing_directory_path(&existing, 0o700, ExistingDirectoryMode::Enforce).unwrap();
         assert!(!opened.was_created());
+    }
+
+    #[test]
+    fn prepared_directory_regular_file_open_rejects_fifo_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        let prepared =
+            prepare_directory_path(&private, 0o700, ExistingDirectoryMode::Enforce).unwrap();
+        let fifo_name = std::ffi::OsStr::new("payload.fifo");
+        let fifo_path = private.join(fifo_name);
+        let fifo_path_c = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_path_c.as_ptr(), 0o600) },
+            0,
+            "create FIFO fixture: {}",
+            io::Error::last_os_error()
+        );
+
+        let error = prepared
+            .open_existing_regular_file(fifo_name, ExistingFileAccess::Read)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {
