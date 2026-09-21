@@ -607,8 +607,11 @@ pub trait NostrRelayClient: Send + Sync {
     -> Result<(), TransportAdapterError>;
 
     /// Register a logical subscription and, when supported, report exact
-    /// endpoint outcomes. The compatibility default preserves existing
-    /// injected clients without inventing endpoint successes.
+    /// endpoint outcomes. The compatibility default preserves source and
+    /// registration compatibility for existing injected clients without
+    /// inventing endpoint successes. Its coverage remains `Unknown`, so a
+    /// client that participates in endpoint-complete replay or repair must
+    /// override this method and report detailed outcomes.
     async fn subscribe_detailed(
         &self,
         request: NostrSubscriptionRegistrationRequest,
