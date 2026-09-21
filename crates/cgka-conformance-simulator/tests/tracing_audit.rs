@@ -324,10 +324,7 @@ fn tracing_invocations(contents: &str) -> Vec<TraceInvocation> {
     let mut index = 0;
 
     while index < lines.len() {
-        if TRACING_MACROS
-            .iter()
-            .any(|needle| lines[index].contains(needle))
-        {
+        if contains_tracing_macro(lines[index]) {
             let start_line = index + 1;
             let mut body = String::new();
             let mut paren_depth = 0isize;
@@ -355,6 +352,29 @@ fn tracing_invocations(contents: &str) -> Vec<TraceInvocation> {
     }
 
     invocations
+}
+
+fn contains_tracing_macro(line: &str) -> bool {
+    TRACING_MACROS.iter().any(|needle| {
+        line.match_indices(needle).any(|(start, _)| {
+            line[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|previous| previous != '_' && !previous.is_alphanumeric())
+        })
+    })
+}
+
+#[test]
+fn tracing_macro_scan_does_not_treat_compile_error_as_error() {
+    let contents = r#"
+compile_error!("unsupported platform");
+error!(target: "audit", method = "test", "expected tracing call");
+"#;
+
+    let invocations = tracing_invocations(contents);
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].line, 3);
 }
 
 #[test]
