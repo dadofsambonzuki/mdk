@@ -174,7 +174,7 @@ struct PreparedAttachment<'a> {
     native_image: bool,
 }
 
-/// Rechecks the staging lease and detects native images by bytes, not sender-controlled metadata.
+/// Revalidates each staged copy immediately before spawn and detects native images by bytes.
 fn prepare_attachments(
     attachments: &[Attachment],
 ) -> Result<Vec<PreparedAttachment<'_>>, HarnessError> {
@@ -191,7 +191,7 @@ fn prepare_attachments(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
             let mut file = options
                 .open(&attachment.path)
@@ -523,6 +523,10 @@ mod tests {
                 "-",
             ]
         );
+        assert_eq!(
+            build_exec_args_with_images(None, ExecutionProfile::Inherit, &[]),
+            vec!["exec", "--json", "-"]
+        );
     }
 
     #[test]
@@ -660,6 +664,23 @@ mod tests {
             Err(HarnessError::AttachmentInvalid)
         ));
 
+        let fifo = root.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let fifo_attachment = Attachment {
+            path: fifo,
+            media_type: "application/octet-stream".to_owned(),
+            file_name: "pipe".to_owned(),
+            size_bytes: 0,
+        };
+        assert!(matches!(
+            prepare_attachments(&[fifo_attachment]),
+            Err(HarnessError::AttachmentInvalid)
+        ));
+
         let non_utf8_path = root
             .path()
             .join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
@@ -763,6 +784,69 @@ printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":
         assert_eq!(
             rx.recv().await,
             Some(RunnerEvent::Text("attachments received".to_owned()))
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_runner_passes_a_non_image_only_batch_without_image_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let notes = root.path().join("000-notes.txt");
+        let archive = root.path().join("001-archive.zip");
+        fs::write(&notes, b"notes").unwrap();
+        fs::write(&archive, b"PK\x03\x04archive").unwrap();
+        let script = root.path().join("file-codex");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 3 ] || [ "$1" != "exec" ] || [ "$2" != "--json" ] || [ "$3" != "-" ]; then
+  printf 'unexpected args:' >&2
+  printf ' <%s>' "$@" >&2
+  exit 64
+fi
+prompt="$(cat)"
+printf '%s' "$prompt" | grep -F '000-notes.txt' >/dev/null || exit 65
+printf '%s' "$prompt" | grep -F '001-archive.zip' >/dev/null || exit 66
+if printf '%s' "$prompt" | grep -F '"delivery":"native_image"' >/dev/null; then
+  exit 67
+fi
+printf '%s' "$prompt" | grep -F '"ordinal":1' >/dev/null || exit 68
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-new"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"files received"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "inspect".to_owned(),
+                artifact_output: None,
+            },
+            vec![
+                attachment(&notes, "text/plain", "000-notes.txt"),
+                attachment(&archive, "application/zip", "001-archive.zip"),
+            ],
+            tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.observed_session.as_deref(), Some("thread-new"));
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            rx.recv().await,
+            Some(RunnerEvent::Text("files received".to_owned()))
         );
         assert!(rx.recv().await.is_none());
     }
