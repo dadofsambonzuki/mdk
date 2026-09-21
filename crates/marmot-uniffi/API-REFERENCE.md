@@ -2242,8 +2242,9 @@ pub async fn create_poll( &self, account_ref: String, group_id_hex: String, ques
 
 Pass two through ten option labels and an optional Unix-seconds deadline no more than 30 days after creation. MDK
 validates bounded display text, assigns stable option ids in display order, and exposes results through the timeline
-poll projection. Creation requires at least three distinct current account identities; multiple device leaves from one
-account count once. Polls are neither anonymous nor election-grade. See [Polls](POLLS.md).
+poll projection. Creation follows MDK's canonical conversation classification: named two-member conversations are
+groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
+[Polls](POLLS.md).
 
 [Source](src/commands/message.rs#L211)
 
@@ -2257,8 +2258,8 @@ pub async fn cast_poll_vote( &self, account_ref: String, group_id_hex: String, p
 
 The poll must already be a valid local timeline row in this group and remain open. Pass one option id for single choice
 or one through ten unique ids for multiple choice; use the ids from `TimelineMessageRecordFfi.poll`, not option labels.
-This is a replacement, not a delta or unvote. An accepted open poll remains votable if its group later shrinks below
-three members. See [Polls](POLLS.md).
+This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
+send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
 [Source](src/commands/message.rs#L236)
 

@@ -474,8 +474,6 @@ impl SqliteAccountStorage {
     /// Ensure the projection root and durably bind it to this account's
     /// authenticated identity. The database is already scoped to one account
     /// device, so this becomes the stable identity source for read projections.
-    /// An unchanged binding is a no-op; a missing or changed binding updates
-    /// the identity and its projection timestamp.
     pub fn ensure_account_projection_with_identity(
         &self,
         label: &str,
@@ -487,8 +485,7 @@ impl SqliteAccountStorage {
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(label) DO UPDATE SET
                     updated_at = excluded.updated_at,
-                    local_account_id_hex = excluded.local_account_id_hex
-                 WHERE account_state.local_account_id_hex IS NOT excluded.local_account_id_hex",
+                    local_account_id_hex = excluded.local_account_id_hex",
                 params![label, unix_now_seconds_i64(), local_account_id_hex],
             )
             .storage()?;

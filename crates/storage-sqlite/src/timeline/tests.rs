@@ -236,6 +236,51 @@ fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
 }
 
 #[test]
+fn poll_response_moderator_delete_falls_back_but_cross_author_delete_does_not() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let poll_id = "12".repeat(32);
+    let older = "13".repeat(32);
+    let newer = "14".repeat(32);
+    store
+        .record_app_event(&poll(&poll_id, "creator", 100))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &older, "bob", &poll_id, 150, "0", "received",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&poll_response(
+            &newer, "bob", &poll_id, 160, "1", "received",
+        ))
+        .unwrap();
+
+    store
+        .record_app_event(&delete(&"15".repeat(32), "admin", &newer, 170))
+        .unwrap();
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.options[1].votes, 1);
+
+    store
+        .record_app_event(&moderated_delete(&"16".repeat(32), "admin", &newer, 180))
+        .unwrap();
+    let projected = store
+        .timeline_message(&"11".repeat(32), &poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(projected.participants, 1);
+    assert_eq!(projected.options[0].votes, 1);
+    assert_eq!(projected.options[1].votes, 0);
+}
+
+#[test]
 fn poll_projection_is_independent_of_response_arrival_order() {
     let poll_id = "12".repeat(32);
     let older = poll_response(&"13".repeat(32), "bob", &poll_id, 140, "0", "received");

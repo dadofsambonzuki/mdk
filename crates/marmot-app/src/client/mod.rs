@@ -3691,14 +3691,48 @@ impl AppClient {
     }
 
     pub(crate) fn ensure_poll_creation_allowed(&self, group_id: &GroupId) -> Result<(), AppError> {
-        let members = self.runtime.members(group_id)?;
-        if !poll_creation_has_enough_distinct_accounts(&members) {
+        let group = self.runtime.group_record(group_id)?;
+        let member_count = u64::try_from(group.members.len()).ok();
+        if storage_sqlite::conversation_kind(&group.name, member_count)
+            != storage_sqlite::ChatConversationKind::Group
+        {
             return Err(AppError::InvalidAppMessagePayload(
-                "polls require a group conversation with at least three distinct account identities"
-                    .into(),
+                "polls require a group conversation".into(),
             ));
         }
         Ok(())
+    }
+
+    fn ensure_poll_response_valid_at(
+        &self,
+        group_id: &GroupId,
+        poll_event_id: &str,
+        option_ids: &[String],
+        response_created_at: u64,
+    ) -> Result<(), AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let message = self
+            .app
+            .timeline_message(&self.state.label, &group_id_hex, poll_event_id)?
+            .ok_or_else(|| {
+                AppError::InvalidAppMessagePayload(
+                    "poll response requires a valid locally accepted poll in this group".into(),
+                )
+            })?;
+        if message.poll.is_none() {
+            return Err(AppError::InvalidAppMessagePayload(
+                "poll response requires a valid locally accepted poll in this group".into(),
+            ));
+        }
+        let poll_event = MarmotInnerEvent {
+            id: message.message_id_hex,
+            pubkey: message.sender,
+            created_at: message.timeline_at,
+            kind: message.kind,
+            tags: message.tags,
+            content: message.plaintext,
+        };
+        validate_stamped_poll_response(&poll_event, response_created_at, option_ids)
     }
 
     async fn send_app_event_with_local_projection_unobserved<F>(
@@ -3713,6 +3747,9 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
+        if matches!(&intent, AppMessageIntent::Poll { .. }) {
+            self.ensure_poll_creation_allowed(group_id)?;
+        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.
@@ -3839,6 +3876,18 @@ impl AppClient {
             let payload = encode_inner_event(&event)?;
             (event, payload)
         };
+        if let AppMessageIntent::PollResponse {
+            poll_event_id,
+            option_ids,
+        } = &intent
+        {
+            self.ensure_poll_response_valid_at(
+                group_id,
+                poll_event_id,
+                option_ids,
+                event.created_at,
+            )?;
+        }
         let _draft_guard = if let Some((revision, _)) = draft {
             let storage = self.app.draft_storage(&self.state.label)?;
             self.runtime.session().set_message_draft_commit_observer(
@@ -6344,13 +6393,28 @@ fn local_account_removed_from_roster(
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
 }
 
-fn poll_creation_has_enough_distinct_accounts(members: &[cgka_traits::group::Member]) -> bool {
-    members
-        .iter()
-        .map(|member| member.id.as_slice())
-        .collect::<HashSet<_>>()
-        .len()
-        >= 3
+fn validate_stamped_poll_response(
+    poll_event: &MarmotInnerEvent,
+    response_created_at: u64,
+    option_ids: &[String],
+) -> Result<(), AppError> {
+    let poll = cgka_traits::parse_poll(poll_event).map_err(|_| {
+        AppError::InvalidAppMessagePayload(
+            "poll response requires a valid locally accepted poll in this group".into(),
+        )
+    })?;
+    cgka_traits::validate_poll_response(
+        &poll,
+        poll_event.created_at,
+        response_created_at,
+        option_ids,
+    )
+    .map_err(|error| match error {
+        cgka_traits::PollError::InvalidDeadline => AppError::InvalidAppMessagePayload(
+            "poll is closed at the response event timestamp".into(),
+        ),
+        _ => AppError::InvalidAppMessagePayload(error.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -6509,7 +6573,7 @@ mod post_canonical_create_tests {
 
 #[cfg(test)]
 mod self_membership_backfill_tests {
-    use super::{local_account_removed_from_roster, poll_creation_has_enough_distinct_accounts};
+    use super::local_account_removed_from_roster;
     use cgka_traits::MemberId;
     use cgka_traits::group::Member;
 
@@ -6540,15 +6604,38 @@ mod self_membership_backfill_tests {
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
     }
+}
+
+#[cfg(test)]
+mod poll_send_validation_tests {
+    use super::{MarmotInnerEvent, validate_stamped_poll_response};
+    use crate::AppError;
 
     #[test]
-    fn poll_creation_counts_distinct_accounts_not_mls_leaves() {
-        let two_accounts_three_leaves = vec![member("aa"), member("bb"), member("bb")];
-        assert!(!poll_creation_has_enough_distinct_accounts(
-            &two_accounts_three_leaves
-        ));
+    fn stamped_poll_response_must_not_cross_the_deadline() {
+        let poll_event = MarmotInnerEvent {
+            id: "11".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 100,
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+            tags: cgka_traits::poll_tags(
+                100,
+                "Tea?",
+                &["Yes".into(), "No".into()],
+                cgka_traits::PollType::SingleChoice,
+                Some(110),
+            )
+            .unwrap(),
+            content: "Tea?".into(),
+        };
+        let selection = ["0".into()];
 
-        let three_accounts = vec![member("aa"), member("bb"), member("cc")];
-        assert!(poll_creation_has_enough_distinct_accounts(&three_accounts));
+        validate_stamped_poll_response(&poll_event, 110, &selection).unwrap();
+        let error = validate_stamped_poll_response(&poll_event, 111, &selection).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::InvalidAppMessagePayload(message)
+                if message == "poll is closed at the response event timestamp"
+        ));
     }
 }

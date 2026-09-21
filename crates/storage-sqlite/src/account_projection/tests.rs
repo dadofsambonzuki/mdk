@@ -19,51 +19,6 @@ fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
 }
 
 #[test]
-fn ensuring_an_unchanged_account_identity_does_not_rewrite_projection_state() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .ensure_account_projection_with_identity("alice", "first")
-        .unwrap();
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE account_state SET updated_at = 7 WHERE label = ?1",
-            params!["alice"],
-        )
-        .unwrap();
-
-    store
-        .ensure_account_projection_with_identity("alice", "first")
-        .unwrap();
-    let unchanged = store
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT updated_at, local_account_id_hex FROM account_state WHERE label = ?1",
-            params!["alice"],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .unwrap();
-    assert_eq!(unchanged, (7, "first".to_owned()));
-
-    store
-        .ensure_account_projection_with_identity("alice", "second")
-        .unwrap();
-    let changed = store
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT updated_at, local_account_id_hex FROM account_state WHERE label = ?1",
-            params!["alice"],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .unwrap();
-    assert_ne!(changed.0, 7);
-    assert_eq!(changed.1, "second");
-}
-
-#[test]
 fn keyed_group_read_is_bounded() {
     use crate::query_work_test_support::measure;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};

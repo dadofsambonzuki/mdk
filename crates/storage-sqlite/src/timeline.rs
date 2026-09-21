@@ -4116,7 +4116,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         return Ok(());
     }
     let local_account_id_hex = conn
-        .query_row(
+        .query_row_cached(
             "SELECT local_account_id_hex
              FROM account_state
              WHERE local_account_id_hex IS NOT NULL
@@ -4165,7 +4165,10 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                             AND delete_edges.kind = ?
                             AND delete_edges.target_message_id_hex = app_events.message_id_hex
                             AND delete_events.invalidated = 0
-                            AND delete_events.sender = app_events.sender
+                            AND (
+                                delete_events.sender = app_events.sender
+                                OR delete_events.moderation_grant = 1
+                            )
                       )
                       AND edges.target_message_id_hex IN ({placeholders})
                  )

@@ -4041,9 +4041,9 @@ MarmotStatus marmot_create_poll(const struct MarmotClient *client, const char *a
 ```
 
 Pass two through ten labels, a valid `MarmotPollType` discriminant, and use `has_ends_at` to distinguish no deadline
-from the Unix-seconds `ends_at` value. Creation requires at least three distinct current account identities; multiple
-device leaves from one account count once. MDK assigns stable option ids. The call blocks and `out` is released with
-`marmot_send_summary_free`; recompile for the added timeline poll record. See
+from the Unix-seconds `ends_at` value. Creation follows MDK's canonical conversation classification: named two-member
+conversations are groups, while unnamed two-member conversations are direct. MDK assigns stable option ids. The call
+blocks and `out` is released with `marmot_send_summary_free`; recompile for the added timeline poll record. See
 [the shared poll contract](../marmot-uniffi/POLLS.md).
 
 [Header contract](include/marmot.h#L8377)
@@ -4057,8 +4057,9 @@ MarmotStatus marmot_cast_poll_vote(const struct MarmotClient *client, const char
 ```
 
 Pass the complete option-id selection from the poll projection; an empty selection is not an unvote. The poll must be
-valid, local to the named group, and open. It remains votable if the group later shrinks below three members. The call
-blocks and `out` is released with `marmot_send_summary_free`. See
+valid, local to the named group, and open. MDK revalidates it against the response event's actual timestamp at send
+time, and it remains votable after conversation reclassification. The call blocks and `out` is released with
+`marmot_send_summary_free`. See
 [the shared poll contract](../marmot-uniffi/POLLS.md).
 
 [Header contract](include/marmot.h#L8395)

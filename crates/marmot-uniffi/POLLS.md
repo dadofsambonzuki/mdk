@@ -7,19 +7,23 @@ application messages. Poll and vote data never become public relay-query metadat
 Use `createPoll` with a question, two through ten option labels, `singleChoice` or `multipleChoice`, and an optional Unix
 seconds deadline. MDK assigns stable option ids in display order (`"0"` through `"9"`). Questions are limited to 1024
 UTF-8 bytes, labels to 256 bytes, and deadlines to at most 30 days after creation. Empty, whitespace-padded, control, and
-bidirectional-override text is rejected. Poll creation requires at least three distinct current account identities;
-multiple MLS device leaves for one account do not satisfy that minimum. An already-accepted open poll remains votable
-if the group later shrinks below three members.
+bidirectional-override text is rejected. Poll creation follows MDK's canonical conversation classification: a named
+conversation is a group even with two members, while an unnamed two-member conversation is direct and cannot create
+a poll. An already-accepted open poll remains votable if the conversation is later classified as direct.
 
 Use `castPollVote` with the poll event id and the complete selected option-id list. It is a replacement, not a delta:
 send one id for single choice and one through ten unique ids for multiple choice. The poll must already be a valid local
 timeline row in the same group and still be open. An empty selection is not an unvote operation.
+MDK checks openness when the command is accepted and again against the response event's actual `created_at` timestamp
+at the shared send boundary. If the deadline passes while the command is queued, the call fails and no response is
+locally projected or confirmed.
 
 `TimelineMessageRecordFfi.poll` is present on valid kind-1068 rows. It contains the ordered options and counts, total
 participating authenticated identities, the account's effective sent selection, creator, deadline, and current open
 state. Kind-1018 responses do not form timeline rows. For each authenticated author MDK selects the response with the
-greatest `(created_at, canonical event id)`; ordinary author deletion or retention expiry falls back to the newest
-retained valid response. Projection work considers at most the newest 64 retained responses per author.
+greatest `(created_at, canonical event id)`; author deletion, an accepted moderator deletion, or retention expiry falls
+back to the newest retained valid response. Projection work considers at most the newest 64 retained responses per
+author.
 That bound is applied before full response validation: if one author publishes 64 newer malformed or out-of-window
 replacements, an older valid response is no longer counted. This is an intentional per-author work bound and cannot
 change another participant's vote. Deletion and retention can therefore also change a projected tally after `endsAt`.

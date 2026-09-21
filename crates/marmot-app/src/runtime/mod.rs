@@ -2391,7 +2391,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create an encrypted NIP-88 poll in a conversation with at least three members.
+    /// Create an encrypted NIP-88 poll in a group conversation.
     pub async fn create_poll(
         &self,
         account_ref: &str,
@@ -2407,8 +2407,8 @@ impl MarmotAppRuntime {
     }
 
     /// Cast or replace this account's current selection for an accepted open
-    /// poll. A poll remains votable if its group later shrinks below three
-    /// members.
+    /// poll. A poll remains votable if the conversation is later classified as
+    /// direct.
     pub async fn cast_poll_vote(
         &self,
         account_ref: &str,

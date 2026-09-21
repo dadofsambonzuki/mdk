@@ -2702,7 +2702,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     })
 }
 
-fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
+/// Classify a conversation from the same inputs used by chat-list projection.
+pub fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
     if !group_name.trim().is_empty() {
         return ChatConversationKind::Group;
     }

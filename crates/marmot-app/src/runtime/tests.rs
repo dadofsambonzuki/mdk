@@ -241,16 +241,17 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
 }
 
 #[tokio::test]
-async fn poll_creation_rejects_direct_chats_but_existing_polls_remain_votable() {
+async fn poll_creation_uses_conversation_kind_and_existing_polls_remain_votable() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
     home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let carol = home.create_account("carol").unwrap();
     let dave = home.create_account("dave").unwrap();
+    let erin = home.create_account("erin").unwrap();
     let app = MarmotApp::with_relay(root.path(), "wss://polls.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    for member in [&bob, &carol, &dave] {
+    for member in [&bob, &carol, &dave, &erin] {
         remember_test_member_inbox(&app, &member.account_id_hex, "wss://polls.example");
         app.client(&member.label)
             .await
@@ -259,10 +260,14 @@ async fn poll_creation_rejects_direct_chats_but_existing_polls_remain_votable() 
             .await
             .unwrap();
     }
-    let (direct, group) = {
+    let (direct, named_pair, group) = {
         let mut alice = app.client("alice").await.unwrap();
         let direct = alice
             .create_group("", &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        let named_pair = alice
+            .create_group("Design", &[erin.account_id_hex.as_str()])
             .await
             .unwrap();
         let group = alice
@@ -272,7 +277,7 @@ async fn poll_creation_rejects_direct_chats_but_existing_polls_remain_votable() 
             )
             .await
             .unwrap();
-        (direct, group)
+        (direct, named_pair, group)
     };
 
     let runtime = app.runtime();
@@ -288,9 +293,21 @@ async fn poll_creation_rejects_direct_chats_but_existing_polls_remain_votable() 
         .await
         .unwrap_err();
     assert!(
-        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three distinct account identities")),
+        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("group conversation")),
         "unexpected error: {direct_error:?}"
     );
+    let named_pair_poll = runtime
+        .create_poll(
+            "alice",
+            &named_pair,
+            "Tea?".into(),
+            vec!["Yes".into(), "No".into()],
+            cgka_traits::PollType::SingleChoice,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(named_pair_poll.message_ids.len(), 1);
     let direct_poll_id = "88".repeat(32);
     let now = crate::unix_now_seconds();
     app.record_account_app_event(

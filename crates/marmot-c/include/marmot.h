@@ -8366,8 +8366,8 @@ MarmotStatus marmot_send_custom_event(const struct MarmotClient *client,
                                       struct MarmotSendSummary **out);
 
 /**
- * Create an encrypted NIP-88 poll for at least three distinct account identities.
- * Option ids use `"0"` through `"9"`. Free `out` with `marmot_send_summary_free`.
+ * Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+ * through `"9"`. Free `out` with `marmot_send_summary_free`.
  *
  * # Safety
  * Strings must be valid; `options` must hold `options_len` valid strings (or
@@ -8386,7 +8386,7 @@ MarmotStatus marmot_create_poll(const struct MarmotClient *client,
                                 struct MarmotSendSummary **out);
 
 /**
- * Replace this account's selection; accepted open polls remain votable after group shrink.
+ * Replace this account's selection; accepted open polls remain votable after reclassification.
  *
  * # Safety
  * Strings must be valid; `option_ids` must hold `option_ids_len` valid strings
