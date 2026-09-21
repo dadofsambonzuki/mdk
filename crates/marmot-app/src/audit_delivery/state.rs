@@ -492,8 +492,9 @@ impl AuditDeliveryStore {
             return Err(AuditDeliveryError::InvalidSegmentOrder);
         }
         let file_name = segment_file_name(&segment_id);
-        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        let file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
         let (length, digest) = file_length_and_digest(&file)?;
+        sync_payload(&file, &mut self.faults)?;
         let relative_name = format!("{SEGMENTS_DIR}/{}.jsonl", segment_id.as_str());
         let mut manifest = self.manifest.clone();
         manifest.segments.push(SegmentEntry {
@@ -541,10 +542,11 @@ impl AuditDeliveryStore {
             return Err(AuditDeliveryError::InvalidSegmentOrder);
         }
         let file_name = segment_file_name(segment_id);
-        let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
+        let file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
         validate_live_segment(&file, entry)?;
         let (length, digest) = file_length_and_digest(&file)?;
         validate_acknowledged_boundary(&file, self.cursor(segment_id)?)?;
+        sync_payload(&file, &mut self.faults)?;
 
         let mut manifest = self.manifest.clone();
         let entry = manifest
@@ -612,12 +614,7 @@ impl AuditDeliveryStore {
             if current_len < end_offset {
                 return Err(AuditDeliveryError::CorruptState);
             }
-            self.faults.check(FaultPoint::PayloadSync)?;
-            file.sync_all()
-                .map_err(|source| AuditDeliveryError::Filesystem {
-                    operation: "sync payload prefix",
-                    source,
-                })?;
+            sync_payload(&file, &mut self.faults)?;
 
             let mut state = self.state.clone();
             state.revision = revision;
@@ -910,6 +907,15 @@ fn file_length_and_digest(file: &File) -> Result<(u64, [u8; 32]), AuditDeliveryE
         })?
         .len();
     Ok((length, digest_range(file, 0, length)?))
+}
+
+fn sync_payload(file: &File, faults: &mut Faults) -> Result<(), AuditDeliveryError> {
+    faults.check(FaultPoint::PayloadSync)?;
+    file.sync_all()
+        .map_err(|source| AuditDeliveryError::Filesystem {
+            operation: "sync payload prefix",
+            source,
+        })
 }
 
 fn validate_registered_prefix(file: &File, entry: &SegmentEntry) -> Result<(), AuditDeliveryError> {

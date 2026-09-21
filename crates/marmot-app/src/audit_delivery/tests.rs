@@ -213,6 +213,28 @@ fn payload_sync_failure_never_persists_preparation() {
 }
 
 #[test]
+fn payload_sync_failure_never_publishes_registration_or_sealing() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = JournalId::generate();
+    let segment = SegmentId::generate();
+    let mut store = AuditDeliveryStore::create(root.path(), journal, profile()).unwrap();
+    fs_private::write_private(&store.segment_path(&segment).unwrap(), b"one\n").unwrap();
+    store.fail_next(FaultPoint::PayloadSync);
+    assert!(
+        store
+            .register_segment(segment.clone(), SegmentStatus::Active)
+            .is_err()
+    );
+    store
+        .register_segment(segment.clone(), SegmentStatus::Active)
+        .unwrap();
+
+    store.fail_next(FaultPoint::PayloadSync);
+    assert!(store.seal_active_segment(&segment).is_err());
+    store.seal_active_segment(&segment).unwrap();
+}
+
+#[test]
 fn j07_stale_destination_generation_attempt_and_close_tokens_are_refused() {
     let (root, journal, _segment, mut store) = store_with_segment(b"one\n");
     let prepared = store.prepare_next().unwrap().unwrap();
