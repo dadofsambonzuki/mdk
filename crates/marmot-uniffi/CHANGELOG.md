@@ -5,8 +5,9 @@
 ### Added
 
 - Add bounded encrypted NIP-88 poll creation and replacement-vote methods. Timeline rows expose deterministic poll
-  counts, participants, local selection and deadline state. Poll commands require a conversation with at least three
-  current members. Regenerate Swift/Kotlin bindings with the matching library.
+  counts, participants, local selection and deadline state. Poll creation requires at least three distinct current
+  account identities; an accepted open poll remains votable if the group later shrinks. Regenerate Swift/Kotlin
+  bindings with the matching library.
 
 ## 0.10.4 - 2026-09-20
 

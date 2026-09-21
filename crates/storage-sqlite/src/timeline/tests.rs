@@ -174,6 +174,9 @@ fn poll_response_options(
 #[test]
 fn polls_fold_latest_response_and_delete_falls_back_deterministically() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .ensure_account_projection_with_identity("local", "alice")
+        .unwrap();
     let poll_id = "22".repeat(32);
     let older = "33".repeat(32);
     let newer = "44".repeat(32);

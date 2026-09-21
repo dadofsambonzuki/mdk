@@ -443,7 +443,6 @@ struct RawAppEvent {
 struct PollResponseCandidate {
     group_id_hex: String,
     message_id_hex: String,
-    direction: String,
     sender: String,
     tags: Vec<Vec<String>>,
     recorded_at: u64,
@@ -3988,16 +3987,15 @@ fn poll_response_candidate_from_row(
     Ok(PollResponseCandidate {
         group_id_hex: row.get(0)?,
         message_id_hex: row.get(1)?,
-        direction: row.get(2)?,
-        sender: row.get(3)?,
-        tags: tags_from_json(row.get::<_, String>(4)?).map_err(|error| {
+        sender: row.get(2)?,
+        tags: tags_from_json(row.get::<_, String>(3)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                4,
+                3,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?,
-        recorded_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+        recorded_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
     })
 }
 
@@ -4122,7 +4120,6 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
             "SELECT local_account_id_hex
              FROM account_state
              WHERE local_account_id_hex IS NOT NULL
-             ORDER BY updated_at DESC, label DESC
              LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
@@ -4144,7 +4141,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT group_id_hex, message_id_hex, direction, sender, tags_json, recorded_at
+                "SELECT group_id_hex, message_id_hex, sender, tags_json, recorded_at
                  FROM (
                     SELECT app_events.*,
                            ROW_NUMBER() OVER (
@@ -4199,8 +4196,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         }
     }
 
-    let mut effective =
-        HashMap::<(String, String, String), (u64, String, String, Vec<String>)>::new();
+    let mut effective = HashMap::<(String, String, String), (u64, String, Vec<String>)>::new();
     for response in responses {
         let event = MarmotAppEvent {
             id: response.message_id_hex.clone(),
@@ -4235,23 +4231,17 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
         if replace {
             effective.insert(
                 key,
-                (
-                    response.recorded_at,
-                    response.message_id_hex,
-                    response.direction,
-                    selections,
-                ),
+                (response.recorded_at, response.message_id_hex, selections),
             );
         }
     }
 
-    let mut effective_by_poll =
-        HashMap::<(String, String), Vec<(String, String, Vec<String>)>>::new();
-    for ((group, poll_id, sender), (_, _, direction, selections)) in effective {
+    let mut effective_by_poll = HashMap::<(String, String), Vec<(String, Vec<String>)>>::new();
+    for ((group, poll_id, sender), (_, _, selections)) in effective {
         effective_by_poll
             .entry((group, poll_id))
             .or_default()
-            .push((sender, direction, selections));
+            .push((sender, selections));
     }
 
     let now = unix_now_seconds();
@@ -4263,7 +4253,7 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
             .collect::<BTreeMap<_, _>>();
         let mut local_selection = Vec::new();
         let mut participants = 0_u64;
-        for (sender, direction, selections) in effective_by_poll
+        for (sender, selections) in effective_by_poll
             .remove(&(group, poll_id))
             .unwrap_or_default()
         {
@@ -4273,10 +4263,12 @@ fn hydrate_polls(conn: &Connection, messages: &mut [TimelineMessageRecord]) -> S
                     *count = count.saturating_add(1);
                 }
             }
-            let is_local = local_account_id_hex.as_deref().map_or_else(
-                || direction == "sent",
-                |local| sender.eq_ignore_ascii_case(local),
-            );
+            // The persisted account identity is authoritative across sibling
+            // devices. `direction` is device-local delivery state and must not
+            // become a second identity rule when the projection root is absent.
+            let is_local = local_account_id_hex
+                .as_deref()
+                .is_some_and(|local| sender.eq_ignore_ascii_case(local));
             if is_local {
                 local_selection = selections;
             }

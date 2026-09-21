@@ -241,7 +241,7 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
 }
 
 #[tokio::test]
-async fn poll_commands_reject_direct_chats_and_round_trip_in_group_chats() {
+async fn poll_creation_rejects_direct_chats_but_existing_polls_remain_votable() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
     home.create_account("alice").unwrap();
@@ -288,7 +288,7 @@ async fn poll_commands_reject_direct_chats_and_round_trip_in_group_chats() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three members")),
+        matches!(&direct_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three distinct account identities")),
         "unexpected error: {direct_error:?}"
     );
     let direct_poll_id = "88".repeat(32);
@@ -320,14 +320,11 @@ async fn poll_commands_reject_direct_chats_and_round_trip_in_group_chats() {
         },
     )
     .unwrap();
-    let direct_vote_error = runtime
+    let direct_vote = runtime
         .cast_poll_vote("alice", &direct, direct_poll_id, vec!["0".into()])
         .await
-        .unwrap_err();
-    assert!(
-        matches!(&direct_vote_error, AppError::InvalidAppMessagePayload(message) if message.contains("at least three members")),
-        "unexpected error: {direct_vote_error:?}"
-    );
+        .unwrap();
+    assert_eq!(direct_vote.message_ids.len(), 1);
 
     let poll = runtime
         .create_poll(

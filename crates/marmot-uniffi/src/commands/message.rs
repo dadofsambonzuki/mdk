@@ -206,8 +206,8 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Create an encrypted NIP-88 poll. MDK assigns stable option ids in
-    /// display order (`"0"` through `"9"`).
+    /// Create an encrypted NIP-88 poll for at least three distinct account
+    /// identities. Option ids use `"0"` through `"9"`.
     pub async fn create_poll(
         &self,
         account_ref: String,
@@ -232,7 +232,7 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Cast or replace this account's complete selection for a poll.
+    /// Replace this account's selection; accepted open polls remain votable after group shrink.
     pub async fn cast_poll_vote(
         &self,
         account_ref: String,

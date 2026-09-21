@@ -4312,6 +4312,21 @@ fn account_worker_command_future<'a>(
             );
             let mut first_projection = true;
             client.send_telemetry = Some(shared.app_performance_telemetry());
+            let poll_creation_allowed = if matches!(&intent, AppMessageIntent::Poll { .. }) {
+                client.ensure_poll_creation_allowed(&group_id)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = poll_creation_allowed {
+                client.send_telemetry = None;
+                shared.app_performance_telemetry().record(
+                    AppPerformanceOperation::OutboundMessageSend,
+                    send_started_at.elapsed(),
+                    false,
+                );
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, Err(error));
+                return true;
+            }
             let result = match intent {
                 AppMessageIntent::Reaction {
                     target_message_id,

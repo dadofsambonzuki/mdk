@@ -10,8 +10,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Added
 
 - Add `marmot_create_poll`, `marmot_cast_poll_vote`, and structured poll projection records. This adds a nullable field
-  to `MarmotTimelineMessageRecord`; poll commands require a conversation with at least three current members.
-  Regenerate and recompile with the matching header and library.
+  to `MarmotTimelineMessageRecord`; poll creation requires at least three distinct current account identities, while an
+  accepted open poll remains votable if the group later shrinks. Regenerate and recompile with the matching header and
+  library.
 
 ## [0.10.4] - 2026-09-20
 

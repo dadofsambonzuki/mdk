@@ -2406,8 +2406,9 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Cast or replace this account's current selection for a poll in a
-    /// conversation with at least three members.
+    /// Cast or replace this account's current selection for an accepted open
+    /// poll. A poll remains votable if its group later shrinks below three
+    /// members.
     pub async fn cast_poll_vote(
         &self,
         account_ref: &str,

@@ -3690,6 +3690,17 @@ impl AppClient {
         .map(|(_, summary)| summary)
     }
 
+    pub(crate) fn ensure_poll_creation_allowed(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let members = self.runtime.members(group_id)?;
+        if !poll_creation_has_enough_distinct_accounts(&members) {
+            return Err(AppError::InvalidAppMessagePayload(
+                "polls require a group conversation with at least three distinct account identities"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn send_app_event_with_local_projection_unobserved<F>(
         &mut self,
         group_id: &GroupId,
@@ -3702,15 +3713,6 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group_application_messages_allowed(group_id)?;
-        if matches!(
-            &intent,
-            AppMessageIntent::Poll { .. } | AppMessageIntent::PollResponse { .. }
-        ) && self.runtime.members(group_id)?.len() < 3
-        {
-            return Err(AppError::InvalidAppMessagePayload(
-                "polls require a group conversation with at least three members".into(),
-            ));
-        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.
@@ -6342,6 +6344,15 @@ fn local_account_removed_from_roster(
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
 }
 
+fn poll_creation_has_enough_distinct_accounts(members: &[cgka_traits::group::Member]) -> bool {
+    members
+        .iter()
+        .map(|member| member.id.as_slice())
+        .collect::<HashSet<_>>()
+        .len()
+        >= 3
+}
+
 #[cfg(test)]
 mod post_canonical_create_tests {
     use super::{
@@ -6498,7 +6509,7 @@ mod post_canonical_create_tests {
 
 #[cfg(test)]
 mod self_membership_backfill_tests {
-    use super::local_account_removed_from_roster;
+    use super::{local_account_removed_from_roster, poll_creation_has_enough_distinct_accounts};
     use cgka_traits::MemberId;
     use cgka_traits::group::Member;
 
@@ -6528,5 +6539,16 @@ mod self_membership_backfill_tests {
     #[test]
     fn empty_roster_is_treated_as_removed() {
         assert!(local_account_removed_from_roster(&[], "aa"));
+    }
+
+    #[test]
+    fn poll_creation_counts_distinct_accounts_not_mls_leaves() {
+        let two_accounts_three_leaves = vec![member("aa"), member("bb"), member("bb")];
+        assert!(!poll_creation_has_enough_distinct_accounts(
+            &two_accounts_three_leaves
+        ));
+
+        let three_accounts = vec![member("aa"), member("bb"), member("cc")];
+        assert!(poll_creation_has_enough_distinct_accounts(&three_accounts));
     }
 }
