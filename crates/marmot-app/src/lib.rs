@@ -82,6 +82,8 @@ mod app_telemetry;
 mod collector_host_safety;
 pub mod product_analytics;
 pub use product_analytics::*;
+#[cfg(feature = "audit-delivery")]
+pub mod audit_delivery;
 mod audit_log;
 mod chat_presentation;
 mod client;
