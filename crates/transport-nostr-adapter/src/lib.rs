@@ -612,6 +612,16 @@ pub trait NostrRelayClient: Send + Sync {
     /// inventing endpoint successes. Its coverage remains `Unknown`, so a
     /// client that participates in endpoint-complete replay or repair must
     /// override this method and report detailed outcomes.
+    ///
+    /// # Compatibility
+    ///
+    /// Existing implementations remain source-compatible, and ordinary
+    /// subscription delivery still uses [`NostrRelayClient::subscribe`]. In a
+    /// `marmot-app` relay plane, however, `Unknown` cannot prove endpoint-level
+    /// EOSE coverage: durable subscription-replay obligations remain pending,
+    /// explicit full-history repair reports incomplete coverage, and epoch
+    /// backfill remains armed. Implementations used there must override this
+    /// method to restore those completion capabilities.
     async fn subscribe_detailed(
         &self,
         request: NostrSubscriptionRegistrationRequest,

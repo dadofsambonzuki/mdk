@@ -2060,18 +2060,7 @@ fn finalize_transport_snapshot(
         .iter()
         .filter(|route| route.state == crate::AccountTransportRouteState::Registered)
         .count();
-    let completely_available = routes.iter().all(|route| {
-        route.state == crate::AccountTransportRouteState::Registered
-            && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
-            && route.endpoints.iter().all(|endpoint| {
-                matches!(
-                    endpoint.admission,
-                    crate::EndpointAdmissionOutcome::Allowed
-                        | crate::EndpointAdmissionOutcome::Duplicate
-                )
-            })
-            && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
-    });
+    let completely_available = requested_subscription_coverage_complete(&snapshot);
     snapshot.state = if registered == 0 {
         crate::AccountTransportState::Unavailable
     } else if completely_available {
@@ -2091,6 +2080,34 @@ fn finalize_transport_snapshot(
             .flatten();
     }
     snapshot
+}
+
+/// Whether the current snapshot proves complete registration for the exact
+/// requested endpoint scope. This is deliberately a separate predicate from
+/// the host-facing account state: future health-reporting changes must not
+/// silently loosen or tighten durable replay-obligation retirement.
+fn requested_subscription_coverage_complete(
+    snapshot: &crate::AccountTransportStatusSnapshot,
+) -> bool {
+    let mut routes = snapshot
+        .inbox
+        .iter()
+        .chain(snapshot.current_group_routes.iter())
+        .chain(snapshot.historical_group_routes.iter())
+        .peekable();
+    routes.peek().is_some()
+        && routes.all(|route| {
+            route.state == crate::AccountTransportRouteState::Registered
+                && route.registration_detail == crate::RegistrationDetailCompleteness::Exact
+                && route.endpoints.iter().all(|endpoint| {
+                    matches!(
+                        endpoint.admission,
+                        crate::EndpointAdmissionOutcome::Allowed
+                            | crate::EndpointAdmissionOutcome::Duplicate
+                    )
+                })
+                && route.registered_endpoint_count == Some(route.admitted_endpoint_count)
+        })
 }
 
 fn canonicalize_transport_route_statuses(routes: &mut [crate::AccountTransportRouteStatus]) {
@@ -2209,7 +2226,7 @@ impl MarmotRelayPlaneAccountAdapter {
             .inner
             .transport_statuses
             .snapshot(&self.account_id);
-        snapshot.state == crate::AccountTransportState::Available
+        requested_subscription_coverage_complete(&snapshot)
     }
 
     fn admit_activation(

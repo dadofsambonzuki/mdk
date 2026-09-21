@@ -61,6 +61,15 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
+### Detailed registration compatibility
+
+The default `NostrRelayClient::subscribe_detailed` implementation preserves source compatibility for existing relay
+clients by delegating to `subscribe`, but it reports endpoint coverage as `Unknown` rather than inventing successful
+registrations. Ordinary subscription delivery remains available. When such a client is used through `marmot-app`,
+durable replay obligations cannot be retired from unknown endpoint evidence, explicit full-history repair reports
+incomplete coverage, and epoch backfill remains armed. Relay clients used for completion-grade replay and repair must
+override `subscribe_detailed` and return exact endpoint outcomes; the optional SDK client does so.
+
 The app-runtime layer now projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
 KeyPackage publish targets are derived from the user's kind `10002` NIP-65 relay list (there is no dedicated KeyPackage

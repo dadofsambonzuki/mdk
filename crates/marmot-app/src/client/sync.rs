@@ -375,6 +375,10 @@ impl DrainVerdict {
     fn made_no_progress(self) -> bool {
         self == Self::NoProgressQuantumYield
     }
+
+    fn eose_gate_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::CoverageIncomplete)
+    }
 }
 
 /// Turn the end-of-stored-events gate into the public outcome of an explicit
@@ -2340,15 +2344,19 @@ impl AppClient {
     /// How an epoch-gap backfill drain that stops now should be read, from the
     /// account's current end-of-stored-events progress.
     async fn backfill_drain_verdict(&self) -> DrainVerdict {
-        if !self.adapter.subscription_replay_coverage_complete() {
+        let verdict = backfill_drain_verdict(self.adapter.account_subscription_eose().await);
+        if verdict == DrainVerdict::Complete
+            && !self.adapter.subscription_replay_coverage_complete()
+        {
             DrainVerdict::CoverageIncomplete
         } else {
-            backfill_drain_verdict(self.adapter.account_subscription_eose().await)
+            verdict
         }
     }
 
-    /// Whether the end-of-stored-events gate is already satisfied, polled from
-    /// the drain's *delivery* path at most once per [`SDK_DRAIN_WAIT`].
+    /// The terminal end-of-stored-events verdict, if the gate is already
+    /// satisfied, polled from the drain's *delivery* path at most once per
+    /// [`SDK_DRAIN_WAIT`].
     ///
     /// The receive timeout is where a backfill drain normally consults its
     /// gate, and that timeout never fires while a relay delivers faster than
@@ -2365,18 +2373,19 @@ impl AppClient {
     /// it has nothing to decide on this path. The independent execution quantum
     /// is checked at the next safe loop boundary and yields duplicate-only
     /// traffic without turning the silence timer itself into a progress gate.
-    async fn backfill_gate_reports_complete(
+    async fn backfill_gate_terminal_verdict(
         &self,
         completion: DrainCompletion,
         polled_at: &mut Instant,
-    ) -> bool {
+    ) -> Option<DrainVerdict> {
         if !matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
             || polled_at.elapsed() < SDK_DRAIN_WAIT
         {
-            return false;
+            return None;
         }
         *polled_at = Instant::now();
-        self.backfill_drain_verdict().await == DrainVerdict::Complete
+        let verdict = self.backfill_drain_verdict().await;
+        verdict.eose_gate_terminal().then_some(verdict)
     }
 
     async fn drain_sdk_relay(
@@ -2410,10 +2419,11 @@ impl AppClient {
                 .execution_quantum()
                 .is_some_and(|quantum| drain_started.elapsed() >= quantum)
             {
-                if matches!(completion, DrainCompletion::EndOfStoredEvents { .. })
-                    && self.backfill_drain_verdict().await == DrainVerdict::Complete
-                {
-                    break DrainVerdict::Complete;
+                if matches!(completion, DrainCompletion::EndOfStoredEvents { .. }) {
+                    let verdict = self.backfill_drain_verdict().await;
+                    if verdict.eose_gate_terminal() {
+                        break verdict;
+                    }
                 }
                 break DrainVerdict::quantum_yield(counts);
             }
@@ -2491,7 +2501,7 @@ impl AppClient {
                         execution_quantum,
                     } => {
                         let verdict = self.backfill_drain_verdict().await;
-                        if verdict == DrainVerdict::Complete {
+                        if verdict.eose_gate_terminal() {
                             break verdict;
                         }
                         if drain_started.elapsed() >= execution_quantum {
@@ -2536,11 +2546,11 @@ impl AppClient {
                 counts.skipped = counts.skipped.saturating_add(1);
                 // Liveness, but not progress. It must not outlast the moment
                 // the relays confirm they served this account's history.
-                if self
-                    .backfill_gate_reports_complete(completion, &mut gate_polled_at)
+                if let Some(verdict) = self
+                    .backfill_gate_terminal_verdict(completion, &mut gate_polled_at)
                     .await
                 {
-                    break DrainVerdict::Complete;
+                    break verdict;
                 }
                 continue;
             }

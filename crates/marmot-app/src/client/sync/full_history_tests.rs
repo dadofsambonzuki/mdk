@@ -2,6 +2,8 @@
 //! and attempt identity. Short quanta are available only in the test-policy build.
 use super::*;
 use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
+#[cfg(feature = "test-policy-overrides")]
+use crate::tests::{every_subscription, scripted_eose_pump};
 use crate::{MarmotApp, MarmotAppConfig};
 use marmot_account::AccountHome;
 use std::sync::Arc;
@@ -341,4 +343,100 @@ async fn one_fast_endpoint_cannot_complete_full_history_repair() {
     assert!(coverage.any());
     assert!(!coverage.complete());
     assert_eq!(relay.subscription_count(), before + 1);
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn retired_requested_endpoint_keeps_repair_and_unfloored_obligation_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![
+            "wss://safe.example".to_owned(),
+            "wss://relay.nostr.band".to_owned(),
+        ],
+        MarmotAppConfig::default().with_dev_epoch_backfill_execution_quantum_ms(10),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let before = relay.subscription_count();
+    let control = FullHistoryRepairControl {
+        started: Instant::now(),
+        timeout: Duration::from_secs(2),
+        cancelled: &|| false,
+    };
+
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let result = client.repair_full_history_with_control(&control).await;
+
+    let failure = result.expect_err("excluded requested coverage must keep repair incomplete");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("subscription_coverage_incomplete"),
+        "unexpected repair failure: {}",
+        failure.source
+    );
+    let subscriptions = relay.accepted_subscriptions();
+    assert_eq!(subscriptions.len(), before + 1);
+    assert_eq!(
+        subscriptions.last().unwrap().endpoints(),
+        &[TransportEndpoint::from("wss://safe.example")],
+        "the retired endpoint must never reach the relay client"
+    );
+
+    let status = app
+        .relay_plane
+        .account_transport_status(client.adapter.account_id());
+    assert_eq!(status.state, crate::AccountTransportState::Degraded);
+    assert_eq!(
+        status
+            .inbox
+            .as_ref()
+            .unwrap()
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.admission)
+            .collect::<Vec<_>>(),
+        vec![
+            crate::EndpointAdmissionOutcome::Allowed,
+            crate::EndpointAdmissionOutcome::Retired,
+        ]
+    );
+
+    let obligations = app
+        .account_storage("alice")
+        .unwrap()
+        .subscription_replay_obligations()
+        .unwrap();
+    let inbox = obligations
+        .iter()
+        .find(|obligation| matches!(obligation.route, SubscriptionReplayRoute::Inbox { .. }))
+        .expect("inbox replay obligation");
+    assert!(inbox.replay_floor.is_none());
+    let SubscriptionReplayRoute::Inbox {
+        normalized_endpoints,
+    } = &inbox.route
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        normalized_endpoints,
+        &vec![
+            TransportEndpoint::from("wss://safe.example"),
+            TransportEndpoint::from("wss://relay.nostr.band"),
+        ]
+    );
+    assert!(
+        client
+            .prepare_subscription_replay_obligations(Some(cgka_traits::transport::Timestamp(7)))
+            .unwrap()
+            .is_none(),
+        "a later cursor floor must not narrow an unfinished full-history obligation"
+    );
 }
