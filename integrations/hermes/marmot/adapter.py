@@ -95,6 +95,24 @@ def _home_channel_platform_name(home_channel: Any) -> Optional[str]:
     return str(getattr(raw, "value", raw)).strip().lower() or None
 
 
+def _home_channel_chat_id(home_channel: Any) -> Optional[str]:
+    """Chat id of a core HomeChannel, from either the mapping or the object form.
+
+    The platform name and the chat id are read from the same value, so a
+    mapping-form home channel must not lose one of them: reading ``chat_id``
+    with ``getattr`` alone drops it, and the route stays unresolved even though
+    the home channel is valid.
+    """
+
+    if isinstance(home_channel, dict):
+        raw = home_channel.get("chat_id")
+    else:
+        raw = getattr(home_channel, "chat_id", None)
+    if raw in (None, ""):
+        return None
+    return str(raw)
+
+
 DEFAULT_SOCKET_HOME = "~/.marmot"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
@@ -1769,7 +1787,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         chat_id = None
         if home_channel is not None:
             platform = _home_channel_platform_name(home_channel)
-            chat_id = getattr(home_channel, "chat_id", None)
+            chat_id = _home_channel_chat_id(home_channel)
         route, error = marmot_diagnostics.resolve_home_route(
             extra,
             home_channel=chat_id if chat_id not in (None, "") else extra.get("home_channel"),
@@ -4316,7 +4334,7 @@ async def probe_readiness(
     home_channel = getattr(config, "home_channel", None)
     if not group_id and home_channel is not None:
         home_platform = _home_channel_platform_name(home_channel) or ""
-        home_chat_id = str(getattr(home_channel, "chat_id", "") or "").strip()
+        home_chat_id = (_home_channel_chat_id(home_channel) or "").strip()
         if home_platform in {"", "marmot"} and home_chat_id:
             if home_chat_id.lower().startswith("marmot:"):
                 home_chat_id = home_chat_id.split(":", 1)[1].strip()
