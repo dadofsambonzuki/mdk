@@ -993,7 +993,7 @@ fn validate_complete_sealed_payload(file: &File, length: u64) -> Result<(), Audi
             operation: "read sealed payload tail",
             source,
         })?;
-    if final_byte != [b'\n'] {
+    if final_byte != *b"\n" {
         return Err(AuditDeliveryError::InvalidJsonl);
     }
     Ok(())
