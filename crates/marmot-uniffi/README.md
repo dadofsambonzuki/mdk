@@ -427,6 +427,9 @@ controlled baseline comparison.
 These are configured profile values, not proof that Cargo applies LTO to every
 output: the mixed `rlib`/`cdylib`/`staticlib` binding target can suppress LTO.
 The measured reduction belongs to the combined profile, not to thin LTO alone.
+Apple measurement rows record pre-sanitization Cargo archive bytes and hashes,
+not final packaged-archive or linked application sizes. Native-only archive
+validation and consumer linking are separate packaging checks.
 Changing crate types to enable effective LTO also requires revisiting the
 incompatible `embed-bitcode=no` flag and revalidating native Apple artifacts.
 

@@ -159,6 +159,11 @@ def artifact_row(target, kind, strip, baseline, candidate, reason=None):
     row = {
         "target": target,
         "kind": kind,
+        "measurement_stage": (
+            "pre-sanitization Cargo archive"
+            if kind == "apple_static_archive"
+            else "Cargo build output"
+        ),
         "baseline_bytes": None,
         "candidate_bytes": None,
         "baseline_sha256": None,
@@ -380,14 +385,17 @@ def render_markdown(report: dict) -> str:
         f"Source SHA: `{report['source_sha']}`",
         f"Builder SHA: `{report['builder_sha']}`",
         "",
-        "| Target | Kind | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |",
-        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+        "Apple archive bytes and hashes are measured before sanitization; they are not final packaged-archive or linked application sizes.",
+        "",
+        "| Target | Kind | Measurement stage | Baseline bytes | Candidate bytes | Delta bytes | Delta % | Status |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in report["artifacts"]:
         lines.append(
-            "| {target} | {kind} | {baseline_bytes} | {candidate_bytes} | {delta_bytes} | {delta} | {availability} |".format(
+            "| {target} | {kind} | {stage} | {baseline_bytes} | {candidate_bytes} | {delta_bytes} | {delta} | {availability} |".format(
                 target=row["target"],
                 kind=row["kind"],
+                stage=row.get("measurement_stage", "not recorded"),
                 baseline_bytes=row["baseline_bytes"] if row["baseline_bytes"] is not None else "unavailable",
                 candidate_bytes=row["candidate_bytes"] if row["candidate_bytes"] is not None else "unavailable",
                 delta_bytes=row["delta_bytes"] if row["delta_bytes"] is not None else "unavailable",
@@ -510,6 +518,7 @@ def main(argv=None) -> int:
             {
                 "target": "host",
                 "kind": "host_generation_library_default_features",
+                "measurement_stage": "Cargo build output",
                 "baseline_bytes": None,
                 "candidate_bytes": default_lib.stat().st_size if default_lib.exists() else None,
                 "baseline_sha256": None,

@@ -130,41 +130,6 @@ def macho64(little: bool, segname: bytes, sectname: bytes | None = None) -> byte
     return header + command
 
 
-def macho64_trailing_llvm(little: bool, payload: bytes) -> bytes:
-    """64-bit Mach-O with empty __TEXT plus a trailing __LLVM bitcode payload."""
-    cmdsize = 72
-    header_size = 32
-    sizeofcmds = cmdsize * 2
-    fileoff = header_size + sizeofcmds
-
-    def segment(name: bytes, off: int, size: int) -> bytes:
-        return (
-            _pack("I", 0x19, little=little)
-            + _pack("I", cmdsize, little=little)
-            + name.ljust(16, b"\0")
-            + _pack("Q", 0, little=little)
-            + _pack("Q", size, little=little)
-            + _pack("Q", off, little=little)
-            + _pack("Q", size, little=little)
-            + _pack("i", 0, little=little)
-            + _pack("i", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-        )
-
-    header = (
-        _pack("I", 0xFEEDFACF, little=little)
-        + _pack("i", 0x0100000C, little=little)
-        + _pack("i", 0, little=little)
-        + _pack("I", 1, little=little)
-        + _pack("I", 2, little=little)
-        + _pack("I", sizeofcmds, little=little)
-        + _pack("I", 0, little=little)
-        + _pack("I", 0, little=little)
-    )
-    return header + segment(b"__TEXT", 0, 0) + segment(b"__LLVM", fileoff, len(payload)) + payload
-
-
 def macho64_mh_object_text_and_llvm(
     little: bool,
     native: bytes,
@@ -221,183 +186,6 @@ def macho64_mh_object_text_and_llvm(
         + section(llvm_sectname, b"__LLVM", len(native), len(bitcode), bitcode_off)
     )
     return header + command + native + bitcode
-
-
-def macho64_mh_object_midfile_llvm_with_version_min(
-    little: bool,
-    leading: bytes,
-    bitcode: bytes,
-    trailing: bytes,
-    extra_cmd: bytes | None = None,
-) -> bytes:
-    """MH_OBJECT with mid-file __LLVM,__bitcode plus LC_VERSION_MIN_IPHONEOS."""
-    header_size = 32
-    nsects = 3
-    segment_cmdsize = 72 + 80 * nsects
-    version_cmdsize = 16
-    extra = extra_cmd or b""
-    sizeofcmds = segment_cmdsize + version_cmdsize + len(extra)
-    ncmds = 2 + (1 if extra else 0)
-    lead_off = header_size + sizeofcmds
-    bitcode_off = lead_off + len(leading)
-    trail_off = bitcode_off + len(bitcode)
-    total = trail_off + len(trailing)
-
-    def section(sectname: bytes, segname: bytes, addr: int, size: int, offset: int) -> bytes:
-        return (
-            sectname.ljust(16, b"\0")
-            + segname.ljust(16, b"\0")
-            + _pack("Q", addr, little=little)
-            + _pack("Q", size, little=little)
-            + _pack("I", offset, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-        )
-
-    header = (
-        _pack("I", 0xFEEDFACF, little=little)
-        + _pack("i", 0x0100000C, little=little)
-        + _pack("i", 0, little=little)
-        + _pack("I", 1, little=little)
-        + _pack("I", ncmds, little=little)
-        + _pack("I", sizeofcmds, little=little)
-        + _pack("I", 0, little=little)
-        + _pack("I", 0, little=little)
-    )
-    segment = (
-        _pack("I", 0x19, little=little)
-        + _pack("I", segment_cmdsize, little=little)
-        + b"__TEXT".ljust(16, b"\0")
-        + _pack("Q", 0, little=little)
-        + _pack("Q", total, little=little)
-        + _pack("Q", 0, little=little)
-        + _pack("Q", total, little=little)
-        + _pack("i", 7, little=little)
-        + _pack("i", 7, little=little)
-        + _pack("I", nsects, little=little)
-        + _pack("I", 0, little=little)
-        + section(b"__text", b"__TEXT", 0, len(leading), lead_off)
-        + section(b"__bitcode", b"__LLVM", len(leading), len(bitcode), bitcode_off)
-        + section(b"__const", b"__TEXT", len(leading) + len(bitcode), len(trailing), trail_off)
-    )
-    version = (
-        _pack("I", 0x25, little=little)
-        + _pack("I", version_cmdsize, little=little)
-        + _pack("I", 0x00120000, little=little)
-        + _pack("I", 0x00120000, little=little)
-    )
-    return header + segment + version + extra + leading + bitcode + trailing
-
-
-def macho64_mh_object_bitcode_at_segment_fileoff(
-    little: bool,
-    native: bytes,
-    bitcode: bytes,
-    *,
-    segment_fileoff: int = 784,
-    extra_cmd: bytes | None = None,
-    native_fileoff: int | None = None,
-    empty_native_sections: tuple[bytes, ...] = (),
-) -> bytes:
-    """MH_OBJECT whose parent __TEXT fileoff equals leftover bitcode.
-
-    Exact-head macOS CI on 9dfab7008e1748a46df9b9240bb678fb4124d46c failed
-    with `segment offset 784 lands inside removed bitcode` because rustc
-    compiler_builtins members set the segment fileoff to the first section,
-    which is leftover `__LLVM,__bitcode`, while native `__text` follows.
-    Later exact-head CI on 31c39233cba23f45c74353c0aa921823636d9928 failed
-    with `section offset 784` because empty native sections reuse that
-    first-payload offset.
-    """
-    header_size = 32
-    nsects = 2 + len(empty_native_sections)
-    segment_cmdsize = 72 + 80 * nsects
-    version_cmdsize = 16
-    extra = extra_cmd or b""
-    sizeofcmds = segment_cmdsize + version_cmdsize + len(extra)
-    ncmds = 2 + (1 if extra else 0)
-    commands_end = header_size + sizeofcmds
-    if segment_fileoff < commands_end:
-        raise ValueError("segment_fileoff overlaps load commands")
-    bitcode_off = segment_fileoff
-    text_off = native_fileoff if native_fileoff is not None else bitcode_off + len(bitcode)
-    reloc_off = text_off + len(native)
-    filesize = (text_off + len(native)) - segment_fileoff
-
-    def section(
-        sectname: bytes,
-        segname: bytes,
-        addr: int,
-        size: int,
-        offset: int,
-        reloff: int = 0,
-        nreloc: int = 0,
-    ) -> bytes:
-        return (
-            sectname.ljust(16, b"\0")
-            + segname.ljust(16, b"\0")
-            + _pack("Q", addr, little=little)
-            + _pack("Q", size, little=little)
-            + _pack("I", offset, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", reloff, little=little)
-            + _pack("I", nreloc, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-            + _pack("I", 0, little=little)
-        )
-
-    header = (
-        _pack("I", 0xFEEDFACF, little=little)
-        + _pack("i", 0x0100000C, little=little)
-        + _pack("i", 0, little=little)
-        + _pack("I", 1, little=little)
-        + _pack("I", ncmds, little=little)
-        + _pack("I", sizeofcmds, little=little)
-        + _pack("I", 0, little=little)
-        + _pack("I", 0, little=little)
-    )
-    segment = (
-        _pack("I", 0x19, little=little)
-        + _pack("I", segment_cmdsize, little=little)
-        + b"__TEXT".ljust(16, b"\0")
-        + _pack("Q", 0, little=little)
-        + _pack("Q", filesize, little=little)
-        + _pack("Q", segment_fileoff, little=little)
-        + _pack("Q", filesize, little=little)
-        + _pack("i", 7, little=little)
-        + _pack("i", 7, little=little)
-        + _pack("I", nsects, little=little)
-        + _pack("I", 0, little=little)
-        + section(b"__bitcode", b"__LLVM", 0, len(bitcode), bitcode_off)
-        + b"".join(
-            section(name, b"__TEXT", 0, 0, bitcode_off) for name in empty_native_sections
-        )
-        + section(
-            b"__text",
-            b"__TEXT",
-            len(bitcode),
-            len(native),
-            text_off,
-            reloff=reloc_off,
-            nreloc=1,
-        )
-    )
-    version = (
-        _pack("I", 0x25, little=little)
-        + _pack("I", version_cmdsize, little=little)
-        + _pack("I", 0x00120000, little=little)
-        + _pack("I", 0x00120000, little=little)
-    )
-    pad = bytes(segment_fileoff - commands_end)
-    reloc = _pack("I", 0, little=little) + _pack("I", 0, little=little)
-    return header + segment + version + extra + pad + bitcode + native + reloc
 
 
 def macho32(little: bool, segname: bytes) -> bytes:
@@ -942,6 +730,37 @@ class ReleaseProfileTests(unittest.TestCase):
         self.assertIn("target/release-profile-measure/logs", text)
         self.assertIn("cpu-${variant}/criterion", text)
         self.assertIn("xcodebuild -version", text)
+
+    def test_measurement_stage_identifies_unsanitized_apple_archives(self):
+        baseline = self.root / "baseline.a"
+        candidate = self.root / "candidate.a"
+        baseline.write_bytes(b"baseline")
+        candidate.write_bytes(b"candidate")
+        for triple in measure.APPLE_SLICES:
+            with self.subTest(target=triple):
+                row = measure.artifact_row(
+                    triple, "apple_static_archive", "none", baseline, candidate
+                )
+                self.assertEqual(row["measurement_stage"], "pre-sanitization Cargo archive")
+                self.assertEqual(row["candidate_sha256"], measure.sha256_file(candidate))
+                markdown = measure.render_markdown({
+                    "schema_version": 1,
+                    "source_sha": "a" * 40,
+                    "builder_sha": "b" * 40,
+                    "artifacts": [row],
+                    "cpu_runs": [],
+                })
+                self.assertIn("| Measurement stage |", markdown)
+                self.assertIn("| pre-sanitization Cargo archive |", markdown)
+        android = measure.artifact_row(
+            "aarch64-linux-android", "android_jni_so", "symbols", baseline, candidate
+        )
+        self.assertEqual(android["measurement_stage"], "Cargo build output")
+        missing = measure.artifact_row(
+            "aarch64-apple-ios", "apple_static_archive", "none", None, None
+        )
+        self.assertEqual(missing["measurement_stage"], "pre-sanitization Cargo archive")
+        self.assertEqual(missing["availability"], "unavailable")
 
     def test_unavailable_measurements_are_not_zero(self):
         row = measure.artifact_row(
