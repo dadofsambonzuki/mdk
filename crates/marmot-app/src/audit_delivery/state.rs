@@ -616,6 +616,11 @@ impl AuditDeliveryStore {
         }
         for entry in &self.manifest.segments {
             let cursor = self.cursor(&entry.segment_id)?;
+            if entry.status == SegmentStatus::Sealed
+                && cursor.acknowledged_end == entry.registered_length
+            {
+                continue;
+            }
             let file_name = segment_file_name(&entry.segment_id);
             let mut file = open_segment_sync(&self.directories.segments, OsStr::new(&file_name))?;
             validate_live_segment(&file, entry)?;
@@ -784,11 +789,6 @@ impl AuditDeliveryStore {
             let file_name = segment_file_name(&entry.segment_id);
             let file = open_segment_read(&self.directories.segments, OsStr::new(&file_name))?;
             validate_registered_prefix(&file, entry)?;
-            validate_payload_framing(
-                &file,
-                entry.registered_length,
-                entry.status == SegmentStatus::Sealed,
-            )?;
             validate_acknowledged_boundary(&file, cursor)?;
         }
         match self.state.health.status {

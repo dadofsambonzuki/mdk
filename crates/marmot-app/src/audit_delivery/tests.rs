@@ -112,6 +112,30 @@ fn sealing_allows_the_next_active_segment_to_be_registered() {
 }
 
 #[test]
+fn prepare_skips_fully_acknowledged_sealed_history_before_live_validation() {
+    let (root, journal, first, mut store) = store_with_segment(b"one\n");
+    store.seal_active_segment(&first).unwrap();
+    let second = SegmentId::generate();
+    fs_private::write_private(&store.segment_path(&second).unwrap(), b"two\n").unwrap();
+    store
+        .register_segment(second, SegmentStatus::Active)
+        .unwrap();
+
+    let first_range = store.prepare_next().unwrap().unwrap();
+    store.acknowledge(first_range.token()).unwrap();
+    fs_private::write_private(&store.segment_path(&first).unwrap(), b"bad\n").unwrap();
+
+    let second_range = store.prepare_next().unwrap().unwrap();
+    assert_eq!(second_range.bodies(), &[b"two".to_vec()]);
+
+    drop(store);
+    assert!(matches!(
+        AuditDeliveryStore::open(root.path(), journal, profile()),
+        Err(AuditDeliveryError::CorruptState)
+    ));
+}
+
+#[test]
 fn j03_j04_reopen_recovers_prepare_and_durable_ack() {
     let (root, journal, _segment, mut store) = store_with_segment(b"one\ntwo\n");
     let prepared = store.prepare_next().unwrap().unwrap();

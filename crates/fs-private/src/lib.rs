@@ -453,48 +453,14 @@ unsafe fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
-#[cfg(all(
-    unix,
-    any(target_os = "android", target_os = "netbsd", target_os = "openbsd")
-))]
+#[cfg(all(unix, target_os = "android"))]
 unsafe fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno() }
 }
 
-#[cfg(all(unix, any(target_os = "solaris", target_os = "illumos")))]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::___errno() }
-}
-
-#[cfg(all(unix, target_os = "aix"))]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::_Errno() }
-}
-
-#[cfg(all(unix, target_os = "haiku"))]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::_errnop() }
-}
-
-#[cfg(all(unix, target_os = "nto"))]
-unsafe fn errno_location() -> *mut libc::c_int {
-    unsafe { libc::__get_errno_ptr() }
-}
-
 #[cfg(all(
     unix,
-    not(any(
-        target_vendor = "apple",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_os = "haiku",
-        target_os = "nto"
-    ))
+    not(any(target_vendor = "apple", target_os = "android", target_os = "freebsd"))
 ))]
 unsafe fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
