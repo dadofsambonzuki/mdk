@@ -202,20 +202,17 @@ fn prepare_attachments(
             if !metadata.file_type().is_file() || metadata.len() != attachment.size_bytes {
                 return Err(HarnessError::AttachmentInvalid);
             }
-            let mut header = [0_u8; 12];
-            let mut header_len = 0;
-            while header_len < header.len() {
-                match file.read(&mut header[header_len..]) {
-                    Ok(0) => break,
-                    Ok(read) => header_len += read,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return Err(HarnessError::AttachmentInvalid),
-                }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| HarnessError::AttachmentInvalid)?;
+            let native_image = has_supported_image_signature(&bytes);
+            if !native_image && !is_supported_staged_file(&bytes) {
+                return Err(HarnessError::AttachmentUnsupported);
             }
             Ok(PreparedAttachment {
                 source: attachment,
                 staged_path,
-                native_image: has_supported_image_signature(&header[..header_len]),
+                native_image,
             })
         })
         .collect()
@@ -227,6 +224,142 @@ fn has_supported_image_signature(header: &[u8]) -> bool {
         || header.starts_with(b"GIF87a")
         || header.starts_with(b"GIF89a")
         || (header.len() >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP")
+}
+
+fn is_supported_staged_file(bytes: &[u8]) -> bool {
+    is_pdf(bytes) || is_audio(bytes) || is_archive(bytes) || is_text(bytes)
+}
+
+fn is_text(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        text.chars()
+            .all(|character| matches!(character, '\n' | '\r' | '\t') || !character.is_control())
+    })
+}
+
+fn is_pdf(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"%PDF-")
+}
+
+fn is_audio(bytes: &[u8]) -> bool {
+    (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE")
+        || is_mp3(bytes)
+        || (bytes.len() >= 8 && bytes.starts_with(b"fLaC"))
+        || is_ogg_audio(bytes)
+}
+
+fn is_mp3(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"ID3") {
+        return bytes.len() >= 10
+            && bytes[3] != 0xff
+            && bytes[4] != 0xff
+            && bytes[6..10].iter().all(|byte| byte & 0x80 == 0);
+    }
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] & 0xe0 != 0xe0 {
+        return false;
+    }
+    let version = (bytes[1] >> 3) & 0x03;
+    let layer = (bytes[1] >> 1) & 0x03;
+    let bitrate = bytes[2] >> 4;
+    let sample_rate = (bytes[2] >> 2) & 0x03;
+    version != 0x01 && layer != 0 && !matches!(bitrate, 0 | 0x0f) && sample_rate != 0x03
+}
+
+fn is_ogg_audio(bytes: &[u8]) -> bool {
+    let mut page_offset = 0_usize;
+    let mut expected_sequence = 0_u32;
+    let mut serial = None;
+    let mut packet_prefix = Vec::with_capacity(8);
+
+    loop {
+        let Some(fixed_header_end) = page_offset.checked_add(27) else {
+            return false;
+        };
+        if bytes.len() < fixed_header_end
+            || &bytes[page_offset..page_offset + 4] != b"OggS"
+            || bytes[page_offset + 4] != 0
+        {
+            return false;
+        }
+        let header_type = bytes[page_offset + 5];
+        if expected_sequence == 0 {
+            if header_type & 0x02 == 0 || header_type & 0x01 != 0 {
+                return false;
+            }
+        } else if header_type & 0x01 == 0 || header_type & 0x02 != 0 {
+            return false;
+        }
+
+        let page_serial = &bytes[page_offset + 14..page_offset + 18];
+        if serial.as_ref().is_some_and(|value| value != page_serial) {
+            return false;
+        }
+        serial.get_or_insert_with(|| page_serial.to_vec());
+        let page_sequence = u32::from_le_bytes(
+            bytes[page_offset + 18..page_offset + 22]
+                .try_into()
+                .expect("Ogg sequence slice has a fixed length"),
+        );
+        if page_sequence != expected_sequence {
+            return false;
+        }
+
+        let segment_count = usize::from(bytes[page_offset + 26]);
+        if segment_count == 0 {
+            return false;
+        }
+        let Some(segment_table_end) = fixed_header_end.checked_add(segment_count) else {
+            return false;
+        };
+        if bytes.len() < segment_table_end {
+            return false;
+        }
+        let segment_table = &bytes[fixed_header_end..segment_table_end];
+        let Some(body_len) = segment_table.iter().try_fold(0_usize, |total, segment| {
+            total.checked_add(usize::from(*segment))
+        }) else {
+            return false;
+        };
+        let Some(page_end) = segment_table_end.checked_add(body_len) else {
+            return false;
+        };
+        if bytes.len() < page_end {
+            return false;
+        }
+
+        let mut payload_offset = segment_table_end;
+        for segment_len in segment_table {
+            let segment_end = payload_offset + usize::from(*segment_len);
+            let remaining_prefix = 8_usize.saturating_sub(packet_prefix.len());
+            packet_prefix.extend_from_slice(
+                &bytes[payload_offset..segment_end.min(payload_offset + remaining_prefix)],
+            );
+            payload_offset = segment_end;
+            if *segment_len < 255 {
+                return packet_prefix.starts_with(b"\x01vorbis")
+                    || packet_prefix.starts_with(b"OpusHead")
+                    || packet_prefix.starts_with(b"\x7fFLAC");
+            }
+        }
+
+        page_offset = page_end;
+        let Some(next_sequence) = expected_sequence.checked_add(1) else {
+            return false;
+        };
+        expected_sequence = next_sequence;
+    }
+}
+
+fn is_archive(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+        || bytes.starts_with(b"\x1f\x8b")
+        || bytes.starts_with(b"BZh")
+        || bytes.starts_with(b"\xfd7zXZ\x00")
+        || bytes.starts_with(b"7z\xbc\xaf'\x1c")
+        || bytes.starts_with(b"Rar!\x1a\x07")
+        || (bytes.len() >= 262 && &bytes[257..262] == b"ustar")
 }
 
 /// Gives Codex an ordered, injection-safe map to every private file in this turn.
@@ -613,6 +746,138 @@ mod tests {
         assert_eq!(prompt.matches("\"delivery\":\"staged_file\"").count(), 3);
     }
 
+    #[test]
+    fn attachment_matrix_stages_documents_audio_and_archives_but_rejects_opaque_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let text = root.path().join("notes.txt");
+        let pdf = root.path().join("report.pdf");
+        let audio = root.path().join("sample.wav");
+        let archive = root.path().join("bundle.zip");
+        let opaque = root.path().join("opaque.bin");
+        let control_text = root.path().join("control.bin");
+        let truncated_mp3 = root.path().join("truncated.mp3");
+        let non_audio_ogg = root.path().join("non-audio.ogg");
+        fs::write(&text, b"plain UTF-8 text\n").unwrap();
+        fs::write(&pdf, b"%PDF-1.7\nfixture").unwrap();
+        fs::write(&audio, b"RIFF\x04\x00\x00\x00WAVEdata").unwrap();
+        fs::write(&archive, b"PK\x03\x04archive").unwrap();
+        fs::write(&opaque, b"\x00\x9f\xff\x80opaque").unwrap();
+        fs::write(&control_text, b"\x01\x02\x03").unwrap();
+        fs::write(&truncated_mp3, b"\xff\xe0").unwrap();
+        fs::write(&non_audio_ogg, b"OggS\x00not-an-audio-page").unwrap();
+
+        let accepted = vec![
+            attachment(&text, "application/octet-stream", "notes.bin"),
+            attachment(&pdf, "text/plain", "report.txt"),
+            attachment(&audio, "application/octet-stream", "sample.bin"),
+            attachment(&archive, "text/plain", "bundle.txt"),
+        ];
+        let prepared = prepare_attachments(&accepted).unwrap();
+        assert!(prepared.iter().all(|attachment| !attachment.native_image));
+
+        for unsupported in [&opaque, &control_text, &truncated_mp3, &non_audio_ogg] {
+            let mut mixed = accepted.clone();
+            mixed.push(attachment(
+                unsupported,
+                "application/octet-stream",
+                "opaque.bin",
+            ));
+            assert!(matches!(
+                prepare_attachments(&mixed),
+                Err(HarnessError::AttachmentUnsupported)
+            ));
+        }
+    }
+
+    #[test]
+    fn audio_signature_matrix_requires_complete_non_reserved_headers() {
+        let ogg_page = |header_type: u8, sequence: u32, segment_len: u8, payload: &[u8]| {
+            let mut page = vec![0_u8; 27];
+            page[..4].copy_from_slice(b"OggS");
+            page[5] = header_type;
+            page[14..18].copy_from_slice(&1_u32.to_le_bytes());
+            page[18..22].copy_from_slice(&sequence.to_le_bytes());
+            page[26] = 1;
+            page.push(segment_len);
+            page.extend_from_slice(payload);
+            page
+        };
+        let opus = ogg_page(0x02, 0, 8, b"OpusHead");
+        let mut first_payload = b"OpusHead".to_vec();
+        first_payload.resize(255, 0);
+        let mut split_opus = ogg_page(0x02, 0, 255, &first_payload);
+        split_opus.extend_from_slice(&ogg_page(0x01, 1, 1, &[0]));
+        let continued_fragment = ogg_page(0x01, 1, 8, b"OpusHead");
+
+        for supported in [
+            b"RIFF\x04\x00\x00\x00WAVEdata".as_slice(),
+            b"ID3\x04\x00\x00\x00\x00\x00\x00".as_slice(),
+            b"\xff\xfb\x90\x64".as_slice(),
+            b"fLaC\x00\x00\x00\x00".as_slice(),
+            opus.as_slice(),
+            split_opus.as_slice(),
+        ] {
+            assert!(is_audio(supported));
+        }
+        for unsupported in [
+            b"\xff\xe0".as_slice(),
+            b"\xff\xeb\x00\x00".as_slice(),
+            b"ID3".as_slice(),
+            b"fLaC".as_slice(),
+            b"OggS\x00not-an-audio-page".as_slice(),
+            continued_fragment.as_slice(),
+        ] {
+            assert!(!is_audio(unsupported));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_binary_rejects_the_whole_batch_before_codex_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let text = root.path().join("notes.txt");
+        let opaque = root.path().join("opaque.bin");
+        let marker = root.path().join("started");
+        let script = root.path().join("must-not-run-codex");
+        fs::write(&text, b"notes").unwrap();
+        fs::write(&opaque, b"\x00\x9f\xff\x80opaque").unwrap();
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\ntouch '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "inspect".to_owned(),
+                artifact_output: None,
+            },
+            vec![
+                attachment(&text, "text/plain", "notes.txt"),
+                attachment(&opaque, "application/octet-stream", "opaque.bin"),
+            ],
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(failure.error, HarnessError::AttachmentUnsupported));
+        assert!(!marker.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn attachment_preflight_rejects_unsafe_missing_and_non_utf8_paths() {
@@ -849,6 +1114,90 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
             Some(RunnerEvent::Text("files received".to_owned()))
         );
         assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backend_reads_every_accepted_private_file_before_batch_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let staging_root = root.path().join("staging");
+        fs::create_dir(&staging_root).unwrap();
+        fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let batch = tempfile::Builder::new()
+            .prefix("batch-")
+            .tempdir_in(&staging_root)
+            .unwrap();
+        fs::set_permissions(batch.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let fixtures = [
+            ("notes.txt", b"private notes\n".as_slice()),
+            ("report.pdf", b"%PDF-1.7\nprivate report".as_slice()),
+            ("sample.wav", b"RIFF\x04\x00\x00\x00WAVEdata".as_slice()),
+            ("bundle.zip", b"PK\x03\x04archive".as_slice()),
+            ("pixel.png", b"\x89PNG\r\n\x1a\nfixture".as_slice()),
+        ];
+        let expected_root = root.path().join("expected");
+        fs::create_dir(&expected_root).unwrap();
+        let mut attachments = Vec::new();
+        let mut comparisons = Vec::new();
+        for (name, bytes) in fixtures {
+            let staged = batch.path().join(name);
+            let expected = expected_root.join(name);
+            fs::write(&staged, bytes).unwrap();
+            fs::write(&expected, bytes).unwrap();
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+            attachments.push(attachment(&staged, "application/octet-stream", name));
+            comparisons.push(format!(
+                "cmp -- '{}' '{}'",
+                staged.display(),
+                expected.display()
+            ));
+        }
+
+        let script = root.path().join("fake-codex-read-every-file");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\n{}\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"thread-private-files\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"read every accepted private file\"}}}}'\n",
+                comparisons.join("\n")
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        for session_id in [None, Some("thread-existing".to_owned())] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let outcome = run_with_bin(
+                script.to_str().unwrap(),
+                ExecutionProfile::Inherit,
+                Invocation {
+                    timeout: Duration::from_secs(5),
+                    idle_timeout: Duration::from_secs(2),
+                    cwd: root.path().to_path_buf(),
+                    session_id,
+                    prompt: "Read every attachment before returning.".to_owned(),
+                    artifact_output: None,
+                },
+                attachments.clone(),
+                tx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.exit_code, Some(0));
+            assert_eq!(
+                rx.recv().await,
+                Some(RunnerEvent::Text(
+                    "read every accepted private file".to_owned()
+                ))
+            );
+            assert!(batch.path().exists());
+        }
+
+        let batch_path = batch.path().to_path_buf();
+        drop(batch);
+        assert!(!batch_path.exists());
     }
 
     #[test]

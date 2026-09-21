@@ -172,9 +172,18 @@ text is returned to Marmot.
 
 ## Inbound attachments
 
-All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. The connector revalidates every staged file immediately before starting Codex and supplies an ordered JSON manifest in the prompt. The manifest marks attachment content and metadata as untrusted data and gives Codex the private path, sanitized file name, declared media type, byte size, and source ordinal.
+All attachments from one Marmot message are downloaded in message order, copied into one owner-only temporary batch, and passed to one Codex turn. The connector revalidates every staged file immediately before starting Codex and supplies an ordered JSON manifest in the prompt. The manifest marks attachment content and metadata as untrusted data and gives Codex the private path, sanitized file name, declared media type, byte size, and source ordinal. Delivery is selected from file bytes, never from sender-controlled MIME strings or extensions:
 
-PNG, JPEG, GIF, and WebP images detected from their file signatures are also passed through Codex's native `--image` input. Every other validated regular file—including text/source documents, PDFs, audio, archives, opaque binary data, and images in other formats—is supplied as a staged file for Codex to inspect with its configured tools; those other image formats are not rendered as native visual input. Sender-controlled MIME strings and extensions do not select the native image path. A missing, size-changed, unreadable, non-regular, count-limit, or aggregate-size failure rejects the complete batch before Codex starts; no attachment is silently dropped. This contract works for new and resumed threads on the pinned Codex CLI used by the connector and does not require a format-specific CLI capability for general files.
+| File class | Byte-level recognition | Codex delivery |
+| --- | --- | --- |
+| Native images | PNG, JPEG, GIF, or WebP signature | Ordered native `--image` argument plus staged-file manifest entry |
+| Text and source | Complete file is valid UTF-8 and contains no control character except tab, carriage return, or line feed | Staged-file manifest entry |
+| PDF | `%PDF-` signature | Staged-file manifest entry |
+| Audio | WAV, MP3, or FLAC header; or an Ogg first packet identifying Vorbis, Opus, or FLAC | Staged-file manifest entry |
+| Archives | ZIP, gzip, bzip2, xz, 7z, RAR, or tar signature | Staged-file manifest entry |
+| Opaque binary or any unrecognized format | No supported signature and not UTF-8 text | Unsupported; reject the complete batch before starting Codex |
+
+The connector pins Codex CLI 0.146.0. Although the app-server protocol has a structured audio input, `codex exec` 0.146.0 exposes native file input only through `--image`; audio therefore uses the staged-file fallback above rather than a nonexistent CLI audio flag. The same delivery contract applies to new and resumed threads. Missing, size-changed, unreadable, non-regular, unsupported-format, count-limit, or aggregate-size failures reject the complete batch before Codex starts; no attachment is silently dropped.
 
 Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts.
 

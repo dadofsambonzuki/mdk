@@ -3001,6 +3001,23 @@ mod tests {
         ) -> std::result::Result<Outcome, RunFailure> {
             use std::os::unix::fs::PermissionsExt as _;
 
+            let mut reader = tokio::process::Command::new("/bin/sh");
+            reader
+                .arg("-c")
+                .arg("for path in \"$@\"; do cat -- \"$path\" >/dev/null || exit; done")
+                .arg("attachment-reader");
+            for attachment in &attachments {
+                reader.arg(&attachment.path);
+            }
+            let status = reader
+                .status()
+                .await
+                .expect("fake backend process must start");
+            assert!(
+                status.success(),
+                "fake backend process must read every file"
+            );
+
             let snapshots = attachments
                 .into_iter()
                 .map(|attachment| {
@@ -3522,7 +3539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_attachment_turn_preserves_order_privacy_and_cleanup() {
+    async fn successful_attachment_process_turn_preserves_order_privacy_and_cleanup() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().unwrap();
