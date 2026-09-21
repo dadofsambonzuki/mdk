@@ -2557,6 +2557,62 @@ impl<S: StorageProvider> Engine<S> {
         true
     }
 
+    /// Compensate the pending-publish lifecycle a failed
+    /// [`Self::hydrate_one_stored_group`] already applied, then drop the
+    /// group's in-memory epoch bookkeeping.
+    ///
+    /// Hydration restores a surviving pending publish — `restore_pending` from
+    /// a durable frozen fanout, or
+    /// [`Self::restore_durable_group_evolution_on_hydrate`] from a
+    /// `Prepared`/`Attempting` evolution — *before* its last two fallible reads
+    /// (the self-remove schedule restore and the disband-request probe). That
+    /// restore hands out one `PendingStateRef` and hangs three things off it:
+    /// the origin-commit id, an `AutoPublish` item, and, for a durable
+    /// evolution, the row's own `pending_ref`. A later failure quarantines the
+    /// group and takes its epoch entry away, so none of the three can ever
+    /// resolve through `confirm_published` / `publish_failed`; left behind, the
+    /// next hydration attempt restores the same evolution again and the
+    /// application drains two publish items and two refs for one signed commit.
+    ///
+    /// So this undoes exactly the `begin_pending` triple, per ref the epoch
+    /// manager still holds for this group: the origin-commit entry, the queued
+    /// publish item, and the durable `pending_ref` (reverted the way the
+    /// restore's own `begin_pending` failure path reverts it). `forget_group`
+    /// then drops both halves of `begin_pending`'s own bookkeeping — the epoch
+    /// entry `live_group_ids` filters on and the pending metas that index it.
+    ///
+    /// That is the complete set. Every other write hydration performs before
+    /// that last read is either deliberately durable and independent of
+    /// liveness (the transport route index kept pre-validation so inbound
+    /// messages still retain for replay — mdk#364, the validated-tree marker,
+    /// the pinned sender-ratchet config, and a cleared stranded staged commit
+    /// with its re-derived record) or re-derived from durable state by the next
+    /// attempt (the leave-request/leaving-group entries, which every attempt
+    /// sets or clears, and the epoch entry itself).
+    fn discard_hydration_side_effects(&mut self, group_id: &GroupId) {
+        let restored_pending = self.epoch_manager.pending_refs_for_group(group_id);
+        self.pending_origin_commits
+            .retain(|pending, _| !restored_pending.contains(pending));
+        self.auto_publish_buf
+            .retain(|work| !restored_pending.contains(&work.pending));
+        // Same durable revert as `restore_durable_group_evolution_on_hydrate`'s
+        // own `begin_pending` failure path.
+        if !restored_pending.is_empty()
+            && let Some(maintenance) = self.storage.maintenance_storage()
+            && let Ok(evolutions) = maintenance.list_group_evolutions_for_group(group_id)
+        {
+            for mut evolution in evolutions.into_iter().filter(|evolution| {
+                evolution
+                    .pending_ref
+                    .is_some_and(|pending| restored_pending.contains(&pending))
+            }) {
+                evolution.pending_ref = None;
+                let _ = maintenance.put_group_evolution(&evolution);
+            }
+        }
+        self.epoch_manager.forget_group(group_id);
+    }
+
     fn quarantine_stored_group_on_hydrate(
         &mut self,
         group_id: &GroupId,
@@ -2575,13 +2631,15 @@ impl<S: StorageProvider> Engine<S> {
             group_digest,
             reason: reason_tag.to_string(),
         });
-        // A quarantined group must not retain an epoch entry: the cheap-pass
-        // seed (and any partial transition applied before the failure) would
-        // otherwise keep it listed in `live_group_ids` while every accessor
-        // rejects it (mdk#1161). The quarantine's account adjustment does not
-        // depend on this order: it reads the durable halt marker when the
-        // in-memory one is gone.
-        self.epoch_manager.clear_group_state(group_id);
+        // A quarantined group must not retain an epoch entry or any of the
+        // pending-publish lifecycle a partial hydration restored: the
+        // cheap-pass seed would otherwise keep it listed in `live_group_ids`
+        // while every accessor rejects it (mdk#1161), and the restored
+        // lifecycle would double on the next attempt. See
+        // `discard_hydration_side_effects`. The quarantine's account adjustment
+        // does not depend on this order: it reads the durable halt marker when
+        // the in-memory one is gone.
+        self.discard_hydration_side_effects(group_id);
         self.enter_hydration_quarantine(group_id, reason);
         self.events_buf
             .push_back(GroupEvent::GroupHydrationQuarantined {
@@ -2780,12 +2838,13 @@ impl<S: StorageProvider> Engine<S> {
                     reason = reason_tag,
                     "retry did not recover the quarantined stored group"
                 );
-                // Hydration may already have written an epoch entry before a
-                // later fallible step failed, and a quarantined group must
-                // hold none (`live_group_ids` filters on entry presence).
-                // `quarantine_stored_group_on_hydrate` would clear it too, but
+                // Hydration may already have written an epoch entry and
+                // restored a pending publish before a later fallible step
+                // failed; a quarantined group must hold neither. See
+                // `discard_hydration_side_effects`.
+                // `quarantine_stored_group_on_hydrate` would do this too, but
                 // also re-emits the quarantine event this arm suppresses.
-                self.epoch_manager.clear_group_state(group_id);
+                self.discard_hydration_side_effects(group_id);
                 self.enter_hydration_quarantine(group_id, reason);
                 Ok(false)
             }

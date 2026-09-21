@@ -15,7 +15,7 @@ use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePassStorage, ConvergencePolicyStorage, DisbandCandidate, DisbandCandidateStorage,
     DisbandRequest, DisbandRequestStorage, DisbandTombstoneStorage, GroupStateCheckpointRef,
-    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage,
+    GroupStorage, KeyPackageBundleStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
     MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
@@ -853,6 +853,12 @@ impl StorageProvider for FlakyGroupRecordStorage {
         self.inner.mls_storage()
     }
 
+    // Forwarded so hydration's durable group-evolution restore runs under this
+    // fault harness; without it that path short-circuits on missing storage.
+    fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        self.inner.maintenance_storage()
+    }
+
     fn backend(&self) -> Backend {
         self.inner.backend()
     }
@@ -1412,6 +1418,91 @@ async fn failed_retry_clears_the_epoch_entry_hydration_already_wrote() {
         reopened.live_group_ids().unwrap().is_empty(),
         "a group that stayed quarantined must hold no epoch entry"
     );
+}
+
+#[tokio::test]
+async fn a_failed_retry_republishes_a_restored_evolution_exactly_once() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    // Stage a self-update and lose the process before resolving it: the
+    // durable evolution stays `Prepared` with its exact signed commit row and
+    // the OpenMLS pending commit survives, so hydration restores it.
+    let staged = match initial
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .expect("stage self-update")
+    {
+        SendResult::GroupEvolution { msg, .. } => msg,
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    drop(initial);
+
+    storage.set_fail_get_group(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_all_stored_groups()
+        .expect("hydration quarantines the unreadable group");
+    reopened.drain_events();
+    assert!(
+        reopened.drain_auto_publish().is_empty(),
+        "a quarantined group must not restore publish work"
+    );
+    storage.set_fail_get_group(false);
+
+    // The first retry restores the evolution and then fails on the last read.
+    storage.set_fail_disband_request(true);
+    assert!(
+        !reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("a late per-group failure re-quarantines, it does not error"),
+    );
+    storage.set_fail_disband_request(false);
+    assert!(
+        reopened.drain_auto_publish().is_empty(),
+        "a group that stayed quarantined owes no publish work"
+    );
+    assert_eq!(
+        storage
+            .inner
+            .list_group_evolutions_for_group(&group_id)
+            .expect("evolutions")[0]
+            .pending_ref,
+        None,
+        "a pending ref that can no longer resolve must not stay on the durable evolution"
+    );
+
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry"),
+        "the second retry recovers the group"
+    );
+
+    let republished = reopened.drain_auto_publish();
+    assert_eq!(
+        republished.len(),
+        1,
+        "one evolution owes exactly one publish, however many retries it took"
+    );
+    assert_eq!(republished[0].msg.id, staged.id);
+    let evolutions = storage
+        .inner
+        .list_group_evolutions_for_group(&group_id)
+        .expect("evolutions");
+    assert_eq!(evolutions.len(), 1);
+    assert_eq!(
+        evolutions[0].pending_ref,
+        Some(republished[0].pending),
+        "the durable evolution must point at the pending ref that was handed out"
+    );
+    reopened
+        .confirm_published(republished[0].pending)
+        .await
+        .expect("confirm the republished evolution");
+    assert_eq!(reopened.epoch(&group_id).unwrap(), EpochId(1));
 }
 
 #[tokio::test]

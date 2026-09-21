@@ -603,13 +603,14 @@ Current `reason` values found in production call sites:
 - `hydrate_durable_group_evolution`
 - `join_welcome`
 - `join_welcome_repair`
+- `recipient_confirmed_rejoin`
 - `begin_pending`
 - `publish_confirmed`
 - `publish_failed`
 - `auto_commit_stage_failed`
 - `update_group_data_stage_failed`
-- `fork_detected`
 - `missing_retained_anchor`
+- `missing_own_commit_checkpoint`
 
 Metadata notes:
 
@@ -1018,7 +1019,7 @@ metadata keys for indexing.
 | `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `avatar`, `image`, `message_retention`, `encrypted_media` |
 | `pending_kind` | `create_group`, `group_evolution` |
 | `epoch_state.new_state` | `seeded`, `stable`, `pending_publish`, `recovering`, `unrecoverable` |
-| `epoch_state.reason` | `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_removed_group`, `join_welcome`, `begin_pending`, `publish_confirmed`, `publish_failed`, `fork_detected`, `missing_retained_anchor` |
+| `epoch_state.reason` | `auto_commit_stage_failed`, `begin_pending`, `founding_create`, `hydrate_durable_group_evolution`, `hydrate_removed_group`, `hydrate_seed_group`, `hydrate_stable_group`, `hydrate_unrecoverable_group`, `join_welcome`, `join_welcome_repair`, `missing_own_commit_checkpoint`, `missing_retained_anchor`, `publish_confirmed`, `publish_failed`, `recipient_confirmed_rejoin`, `update_group_data_stage_failed` |
 | `group_state.change_kind` | `member_added`, `member_removed`, `member_left`, `admin_added`, `admin_removed`, `group_renamed`, `group_avatar_changed`, `message_retention_changed` |
 | `group_state.fields` | `members`, `membership`, `admins`, `name`, `avatar`, `message_retention` |
 | `convergence error_kinds` | `unsupported_policy`, `missing_retained_anchor`, `candidate_state_unavailable`, `mls_validation_failed`, `outbound_intent_stale`, `storage_unavailable` |
