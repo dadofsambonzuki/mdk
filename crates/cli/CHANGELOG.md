@@ -29,10 +29,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Fixed
 
 - OpenClaw Marmot restarts an account without waiting on the replaced gateway generation's welcomer-allowlist
-  reconciliation. The superseded generation is told to stop at its next mutation boundary instead, so a stalled
-  wn-agent control call can no longer keep a replacement from starting, and the two generations still never
-  reconcile the same allowlist at once. When a superseded call settles late, the current generation reconciles
-  once more so an already-dispatched write cannot outlive the handover.
+  reconciliation, so a stalled wn-agent control call can no longer keep a replacement from starting. The
+  superseded generation is told to stop instead: it dispatches no further allowlist mutations after the request
+  already in flight. That one request can still settle after the replacement has reconciled, so the current
+  generation reconciles once more when it does, for every superseded request it inherited.
 
 ## [0.10.4] - 2026-09-20
 
