@@ -26,6 +26,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   as ambient context; unauthorized and self-authored mutations are denied
   without buffering.
 
+### Fixed
+
+- OpenClaw Marmot restarts an account without waiting on the replaced gateway generation's welcomer-allowlist
+  reconciliation. The superseded generation is told to stop at its next mutation boundary instead, so a stalled
+  wn-agent control call can no longer keep a replacement from starting, and the two generations still never
+  reconcile the same allowlist at once. When a superseded call settles late, the current generation reconciles
+  once more so an already-dispatched write cannot outlive the handover.
+
 ## [0.10.4] - 2026-09-20
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
