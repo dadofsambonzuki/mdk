@@ -7509,6 +7509,7 @@ version = "0.10.4"
 dependencies = [
  "async-trait",
  "clap",
+ "libc",
  "marmot-terminal-harness",
  "serde_json",
  "tempfile",
