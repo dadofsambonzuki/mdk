@@ -84,33 +84,19 @@ def _home_channel_platform_name(home_channel: Any) -> Optional[str]:
     resolver rejects as ``wrong_platform``. Prefer ``.value`` so a home set by
     Hermes's own ``/sethome`` resolves exactly like the YAML projection the
     doctor reads.
+
+    Both call sites read ``self.config.home_channel``, which is always an
+    attribute-style value: the core ``HomeChannel`` object, or the
+    ``SimpleNamespace`` that ``_effective_platform_config`` builds for the
+    plugin-settings path. The YAML mapping form belongs to the doctor and is
+    handled once in ``diagnostics._home_channel_fields``, so it is deliberately
+    not tolerated here.
     """
 
-    if isinstance(home_channel, dict):
-        raw = home_channel.get("platform")
-    else:
-        raw = getattr(home_channel, "platform", None)
+    raw = getattr(home_channel, "platform", None)
     if raw in (None, ""):
         return None
     return str(getattr(raw, "value", raw)).strip().lower() or None
-
-
-def _home_channel_chat_id(home_channel: Any) -> Optional[str]:
-    """Chat id of a core HomeChannel, from either the mapping or the object form.
-
-    The platform name and the chat id are read from the same value, so a
-    mapping-form home channel must not lose one of them: reading ``chat_id``
-    with ``getattr`` alone drops it, and the route stays unresolved even though
-    the home channel is valid.
-    """
-
-    if isinstance(home_channel, dict):
-        raw = home_channel.get("chat_id")
-    else:
-        raw = getattr(home_channel, "chat_id", None)
-    if raw in (None, ""):
-        return None
-    return str(raw)
 
 
 DEFAULT_SOCKET_HOME = "~/.marmot"
@@ -1787,7 +1773,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         chat_id = None
         if home_channel is not None:
             platform = _home_channel_platform_name(home_channel)
-            chat_id = _home_channel_chat_id(home_channel)
+            chat_id = getattr(home_channel, "chat_id", None)
         route, error = marmot_diagnostics.resolve_home_route(
             extra,
             home_channel=chat_id if chat_id not in (None, "") else extra.get("home_channel"),
@@ -4334,7 +4320,7 @@ async def probe_readiness(
     home_channel = getattr(config, "home_channel", None)
     if not group_id and home_channel is not None:
         home_platform = _home_channel_platform_name(home_channel) or ""
-        home_chat_id = (_home_channel_chat_id(home_channel) or "").strip()
+        home_chat_id = (getattr(home_channel, "chat_id", None) or "").strip()
         if home_platform in {"", "marmot"} and home_chat_id:
             if home_chat_id.lower().startswith("marmot:"):
                 home_chat_id = home_chat_id.split(":", 1)[1].strip()
