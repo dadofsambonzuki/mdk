@@ -121,9 +121,11 @@ def install_fake_hermes_modules(*, media_kinds: bool = False):
         # never a trigger itself. Mirrors gateway.platforms.base.MessageEvent.
         channel_context: str | None = None
 
-    class Platform:
-        def __init__(self, value):
-            self.value = value
+    class Platform(enum.Enum):
+        # Hermes ships a Platform *enum*, and str() on a member is
+        # "Platform.MARMOT" rather than its value. A plain wrapper here is what
+        # let that difference go untested.
+        MARMOT = "marmot"
 
     @dataclass
     class PlatformConfig:
@@ -5173,15 +5175,14 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # restart.required + home.live_agreement mismatch against a config-side
         # route that resolved fine.
 
-        class Platform(enum.Enum):
-            MARMOT = "marmot"
+        Platform = sys.modules["gateway.config"].Platform
 
         extra = {
             "account_id_hex": "11" * 32,
             "socket_path": "/tmp/home-enum.sock",
             "group_id_hex": "dd" * 16,
         }
-        home = type("Home", (), {"platform": Platform.MARMOT, "chat_id": "cc" * 16})()
+        home = type("Home", (), {"platform": Platform("marmot"), "chat_id": "cc" * 16})()
 
         class FakeClient:
             pass
@@ -7455,7 +7456,7 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
             enabled=True,
             extra={"socket_path": "/tmp/passive-probe.sock"},
             home_channel=type(
-                "Home", (), {"platform": Platform.MARMOT, "chat_id": "cc" * 16}
+                "Home", (), {"platform": Platform("marmot"), "chat_id": "cc" * 16}
             )(),
         )
         live.client = ReadyClient()
