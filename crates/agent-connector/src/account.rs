@@ -6,7 +6,7 @@ use marmot_app::AccountRelayListBootstrap;
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
-use crate::validation::{unix_now_seconds, validate_profile_name};
+use crate::validation::{unix_now_seconds, validate_profile_field, validate_profile_name};
 
 /// Optional kind-0 fields one publish may set. Every field left as `None` keeps
 /// the value already published for the account.
@@ -16,6 +16,22 @@ pub(crate) struct ProfileUpdateFields {
     pub(crate) picture: Option<String>,
     pub(crate) nip05: Option<String>,
     pub(crate) lud16: Option<String>,
+}
+
+impl ProfileUpdateFields {
+    /// Reject the values a control request must not be able to publish. The name
+    /// already goes through [`validate_profile_name`]; these four arrived straight
+    /// from the socket, so one request could otherwise publish embedded control
+    /// bytes or a multi-KB `about`. Validation runs before the relay read, so a
+    /// hostile field cannot trigger network work either.
+    fn validated(self) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            about: validate_profile_field("about", self.about)?,
+            picture: validate_profile_field("picture", self.picture)?,
+            nip05: validate_profile_field("nip05", self.nip05)?,
+            lud16: validate_profile_field("lud16", self.lud16)?,
+        })
+    }
 }
 
 impl AgentConnector {
@@ -159,6 +175,7 @@ impl AgentConnector {
             .map(validate_profile_name)
             .transpose()?
             .unwrap_or_else(|| name.clone());
+        let fields = fields.validated()?;
         let bootstrap_relays = self.configured_relay_endpoints();
         // kind:0 is a *replaceable* event, so publishing a struct built only from
         // this request would erase every field the caller did not name - `about`,

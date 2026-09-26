@@ -280,6 +280,106 @@ fn profile_name_validation_rejects_non_whitespace_control_characters() {
     }
 }
 
+#[test]
+fn profile_field_validation_bounds_free_text_and_rejects_control_characters() {
+    use crate::validation::validate_profile_field;
+
+    // An omitted field keeps the published value; an empty one clears it.
+    assert_eq!(validate_profile_field("about", None).unwrap(), None);
+    assert_eq!(
+        validate_profile_field("about", Some(String::new())).unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(
+        validate_profile_field("about", Some("Day family assistant.".to_owned())).unwrap(),
+        Some("Day family assistant.".to_owned())
+    );
+
+    let longest = "a".repeat(crate::MAX_PROFILE_FIELD_CHARS);
+    assert!(validate_profile_field("about", Some(longest)).is_ok());
+    assert!(matches!(
+        validate_profile_field(
+            "about",
+            Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1))
+        ),
+        Err(crate::ConnectorError::InvalidProfileField(
+            "about", "too_long"
+        ))
+    ));
+
+    for (field, value) in [
+        ("about", "Day\u{1b}[2Jfamily".to_owned()),
+        ("picture", "https://example.com/\u{7}avatar.png".to_owned()),
+        ("nip05", "holly\u{0}@example.com".to_owned()),
+        ("lud16", "holly@example.com\u{b}".to_owned()),
+    ] {
+        assert!(matches!(
+            validate_profile_field(field, Some(value)),
+            Err(crate::ConnectorError::InvalidProfileField(
+                _,
+                "control_characters"
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn connector_profile_publish_rejects_hostile_optional_fields_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The name has its own validation; these four arrive straight from the socket
+    // and would otherwise reach kind:0 unchecked.
+    for fields in [
+        ProfileUpdateFields {
+            about: Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1)),
+            ..ProfileUpdateFields::default()
+        },
+        ProfileUpdateFields {
+            picture: Some("https://example.com/\u{1b}avatar.png".to_owned()),
+            ..ProfileUpdateFields::default()
+        },
+    ] {
+        let error = connector
+            .publish_profile_response(
+                &account.account_id_hex,
+                "Hermes Agent".to_owned(),
+                Some("Hermes Agent".to_owned()),
+                fields,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_profile_field");
+    }
+
+    // A rejected publish must not leave a half-written profile on the relay.
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&relay_url)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .is_none(),
+        "a rejected profile must not publish anything"
+    );
+}
+
 fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,
