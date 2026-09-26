@@ -179,14 +179,27 @@ impl AgentConnector {
         // that merge treats `None` here as a clear for `about`, `picture`, `nip05`
         // and `lud16`, so it cannot preserve a field this request never named.
         // Overlaying the read value is what keeps the four fields intact.
-        let mut profile = self
+        let published = self
             .runtime
             .fetch_current_user_profile_for_account_id(
                 &account.account_id_hex,
                 bootstrap_relays.clone(),
             )
-            .await?
-            .unwrap_or_default();
+            .await?;
+        // An empty read is not proof that the account has no profile: the relays
+        // the read reaches need not be the relays the account published to. Fall
+        // back to the locally cached directory entry, which every publish writes
+        // through `remember_directory_profile`, before starting from a default.
+        // Onboarding still needs its first publish to succeed, so refusing the
+        // publish here is not an option.
+        let mut profile = match published {
+            Some(profile) => profile,
+            None => self
+                .app
+                .directory_entry_for_account_id(&account.account_id_hex)?
+                .and_then(|entry| entry.profile)
+                .unwrap_or_default(),
+        };
         profile.name = Some(name.clone());
         profile.display_name = Some(display_name.clone());
         if let Some(about) = fields.about {

@@ -20,8 +20,9 @@ use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::{EpochId, GroupId, MessageId};
 use marmot_account::AccountHome;
 use marmot_app::{
-    AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
-    RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    AccountRelayListBootstrap, AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent,
+    MarmotAppRuntime, ReceivedMessage, RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
 use std::collections::HashSet;
@@ -3199,6 +3200,98 @@ async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
     );
     assert_eq!(profile.nip05.as_deref(), Some("holly@example.com"));
     assert_eq!(profile.lud16.as_deref(), Some("holly@example.com"));
+}
+
+#[tokio::test]
+async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_read_relays_hold_none()
+{
+    let dir = tempfile::tempdir().unwrap();
+    // The account published through one relay; a later connector reads and
+    // publishes through another. Re-bootstrapping with new `--relay` values is
+    // exactly this shape (#1966): the profile exists, just not on the relays this
+    // request reads.
+    let published_relay = MockRelay::run().await.unwrap();
+    let published_url = published_relay.url().await.to_string();
+    let read_relay = MockRelay::run().await.unwrap();
+    let read_url = read_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), published_url.clone());
+    let published_endpoint = crate::validation::endpoint(&published_url);
+
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/avatar.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![published_endpoint.clone()],
+            vec![published_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The published profile reaches the local cache the way it does on a real
+    // device: a directory refresh remembers what the relay holds.
+    app.refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .and_then(|profile| profile.about),
+        Some("Day family assistant.".to_owned()),
+        "cached profile before the read that finds nothing"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![read_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The read through the connector's relays finds no kind:0 for the account, so
+    // the locally cached profile is the only thing that can keep `about` and
+    // `picture` from being wiped by this publish.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.refresh_profile_for_account_id(
+        &account.account_id_hex,
+        vec![crate::validation::endpoint(&read_url)],
+    )
+    .await
+    .unwrap();
+    let profile = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    // The values above come from the second publish, not from the seeded one.
+    assert!(profile.created_at > 42);
 }
 
 #[tokio::test]
