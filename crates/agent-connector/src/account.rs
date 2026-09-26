@@ -177,11 +177,13 @@ impl AgentConnector {
             .unwrap_or_else(|| name.clone());
         let fields = fields.validated()?;
         let bootstrap_relays = self.configured_relay_endpoints();
-        // kind:0 is a *replaceable* event, so publishing a struct built only from
-        // this request would erase every field the caller did not name - `about`,
-        // `picture`, `banner`, `nip05`, `lud16` and any unknown key another client
-        // wrote. Read the currently published profile first and overlay only the
-        // provided fields, exactly as `wn profile update` does. A relay failure
+        // kind:0 is a *replaceable* event. `MarmotApp::publish_user_profile`
+        // already merges the currently published profile on its own publish path,
+        // and that merge keeps `banner` and any unknown key another client wrote.
+        // It does treat a `None` as a clear for `about`, `picture`, `nip05` and
+        // `lud16`, though, so a request that names only the name still wipes those
+        // four. Read the published profile first and overlay exactly the fields
+        // this request named, the way `wn profile update` does. A relay failure
         // stays an error: an unconfirmed read must never become a partial
         // replacement.
         //
@@ -191,11 +193,6 @@ impl AgentConnector {
         // can be different sets, so skipping the read would publish a partial
         // replacement over a profile that exists on relays this request never
         // looked at.
-        //
-        // The runtime merges the current profile on its own publish path too, but
-        // that merge treats `None` here as a clear for `about`, `picture`, `nip05`
-        // and `lud16`, so it cannot preserve a field this request never named.
-        // Overlaying the read value is what keeps the four fields intact.
         let published = self
             .runtime
             .fetch_current_user_profile_for_account_id(
