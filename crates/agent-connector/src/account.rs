@@ -2,7 +2,7 @@
 
 use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
-use marmot_app::{AccountRelayListBootstrap, UserProfileMetadata};
+use marmot_app::AccountRelayListBootstrap;
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
@@ -166,19 +166,27 @@ impl AgentConnector {
         // wrote. Read the currently published profile first and overlay only the
         // provided fields, exactly as `wn profile update` does. A relay failure
         // stays an error: an unconfirmed read must never become a partial
-        // replacement. No configured relay means nothing to read, and no profile
-        // to preserve.
-        let mut profile = if bootstrap_relays.is_empty() {
-            UserProfileMetadata::default()
-        } else {
-            self.runtime
-                .fetch_current_user_profile_for_account_id(
-                    &account.account_id_hex,
-                    bootstrap_relays.clone(),
-                )
-                .await?
-                .unwrap_or_default()
-        };
+        // replacement.
+        //
+        // The read is unconditional. An empty configured relay list is not "nothing
+        // to read": the read falls back to the directory and app relays, and the
+        // publish goes to the account's NIP-65 outbox (`outbox_endpoints`). Those
+        // can be different sets, so skipping the read would publish a partial
+        // replacement over a profile that exists on relays this request never
+        // looked at.
+        //
+        // The runtime merges the current profile on its own publish path too, but
+        // that merge treats `None` here as a clear for `about`, `picture`, `nip05`
+        // and `lud16`, so it cannot preserve a field this request never named.
+        // Overlaying the read value is what keeps the four fields intact.
+        let mut profile = self
+            .runtime
+            .fetch_current_user_profile_for_account_id(
+                &account.account_id_hex,
+                bootstrap_relays.clone(),
+            )
+            .await?
+            .unwrap_or_default();
         profile.name = Some(name.clone());
         profile.display_name = Some(display_name.clone());
         if let Some(about) = fields.about {
