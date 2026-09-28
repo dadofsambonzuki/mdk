@@ -3395,6 +3395,136 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
 }
 
 #[tokio::test]
+async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_lagging_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    // A read relay can be *stale* rather than empty: it keeps serving the
+    // pre-edit kind:0 while the newer edit is already in the local directory
+    // cache. Starting from the relay's older copy republishes the fields it
+    // holds over the local edit, which is the same erasure from the other side.
+    let lagging_relay = MockRelay::run().await.unwrap();
+    let lagging_url = lagging_relay.url().await.to_string();
+    let current_relay = MockRelay::run().await.unwrap();
+    let current_url = current_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // What the lagging relay holds and will keep returning to the read below.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Old about.".to_owned()),
+            picture: Some("https://example.com/old.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![lagging_endpoint.clone()],
+            vec![lagging_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit, published where the lagging relay cannot see it. A
+    // profile's `created_at` is the event timestamp the relay hands back, so
+    // the lagging copy is at best same-second and never strictly newer.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/new.png".to_owned()),
+            created_at: 4242,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![current_endpoint.clone()],
+            vec![current_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit reaches the cache the way it does on a real device: a
+    // directory refresh remembers what the current relay holds.
+    app.refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
+        .await
+        .unwrap();
+    let cached = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("cached profile before the stale read");
+    assert_eq!(cached.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        cached.picture.as_deref(),
+        Some("https://example.com/new.png"),
+        "cached profile before the stale read"
+    );
+
+    // Pin the premise: the copy this publish reads is the older one, and the
+    // cache is not older than it.
+    let read_copy = app
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert_eq!(read_copy.about.as_deref(), Some("Old about."));
+    assert_eq!(
+        read_copy.picture.as_deref(),
+        Some("https://example.com/old.png")
+    );
+    assert!(cached.created_at >= read_copy.created_at);
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // This publish names no optional field, so everything it does not name must
+    // come from the newer cached edit and not from the older copy the read
+    // relay returns.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    // Read what the lagging relay now holds, straight from the relay.
+    let published = app
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("published profile");
+    assert_eq!(published.name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        published.picture.as_deref(),
+        Some("https://example.com/new.png")
+    );
+    assert!(published.created_at >= read_copy.created_at);
+}
+
+#[tokio::test]
 async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();

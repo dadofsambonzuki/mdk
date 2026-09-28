@@ -200,19 +200,30 @@ impl AgentConnector {
                 bootstrap_relays.clone(),
             )
             .await?;
-        // An empty read is not proof that the account has no profile: the relays
-        // the read reaches need not be the relays the account published to. Fall
-        // back to the locally cached directory entry, which every publish writes
-        // through `remember_directory_profile`, before starting from a default.
-        // Onboarding still needs its first publish to succeed, so refusing the
-        // publish here is not an option.
-        let mut profile = match published {
-            Some(profile) => profile,
-            None => self
-                .app
-                .directory_entry_for_account_id(&account.account_id_hex)?
-                .and_then(|entry| entry.profile)
-                .unwrap_or_default(),
+        // The read can also be *stale* rather than empty.
+        // `fetch_current_user_profile_for_account_id` returns the relay's copy
+        // even when its own `remember_directory_profile_if_newer` call has
+        // deliberately kept a newer cached profile, so starting from that copy
+        // would republish the older fields over a newer local edit: the
+        // runtime's `merge_user_profile_update` takes `about`, `picture`,
+        // `nip05` and `lud16` from this update unconditionally. Take the newer
+        // of the two and keep the cache on equality, the way the directory
+        // ingest rule does (`created_at` has second resolution, mdk#206), which
+        // is also what `newest_user_profile` selects for the runtime's own
+        // merge. An empty read is not proof that the account has no profile
+        // either: the relays the read reaches need not be the relays the
+        // account published to. The locally cached directory entry, which every
+        // publish writes through `remember_directory_profile`, covers both
+        // cases. Onboarding still needs its first publish to succeed, so
+        // refusing the publish here is not an option.
+        let cached = self
+            .app
+            .directory_entry_for_account_id(&account.account_id_hex)?
+            .and_then(|entry| entry.profile);
+        let mut profile = match (cached, published) {
+            (Some(cached), Some(published)) if cached.created_at >= published.created_at => cached,
+            (_, Some(published)) => published,
+            (cached, None) => cached.unwrap_or_default(),
         };
         profile.name = Some(name.clone());
         profile.display_name = Some(display_name.clone());
