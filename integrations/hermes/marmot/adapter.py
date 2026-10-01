@@ -4852,6 +4852,75 @@ async def _marmot_group_profile_tool(args: Dict[str, Any], **_kwargs: Any) -> st
         return json.dumps({"ok": False, "error": "Marmot group profile update failed", "kind": type(exc).__name__})
 
 
+async def _marmot_relays_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """Account relay lists: read them, or add/remove one relay.
+
+    kind 10002 and kind 10050 are replaceable, so the connector reads the
+    published list, overlays the named relay and republishes the merge. The call
+    fails rather than publishing a partial list when the published list cannot
+    be confirmed.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    relay_type = str(args.get("relay_type") or "").strip().lower()
+    url = str(args.get("url") or "").strip()
+    direction = args.get("direction")
+    if action not in {"list", "add", "remove"}:
+        return json.dumps({"ok": False, "error": "action must be list, add or remove"})
+    if relay_type not in {"nip65", "inbox"}:
+        return json.dumps({"ok": False, "error": "relay_type must be nip65 or inbox"})
+    if action in {"add", "remove"} and not url:
+        return json.dumps({"ok": False, "error": "url required"})
+    if direction is not None:
+        direction = str(direction).strip().lower()
+        if direction not in {"read", "write", "both"}:
+            return json.dumps({"ok": False, "error": "direction must be read, write or both"})
+        if relay_type == "inbox" and direction != "both":
+            return json.dumps({
+                "ok": False,
+                "error": "direction applies to nip65 only",
+            })
+
+    adapter = _live_adapter()
+    if adapter is None:
+        return json.dumps({"ok": False, "error": "marmot_relays requires a live Marmot adapter"})
+    try:
+        account_id_hex = await adapter._ensure_account_id()
+        if action == "list":
+            response = await adapter.client.account_relay_lists(account_id_hex)
+        elif action == "add":
+            response = await adapter.client.account_relay_list_add(
+                account_id_hex, relay_type, url, direction=direction,
+            )
+        else:
+            response = await adapter.client.account_relay_list_remove(
+                account_id_hex, relay_type, url, direction=direction,
+            )
+        return json.dumps({"ok": True, **response})
+    except AgentControlError as exc:
+        if exc.code in {"invalid_relay_url", "invalid_relay_list_edit"}:
+            return json.dumps({"ok": False, "error_code": exc.code, "error": str(exc)})
+        if exc.code == "relay_list_inconclusive":
+            return json.dumps({
+                "ok": False,
+                "error_code": exc.code,
+                "retryable": True,
+                "error": "the published relay list could not be confirmed; nothing was published",
+            })
+        if exc.code in {"timeout", "socket_closed", "socket_io", "operation_timed_out"}:
+            return json.dumps({
+                "ok": False,
+                "error_code": exc.code,
+                "outcome_unknown": True,
+                "error": "relay list edit outcome is unknown; read the relay lists before retrying",
+            })
+        return json.dumps({"ok": False, "error_code": exc.code, "error": "Marmot relay list request failed"})
+    except Exception as exc:
+        logger.debug("Marmot relay list request failed", exc_info=True)
+        return json.dumps({
+            "ok": False, "error": "Marmot relay list request failed", "kind": type(exc).__name__,
+        })
+
+
 async def _marmot_reaction_tool(args: Dict[str, Any], **_kwargs: Any) -> str:
     action = str(args.get("action") or "").strip().lower()
     group_id_hex = str(args.get("group_id_hex") or "").strip()
@@ -5055,6 +5124,44 @@ def register(ctx):
                 "required": ["group_id_hex"],
             },
             handler=_marmot_group_profile_tool,
+            is_async=True,
+        )
+        register_tool(
+            name="marmot_relays",
+            toolset="platform",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove"],
+                        "description": "Read the account relay lists, or add/remove one relay.",
+                    },
+                    "relay_type": {
+                        "type": "string",
+                        "enum": ["nip65", "inbox"],
+                        "description": "nip65 is the NIP-65 read/write relay map (kind 10002); inbox is the Marmot inbox list (kind 10050).",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "Relay URL to add or remove (wss://). Required for add and remove. "
+                            "Omit for list."
+                        ),
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["read", "write", "both"],
+                        "description": (
+                            "Which direction to publish the relay for. Omit for both, which "
+                            "publishes it unmarked. nip65 only."
+                        ),
+                    },
+                },
+                "required": ["action", "relay_type"],
+            },
+            handler=_marmot_relays_tool,
             is_async=True,
         )
         register_tool(

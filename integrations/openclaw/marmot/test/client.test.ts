@@ -62,6 +62,37 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         echoed_limit: req.limit,
       });
       break;
+    case "account_relay_lists":
+      send(socket, id, {
+        type: "relay_lists",
+        account_id_hex: req.account_id_hex,
+        relay_lists: {
+          nip65: {
+            relays: ["wss://write.example"],
+            read_relays: ["wss://read.example", "wss://write.example"],
+            write_relays: ["wss://write.example"],
+            created_at: 1,
+          },
+          inbox: { relays: ["wss://inbox.example"], read_relays: [], write_relays: [], created_at: 0 },
+        },
+      });
+      break;
+    case "account_relay_list_add":
+    case "account_relay_list_remove":
+      send(socket, id, {
+        type: "relay_lists",
+        account_id_hex: req.account_id_hex,
+        // Echo the optional field so a test can assert the client omitted it
+        // rather than sending an empty string.
+        echoed_direction: req.direction ?? null,
+        echoed_relay_type: req.relay_type ?? null,
+        echoed_url: req.url ?? null,
+        relay_lists: {
+          nip65: { relays: [], read_relays: [], write_relays: [], created_at: 1 },
+          inbox: { relays: [], read_relays: [], write_relays: [], created_at: 0 },
+        },
+      });
+      break;
     case "account_profile_lookup":
       send(socket, id, {
         type: "profile_lookup",
@@ -253,6 +284,32 @@ describe("MarmotAgentControlClient", () => {
       status: "profile_found",
       retryable: false,
     });
+  });
+
+  it("round-trips a typed relay-list read", async () => {
+    const res = await client.accountRelayLists(HEX32("aa"));
+    expect(res.type).toBe("relay_lists");
+    expect(res.relay_lists.nip65.write_relays).toEqual(["wss://write.example"]);
+    expect(res.relay_lists.inbox.relays).toEqual(["wss://inbox.example"]);
+  });
+
+  it("omits a relay-list direction the caller does not name", async () => {
+    const added = (await client.accountRelayListAdd(
+      HEX32("aa"),
+      "nip65",
+      "wss://relay.example",
+    )) as unknown as Record<string, unknown>;
+    expect(added.echoed_direction).toBeNull();
+    expect(added.echoed_relay_type).toBe("nip65");
+    expect(added.echoed_url).toBe("wss://relay.example");
+
+    const removed = (await client.accountRelayListRemove(
+      HEX32("aa"),
+      "nip65",
+      "wss://relay.example",
+      "read",
+    )) as unknown as Record<string, unknown>;
+    expect(removed.echoed_direction).toBe("read");
   });
 
   it("fetches one durable timeline message and pages by stable cursor", async () => {
