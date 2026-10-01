@@ -17,8 +17,10 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` and `
 - `plugin.yaml` — Hermes platform plugin manifest.
 - `__init__.py` — plugin entry registration.
 - `adapter.py` — Hermes platform adapter: inbound/outbound bridging, activation, sender ACL, media, the registered
-  platform tools (`marmot_status`, `marmot_history`, `marmot_group_profile`, `marmot_reaction`, `marmot_relays`), and
-  live-preview state machine.
+  platform tools (`marmot_status`, `marmot_history`, `marmot_group_profile`, `marmot_reaction`), and live-preview
+  state machine.
+- `inbound_spool.py` — crash-safe inbound obligation spool ahead of Hermes' in-memory debounce/queue.
+- `ambient_context.py` — private durable quiet-context facts (hashed keys only; no message text or identifiers).
 - `agent_control.py` — hardened v2 NDJSON control-socket client (framing, correlation, typed requests including the
   account relay-list read and edits).
 - `diagnostics.py` — shared doctor report helpers and the plugin-owned diagnostics socket.
