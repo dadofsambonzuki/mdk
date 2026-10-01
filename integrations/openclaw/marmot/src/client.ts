@@ -111,34 +111,6 @@ export interface GroupInfoResponse {
   subject?: string | null;
 }
 
-/** One published account relay list (NIP-65 kind 10002 or inbox kind 10050). */
-export interface RelayListResponse {
-  /** Write-capable targets for kind 10002; the declared set for the inbox list. */
-  relays: string[];
-  /** NIP-65 read-capable endpoints; empty for the inbox list. */
-  read_relays?: string[];
-  /** NIP-65 write-capable endpoints; empty for the inbox list. */
-  write_relays?: string[];
-  /** Timestamp of the replaceable event this state came from; 0 means nothing published. */
-  created_at?: number;
-}
-
-/** Both account relay lists, as returned by a read or an edit. */
-export interface RelayListsResponse {
-  type: "relay_lists";
-  account_id_hex: string;
-  relay_lists: {
-    nip65: RelayListResponse;
-    inbox: RelayListResponse;
-  };
-}
-
-/** Which published relay list an edit targets. */
-export type RelayListType = "nip65" | "inbox";
-
-/** Which direction a NIP-65 entry is published for; omitted means both. */
-export type RelayListDirection = "read" | "write" | "both";
-
 export interface ProfilePublishedResponse {
   type: "profile_published";
   account_id_hex: string;
@@ -622,91 +594,6 @@ export class MarmotAgentControlClient {
       name: String(name ?? ""),
       display_name: displayName == null ? null : String(displayName),
     })) as unknown as ProfilePublishedResponse;
-  }
-
-  /** Read the account's cached relay lists (NIP-65 and the Marmot inbox). */
-  async accountRelayLists(accountIdHex: string): Promise<RelayListsResponse> {
-    const response = await this.request({
-      type: "account_relay_lists",
-      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
-    });
-    return this.requireRelayLists(response);
-  }
-
-  /**
-   * Add one relay to one published account relay list.
-   *
-   * kind 10002 and kind 10050 are replaceable, so wn-agent reads the published
-   * list, overlays this entry and republishes the merge; an entry the request
-   * does not name survives. The call fails rather than publishing a partial list
-   * when the published list cannot be confirmed.
-   */
-  async accountRelayListAdd(
-    accountIdHex: string,
-    relayType: RelayListType,
-    url: string,
-    direction?: RelayListDirection,
-  ): Promise<RelayListsResponse> {
-    return this.relayListEdit("account_relay_list_add", accountIdHex, relayType, url, direction);
-  }
-
-  /** Remove one relay from one published account relay list. */
-  async accountRelayListRemove(
-    accountIdHex: string,
-    relayType: RelayListType,
-    url: string,
-    direction?: RelayListDirection,
-  ): Promise<RelayListsResponse> {
-    return this.relayListEdit(
-      "account_relay_list_remove",
-      accountIdHex,
-      relayType,
-      url,
-      direction,
-    );
-  }
-
-  private async relayListEdit(
-    type: "account_relay_list_add" | "account_relay_list_remove",
-    accountIdHex: string,
-    relayType: RelayListType,
-    url: string,
-    direction?: RelayListDirection,
-  ): Promise<RelayListsResponse> {
-    const response = await this.request({
-      type,
-      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
-      relay_type: relayType,
-      url: String(url ?? "").trim(),
-      // Optional on the wire: omitted means both directions, which is wn-agent's
-      // own default. Never send an empty string in its place.
-      ...(direction ? { direction } : {}),
-    });
-    return this.requireRelayLists(response);
-  }
-
-  private requireRelayLists(response: Record<string, unknown>): RelayListsResponse {
-    const lists = response.relay_lists as Record<string, unknown> | undefined;
-    const listsValid =
-      lists != null &&
-      typeof lists === "object" &&
-      ["nip65", "inbox"].every((name) => {
-        const entry = lists[name] as Record<string, unknown> | undefined;
-        return (
-          entry != null &&
-          typeof entry === "object" &&
-          Array.isArray(entry.relays) &&
-          typeof entry.created_at === "number"
-        );
-      });
-    if (response.type !== "relay_lists" || !listsValid) {
-      // Classifiable like every other protocol failure: callers check
-      // `instanceof AgentControlError` and read `.code`.
-      throw new AgentControlError("wn-agent returned invalid relay_lists response", {
-        code: "protocol_error",
-      });
-    }
-    return response as unknown as RelayListsResponse;
   }
 
   async sendFinal(

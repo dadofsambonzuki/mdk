@@ -7389,12 +7389,6 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(group_profile["schema"]["additionalProperties"])
         self.assertIs(group_profile["handler"], self.adapter_module._marmot_group_profile_tool)
         self.assertTrue(group_profile["is_async"])
-        relays = next(tool for tool in ctx.tools if tool["name"] == "marmot_relays")
-        self.assertEqual(relays["toolset"], "platform")
-        self.assertEqual(relays["schema"]["required"], ["action", "relay_type"])
-        self.assertFalse(relays["schema"]["additionalProperties"])
-        self.assertIs(relays["handler"], self.adapter_module._marmot_relays_tool)
-        self.assertTrue(relays["is_async"])
         reaction = next(tool for tool in ctx.tools if tool["name"] == "marmot_reaction")
         self.assertEqual(reaction["toolset"], "platform")
         self.assertEqual(reaction["schema"]["required"], ["action", "group_id_hex"])
@@ -7742,112 +7736,6 @@ class PluginRegistrationTests(unittest.IsolatedAsyncioTestCase):
         }))
         self.assertFalse(oversized["ok"])
         self.assertEqual(len(calls), 3)
-
-    async def test_marmot_relays_tool_reads_and_edits_lists(self):
-        calls = []
-        module = self.adapter_module
-
-        class FakeClient:
-            async def account_relay_lists(self, account_id_hex):
-                calls.append(("list", account_id_hex, None, None, None))
-                return {
-                    "type": "relay_lists",
-                    "account_id_hex": account_id_hex,
-                    "relay_lists": {
-                        "nip65": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 0},
-                        "inbox": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 0},
-                    },
-                }
-
-            async def account_relay_list_add(self, account_id_hex, relay_type, url, direction=None):
-                calls.append(("add", account_id_hex, relay_type, url, direction))
-                if url == "wss://unconfirmed.example":
-                    raise module.AgentControlError(
-                        "the published relay list could not be confirmed",
-                        code="relay_list_inconclusive",
-                        retryable=True,
-                    )
-                if url == "not-a-url":
-                    raise module.AgentControlError("invalid relay URL", code="invalid_relay_url")
-                return {
-                    "type": "relay_lists",
-                    "account_id_hex": account_id_hex,
-                    "relay_lists": {
-                        "nip65": {
-                            "relays": [url], "read_relays": [url], "write_relays": [url],
-                            "created_at": 1,
-                        },
-                        "inbox": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 0},
-                    },
-                }
-
-            async def account_relay_list_remove(self, account_id_hex, relay_type, url, direction=None):
-                calls.append(("remove", account_id_hex, relay_type, url, direction))
-                return {
-                    "type": "relay_lists",
-                    "account_id_hex": account_id_hex,
-                    "relay_lists": {
-                        "nip65": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 2},
-                        "inbox": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 0},
-                    },
-                }
-
-        class FakeAdapter:
-            client = FakeClient()
-
-            async def _ensure_account_id(self):
-                return "11" * 32
-
-        # Keep a strong reference: the live adapter is held by weakref, so a
-        # temporary would be collected before the handler runs.
-        adapter = FakeAdapter()
-        module._remember_live_adapter(adapter)
-
-        listed = json.loads(await module._marmot_relays_tool({
-            "action": "list", "relay_type": "nip65",
-        }))
-        self.assertTrue(listed["ok"])
-        self.assertEqual(calls[-1], ("list", "11" * 32, None, None, None))
-
-        added = json.loads(await module._marmot_relays_tool({
-            "action": "add", "relay_type": "nip65", "url": "wss://relay.example",
-            "direction": "read",
-        }))
-        self.assertTrue(added["ok"])
-        self.assertEqual(calls[-1], ("add", "11" * 32, "nip65", "wss://relay.example", "read"))
-
-        removed = json.loads(await module._marmot_relays_tool({
-            "action": "remove", "relay_type": "inbox", "url": "wss://inbox.example",
-        }))
-        self.assertTrue(removed["ok"])
-        self.assertEqual(calls[-1], ("remove", "11" * 32, "inbox", "wss://inbox.example", None))
-
-        unconfirmed = json.loads(await module._marmot_relays_tool({
-            "action": "add", "relay_type": "nip65", "url": "wss://unconfirmed.example",
-        }))
-        self.assertFalse(unconfirmed["ok"])
-        self.assertEqual(unconfirmed["error_code"], "relay_list_inconclusive")
-        self.assertTrue(unconfirmed["retryable"])
-
-        invalid = json.loads(await module._marmot_relays_tool({
-            "action": "add", "relay_type": "nip65", "url": "not-a-url",
-        }))
-        self.assertFalse(invalid["ok"])
-        self.assertEqual(invalid["error_code"], "invalid_relay_url")
-
-        before_refusal = len(calls)
-        refused = json.loads(await module._marmot_relays_tool({
-            "action": "add", "relay_type": "inbox", "url": "wss://relay.example",
-            "direction": "read",
-        }))
-        self.assertFalse(refused["ok"])
-        # Refused locally: the connector was never asked to edit the list.
-        self.assertEqual(len(calls), before_refusal)
-
-        bad_action = json.loads(await module._marmot_relays_tool({
-            "action": "set", "relay_type": "nip65",
-        }))
-        self.assertFalse(bad_action["ok"])
 
     async def test_marmot_reaction_tool_calls_live_adapter_for_add_and_matching_remove(self):
         calls = []

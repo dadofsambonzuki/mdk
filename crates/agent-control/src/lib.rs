@@ -151,12 +151,6 @@ impl AgentControlRelayListType {
     }
 }
 
-impl std::fmt::Display for AgentControlRelayListType {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// Which direction of a NIP-65 entry one edit applies to.
 ///
 /// `Both` — the default when a request omits the field — publishes the relay
@@ -178,12 +172,6 @@ impl AgentControlRelayListDirection {
             Self::Write => "write",
             Self::Both => "both",
         }
-    }
-}
-
-impl std::fmt::Display for AgentControlRelayListDirection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
     }
 }
 
