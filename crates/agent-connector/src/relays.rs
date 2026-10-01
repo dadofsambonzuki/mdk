@@ -7,6 +7,8 @@
 //! confirm is refused rather than published as a partial replacement, so one
 //! edit can never drop the entries it did not name.
 
+use std::sync::Arc;
+
 use agent_control::{
     AgentControlRelayList, AgentControlRelayListDirection, AgentControlRelayListType,
     AgentControlRelayLists, AgentControlResponse,
@@ -62,14 +64,18 @@ impl AgentConnector {
             ));
         }
         let url = validate_relay_url(&edit.url, self.allow_loopback_relays)?;
+        // Serialize edits per account: two control requests that read the same
+        // snapshot would otherwise each publish a merge of it, and the loser's
+        // entry would vanish even though both answered success.
+        let edit_lock = self.relay_list_edit_lock(&account.account_id_hex);
+        let _edit_guard = edit_lock.lock().await;
         let cached = self.app.account_relay_list_status(&account.label)?;
         let source_relays = self.relay_list_source_relays(&cached);
         // The read is attempted even with an empty configured relay list: the
         // app falls back to the directory and default relays, so an empty
         // configuration is not "nothing to read" (the trap the profile publish
         // had to fix). A read that returns nothing is unconfirmed, not empty.
-        let published = self
-            .app
+        self.app
             .fetch_current_account_relay_list_status_for_account_id(
                 &account.account_id_hex,
                 source_relays,
@@ -77,27 +83,16 @@ impl AgentConnector {
             )
             .await?
             .ok_or(ConnectorError::RelayListInconclusive("read_empty"))?;
-        // A lagging relay can hand back a copy older than the local cache.
-        // Replaceable-event timestamps have second resolution, so start from the
-        // newer state and keep the cache on equality — the rule the directory
-        // ingest path already applies (`remember_directory_relay_list_event`,
-        // mdk#920). Without it, one edit would republish the stale entries the
-        // read returned over the newer local ones.
-        let current = newer_relay_list_state(
-            relay_list_state_for(&cached, relay_type),
-            relay_list_state_for(&published, relay_type),
-        );
+        // The fetch persists what it read through `merge_relay_list_status`,
+        // which keeps the newer state per kind and keeps the cache on a tie, so
+        // the cached status now holds the newer of the read and the cache: a
+        // lagging relay cannot hand back a copy older than the local cache, and
+        // one edit cannot republish the stale entries that read returned
+        // (mdk#920). Re-reading it is that merged state.
+        let merged = self.app.account_relay_list_status(&account.label)?;
+        let current = relay_list_state_for(&merged, relay_type).clone();
         let next = apply_relay_edit(&current, relay_type, &url, edit.direction, edit.add)?;
-        // Publish through the same route the read used: a relay that is being
-        // added must learn about the account even when it is not in the current
-        // outbox, and the app unions this route with the account's own NIP-65
-        // outbox.
-        let route = self.relay_list_route(&cached, &next, &url);
-        if route.is_empty() {
-            return Err(ConnectorError::RelayListSourceUnavailable(
-                "no_publish_route",
-            ));
-        }
+        let route = self.relay_list_route(&cached, &next, &url, edit.add);
         let status = match relay_type {
             AgentControlRelayListType::Nip65 => {
                 self.runtime
@@ -126,6 +121,18 @@ impl AgentConnector {
         })
     }
 
+    /// Per-account edit lock serializing relay-list mutations.
+    fn relay_list_edit_lock(&self, account_id_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .relay_list_edits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(account_id_hex.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Relays a relay-list read starts from, mirroring `wn relays`: the
     /// connector's configured relays first (a re-bootstrap with new `--relay`
     /// values is exactly the case where the published list must be re-read and
@@ -144,24 +151,28 @@ impl AgentConnector {
 
     /// Route one relay-list publication goes through.
     ///
-    /// When the connector has no configured relays and the account remembers
-    /// none, the edited entry itself is the only route that can reach the list,
-    /// so publishing through it is still better than refusing a first edit.
+    /// An add always includes the edited URL: the relay being adopted is by
+    /// definition not in the account's own NIP-65 write set yet, so the route
+    /// derived from that set would leave it without the kind-10002 event that
+    /// names it. The app unions this route with the account's own outbox, so the
+    /// relays already in the list are republished to as well.
     fn relay_list_route(
         &self,
         cached: &AccountRelayListStatus,
         next: &AccountRelayListState,
         url: &str,
+        add: bool,
     ) -> Vec<TransportEndpoint> {
-        let configured = self.configured_relay_endpoints();
-        if !configured.is_empty() {
-            return configured;
-        }
         let mut route = cached.bootstrap_relays.clone();
-        route.extend(next.relays.clone());
-        route.extend(next.read_relays.clone());
-        route.extend(next.write_relays.clone());
-        if route.is_empty() {
+        let configured = self.configured_relay_endpoints();
+        if configured.is_empty() {
+            route.extend(next.relays.clone());
+            route.extend(next.read_relays.clone());
+            route.extend(next.write_relays.clone());
+        } else {
+            route.extend(configured.into_iter().map(|endpoint| endpoint.0));
+        }
+        if add {
             route.push(url.to_owned());
         }
         unique_endpoints(&route)
@@ -176,19 +187,6 @@ fn relay_list_state_for(
     match relay_type {
         AgentControlRelayListType::Nip65 => &status.nip65,
         AgentControlRelayListType::Inbox => &status.inbox,
-    }
-}
-
-/// Start from the newer of the cached and freshly read list state, keeping the
-/// cache when both carry the same second-resolution timestamp.
-fn newer_relay_list_state(
-    cached: &AccountRelayListState,
-    published: &AccountRelayListState,
-) -> AccountRelayListState {
-    if cached.created_at >= published.created_at {
-        cached.clone()
-    } else {
-        published.clone()
     }
 }
 
@@ -591,24 +589,5 @@ mod tests {
         .unwrap();
         assert!(removed.read_relays.is_empty());
         assert_eq!(removed.write_relays, vec!["wss://relay.example/"]);
-    }
-
-    #[test]
-    fn newer_state_prefers_the_cache_on_equal_timestamps() {
-        let mut cached = nip65_state(&["wss://cached.example"], &["wss://cached.example"]);
-        cached.created_at = 9;
-        let mut published = nip65_state(&["wss://published.example"], &["wss://published.example"]);
-        published.created_at = 9;
-
-        assert_eq!(
-            newer_relay_list_state(&cached, &published).relays,
-            vec!["wss://cached.example"]
-        );
-
-        published.created_at = 10;
-        assert_eq!(
-            newer_relay_list_state(&cached, &published).relays,
-            vec!["wss://published.example"]
-        );
     }
 }

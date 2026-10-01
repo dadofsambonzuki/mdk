@@ -245,6 +245,13 @@ pub struct AgentConnector {
     #[cfg(test)]
     pub(crate) test_hooks: std::sync::Arc<test_support::ConnectorTestHooks>,
     relays: Vec<String>,
+    /// Per-account edit locks for relay-list mutations. Two control requests
+    /// that read the same published list would each publish a merge of it, and
+    /// the entry added by the loser would disappear even though both answered
+    /// success. Bounded by the number of local accounts, like the runtime's
+    /// follow-list locks.
+    relay_list_edits:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Dev/test gate for loopback relay URLs a control request may declare.
     /// Same switch as the relay-plane gate; a production connector rejects a
     /// `ws://` loopback entry here rather than letting one control request widen
@@ -300,6 +307,7 @@ impl AgentConnector {
             #[cfg(test)]
             test_hooks: std::sync::Arc::new(test_support::ConnectorTestHooks::default()),
             relays,
+            relay_list_edits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             allow_loopback_relays: config.allow_loopback_relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),

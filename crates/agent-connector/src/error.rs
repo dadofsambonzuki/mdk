@@ -37,8 +37,6 @@ pub enum ConnectorError {
     InvalidRelayUrl(&'static str),
     #[error("invalid relay list edit: {0}")]
     InvalidRelayListEdit(&'static str),
-    #[error("no relay route is available for this relay list: {0}")]
-    RelayListSourceUnavailable(&'static str),
     #[error("the published relay list could not be confirmed: {0}")]
     RelayListInconclusive(&'static str),
     #[error("connector operation timed out: {0}")]
@@ -93,7 +91,6 @@ impl ConnectorError {
             Self::InvalidProfileField(_, _) => "invalid_profile_field",
             Self::InvalidRelayUrl(_) => "invalid_relay_url",
             Self::InvalidRelayListEdit(_) => "invalid_relay_list_edit",
-            Self::RelayListSourceUnavailable(_) => "relay_list_source_unavailable",
             Self::RelayListInconclusive(_) => "relay_list_inconclusive",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
@@ -137,9 +134,6 @@ impl ConnectorError {
             Self::InvalidProfileField(_, _) => "invalid profile field",
             Self::InvalidRelayUrl(_) => "invalid relay URL",
             Self::InvalidRelayListEdit(_) => "invalid relay list edit",
-            Self::RelayListSourceUnavailable(_) => {
-                "no relay route is available for this relay list"
-            }
             Self::RelayListInconclusive(_) => {
                 "the published relay list could not be confirmed; nothing was published"
             }

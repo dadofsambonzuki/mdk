@@ -7873,6 +7873,25 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         );
     }
 
+    // The relay being adopted must actually receive the event that names it: it
+    // is not in the account's pre-edit outbox, so the route has to include it.
+    let added_copy = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&added_url)],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("the added relay received the list naming it");
+    assert!(
+        added_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+
     // Removing one entry keeps the rest, in both list kinds. Replaceable events
     // are second-resolution: a removal published in the same second as the
     // addition cannot supersede it, so the removal waits for the next second.
