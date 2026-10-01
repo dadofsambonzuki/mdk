@@ -254,15 +254,39 @@ fn apply_relay_edit(
     Ok(next)
 }
 
+/// Comparison key for one relay entry.
+///
+/// Relay lists are ingested as trimmed raw tag text
+/// (`parse_nip65_relay_set` / `relay_list_state_from_event`), so the same relay
+/// can be published as `wss://relay.example` by one client and
+/// `wss://relay.example/` by another. Comparing the text would treat those as
+/// two entries: a removal would appear to succeed while the variant stayed in
+/// the list and was republished, and an add could keep both. Compare the parsed
+/// URL form instead, falling back to the trimmed text for an entry this device
+/// cannot parse at all.
+fn relay_entry_key(value: &str) -> String {
+    let value = value.trim();
+    match url::Url::parse(value) {
+        Ok(parsed) => parsed.to_string(),
+        Err(_) => value.to_owned(),
+    }
+}
+
 /// Add or remove one URL, keeping the list sorted and deduplicated the way
 /// `wn relays` does.
+///
+/// The published text stays exactly what the caller supplied (the same text
+/// `wn relays` publishes); only the comparison is canonical. A removal drops
+/// every textual variant of the relay it names, so the next read cannot hand a
+/// variant back.
 fn update_relays(relays: &mut Vec<String>, url: &str, add: bool) {
+    let key = relay_entry_key(url);
     if add {
-        if !relays.iter().any(|relay| relay == url) {
+        if !relays.iter().any(|relay| relay_entry_key(relay) == key) {
             relays.push(url.to_owned());
         }
     } else {
-        relays.retain(|relay| relay != url);
+        relays.retain(|relay| relay_entry_key(relay) != key);
     }
     relays.sort();
     relays.dedup();
@@ -510,6 +534,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ConnectorError::InvalidRelayListEdit(_)));
+    }
+
+    #[test]
+    fn relay_entry_keys_match_trailing_slash_and_case_variants() {
+        assert_eq!(
+            relay_entry_key("wss://relay.example"),
+            relay_entry_key("wss://relay.example/")
+        );
+        assert_eq!(
+            relay_entry_key("wss://relay.example"),
+            relay_entry_key(" wss://Relay.Example ")
+        );
+        // An entry this device cannot parse still compares to itself, so a
+        // malformed legacy entry is removable rather than permanent.
+        assert_eq!(
+            relay_entry_key("not-a-relay"),
+            relay_entry_key(" not-a-relay ")
+        );
+        assert_ne!(
+            relay_entry_key("not-a-relay"),
+            relay_entry_key("wss://relay.example")
+        );
+    }
+
+    #[test]
+    fn relay_edits_match_a_stored_variant() {
+        let current = AccountRelayListState {
+            kind: 10_002,
+            created_at: 1,
+            relays: vec!["wss://relay.example/".to_owned()],
+            read_relays: vec!["wss://relay.example/".to_owned()],
+            write_relays: vec!["wss://relay.example/".to_owned()],
+        };
+
+        // Adding the slash-less form of an entry that is already present is a
+        // no-op instead of a second entry.
+        let added = apply_relay_edit(
+            &current,
+            AgentControlRelayListType::Nip65,
+            "wss://relay.example",
+            AgentControlRelayListDirection::Both,
+            true,
+        )
+        .unwrap();
+        assert_eq!(added.write_relays, vec!["wss://relay.example/"]);
+
+        // Removing the slash-less form drops the stored variant.
+        let removed = apply_relay_edit(
+            &current,
+            AgentControlRelayListType::Nip65,
+            "wss://relay.example",
+            AgentControlRelayListDirection::Read,
+            false,
+        )
+        .unwrap();
+        assert!(removed.read_relays.is_empty());
+        assert_eq!(removed.write_relays, vec!["wss://relay.example/"]);
     }
 
     #[test]
