@@ -312,6 +312,29 @@ describe("MarmotAgentControlClient", () => {
     expect(removed.echoed_direction).toBe("read");
   });
 
+  it("classifies a malformed relay_lists response as a protocol error", async () => {
+    const malformedSocket = join(dir, "malformed-relays.sock");
+    const malformed = await startServer(malformedSocket, 0, (socket, req) => {
+      send(socket, req.id, {
+        type: "relay_lists",
+        account_id_hex: req.account_id_hex,
+        relay_lists: { nip65: { relays: "wss://relay.example" } },
+      });
+    });
+    try {
+      const malformedClient = new MarmotAgentControlClient({
+        socketPath: malformedSocket,
+        requestTimeoutMs: 2000,
+      });
+      await expect(malformedClient.accountRelayLists(HEX32("aa"))).rejects.toMatchObject({
+        name: "AgentControlError",
+        code: "protocol_error",
+      });
+    } finally {
+      await new Promise<void>((resolve) => malformed.close(() => resolve()));
+    }
+  });
+
   it("fetches one durable timeline message and pages by stable cursor", async () => {
     const one = await client.timelineMessageGet(
       HEX32("aa"),

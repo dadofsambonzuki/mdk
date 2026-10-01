@@ -700,7 +700,11 @@ export class MarmotAgentControlClient {
         );
       });
     if (response.type !== "relay_lists" || !listsValid) {
-      throw new Error("wn-agent returned invalid relay_lists response");
+      // Classifiable like every other protocol failure: callers check
+      // `instanceof AgentControlError` and read `.code`.
+      throw new AgentControlError("wn-agent returned invalid relay_lists response", {
+        code: "protocol_error",
+      });
     }
     return response as unknown as RelayListsResponse;
   }
